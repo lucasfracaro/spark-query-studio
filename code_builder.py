@@ -129,7 +129,7 @@ def validate_orchestration(orch: Orchestration) -> list[str]:
     return errors
 
 
-def build_spark_code(sql: str, orch: Orchestration, local_mode: bool = False) -> str:
+def build_spark_code(sql: str, orch: Orchestration, local_mode: bool = False, profile: bool = False) -> str:
     """Monta o script PySpark que roda as entradas + query e imprime o resultado."""
     statements = split_statements(sql)
     if not statements:
@@ -141,6 +141,7 @@ def build_spark_code(sql: str, orch: Orchestration, local_mode: bool = False) ->
         "conf": {k: v for k, v in orch.spark_conf.items() if k and str(k).strip()},
         "db": orch.default_database.strip(),
         "limit": int(orch.limit),
+        "profile": bool(profile),
         "marker": RESULT_MARKER,
     }
 
@@ -190,11 +191,36 @@ try:
         if _i < len(_p["statements"]) - 1:
             _df.collect()  # executa comandos intermediários (CREATE/INSERT/SET...)
 
-    _cols = [{{"name": _f.name, "type": _f.dataType.simpleString()}} for _f in _df.schema.fields]
+    _fields = _df.schema.fields
+    _cols = [{{"name": _f.name, "type": _f.dataType.simpleString(), "nullable": bool(getattr(_f, "nullable", True))}}
+             for _f in _fields]
     _rows = []
     for _row in _df.limit(_p["limit"]).collect():
         _rows.append([None if _x is None else (_x if isinstance(_x, (int, float, bool, str)) else str(_x)) for _x in _row])
-    _emit({{"ok": True, "columns": _cols, "rows": _rows, "elapsed": round(_time.time() - _t0, 2), "log": _log}})
+    _out = {{"ok": True, "columns": _cols, "rows": _rows, "elapsed": round(_time.time() - _t0, 2), "log": _log}}
+
+    if _p["profile"] and _fields:
+        # estatísticas no resultado COMPLETO (uma agregação só, colunas renomeadas por posição)
+        from pyspark.sql import functions as _F
+        _simples = ("string", "int", "bigint", "smallint", "tinyint", "double", "float", "boolean",
+                    "date", "timestamp", "timestamp_ntz", "decimal", "varchar", "char")
+        _dfp = _df.toDF(*["c%d" % _i for _i in range(len(_fields))])
+        _aggs = [_F.count(_F.lit(1)).alias("__n")]
+        for _i, _f in enumerate(_fields):
+            _c = _F.col("c%d" % _i)
+            _aggs.append(_F.count(_c).alias("n%d" % _i))
+            if _f.dataType.simpleString().split("(")[0] in _simples:
+                _aggs += [_F.approx_count_distinct(_c).alias("d%d" % _i), _F.min(_c).alias("mn%d" % _i),
+                          _F.max(_c).alias("mx%d" % _i)]
+        _a = _dfp.agg(*_aggs).collect()[0].asDict()
+        _txt = lambda _v: None if _v is None else (_v if isinstance(_v, (int, float, bool)) else str(_v))
+        _out["profile"] = {{"rows": _a["__n"], "columns": [
+            {{"nulls": _a["__n"] - _a["n%d" % _i], "distinct": _a.get("d%d" % _i),
+              "min": _txt(_a.get("mn%d" % _i)), "max": _txt(_a.get("mx%d" % _i))}}
+            for _i in range(len(_fields))]}}
+        _log.append("estatísticas calculadas em " + str(_a["__n"]) + " linhas")
+
+    _emit(_out)
 except Exception as _e:
     _emit({{"ok": False, "error": type(_e).__name__ + ": " + str(_e), "traceback": _tb.format_exc(), "elapsed": round(_time.time() - _t0, 2), "log": _log}})
 '''.strip()

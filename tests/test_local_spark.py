@@ -70,3 +70,28 @@ def test_erro_de_analise(engine):
     res = _run(engine, "SELECT * FROM tabela_que_nao_existe")
     assert res["ok"] is False
     assert "tabela_que_nao_existe" in res["error"]
+
+
+def test_nullable_e_estatisticas(engine):
+    sql = ("SELECT * FROM VALUES (1, 'a', CAST(1.5 AS DECIMAL(5,2))), (2, NULL, NULL), (3, 'a', 2.0), "
+           "(3, 'b', 2.0) AS t(id, letra, valor)")
+    code = build_spark_code(sql, Orchestration(limit=2), profile=True)
+    res = engine.run(code)
+    assert res["ok"], res
+    assert len(res["rows"]) == 2                                   # limite vale só para as linhas exibidas
+    assert [c["nullable"] for c in res["columns"]] == [False, True, True]
+    prof = res["profile"]
+    assert prof["rows"] == 4                                       # estatísticas no resultado completo
+    id_, letra, valor = prof["columns"]
+    assert id_ == {"nulls": 0, "distinct": 3, "min": 1, "max": 3}
+    assert letra["nulls"] == 1 and letra["distinct"] == 2 and letra["min"] == "a" and letra["max"] == "b"
+    assert valor["nulls"] == 1 and valor["min"] == "1.50" and valor["max"] == "2.00"
+
+
+def test_estatisticas_com_nomes_repetidos_e_tipos_complexos(engine):
+    sql = "SELECT 1 AS x, 2 AS x, array(1, 2) AS arr, map('k', 1) AS m"
+    res = engine.run(build_spark_code(sql, Orchestration(), profile=True))
+    assert res["ok"], res
+    cols = res["profile"]["columns"]
+    assert cols[0]["max"] == 1 and cols[1]["max"] == 2              # renomeadas por posição: sem ambiguidade
+    assert cols[2]["distinct"] is None and cols[2]["nulls"] == 0    # complexos: só contagem de nulos

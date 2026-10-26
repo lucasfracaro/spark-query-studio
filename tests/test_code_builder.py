@@ -182,3 +182,13 @@ def test_parse_result_marcacao_no_meio_da_linha():
 def test_parse_result_saida_invalida(saida):
     # "e30" é base64 de "{}" truncado: não deve estourar exceção
     assert parse_result(saida) in (None, {})
+
+
+def test_estatisticas_desligadas_por_padrao_e_nullable_no_resultado():
+    res = run_generated(build_spark_code("SELECT 1", Orchestration()), FakeSpark())
+    assert "profile" not in res
+    assert all(c["nullable"] is True for c in res["columns"])
+
+
+def test_codigo_com_estatisticas_compila():
+    compile(build_spark_code("SELECT 1", Orchestration(), profile=True), "<gerado>", "exec")

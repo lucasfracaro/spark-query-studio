@@ -1,5 +1,6 @@
 streamlit>=1.50
 boto3>=1.34
 pandas>=2.0
+sqlglot>=30.20,<31   # importar queries do Athena (leitura e tradução para Spark SQL)
 streamlit-ace>=0.1.1   # opcional: editor SQL com destaque de sintaxe
 # pyspark>=3.5         # opcional: só para o modo "Spark local" (precisa de Java 11/17)

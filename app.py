@@ -6,7 +6,6 @@ Rodar:  streamlit run app.py
 """
 from __future__ import annotations
 
-import json
 import math
 import os
 import time
@@ -19,6 +18,9 @@ import settings_store
 from code_builder import (DEFAULT_LIMIT, InputSource, Orchestration, build_spark_code,
                           split_statements, validate_orchestration)
 from sql_refs import check_query_against_orchestration, missing_from_spark_error
+import athena_import
+import metadata
+import orchestration_io
 from engines import (GLUE_VERSIONS, GLUE_WORKER_TYPES, AwsAccount, EngineError,
                      GlueSessionEngine, InstanceConfig, LocalSparkEngine)
 
@@ -78,6 +80,12 @@ ss.conf_df = ss.conf_base
 ss.setdefault("default_db", "")
 ss.setdefault("row_limit", DEFAULT_LIMIT)
 ss.setdefault("check_refs", True)
+ss.setdefault("profile", False)
+ss.setdefault("result_version", 0)
+ss.setdefault("orch_draft", "")
+ss.setdefault("orch_draft_version", 0)
+ss.setdefault("open_orch_after", False)
+ss.setdefault("athena_result", None)
 
 
 def make_engine():
@@ -111,6 +119,124 @@ def current_orchestration() -> Orchestration:
     conf = {clean(r["chave"]): clean(r["valor"]) for _, r in ss.conf_df.iterrows() if clean(r.get("chave"))}
     return Orchestration(inputs=inputs, spark_conf=conf, default_database=ss.default_db,
                          limit=int(ss.row_limit))
+
+
+INPUT_COLUMNS = ["alias", "kind", "source", "fmt", "options", "filter", "cache"]
+
+
+def apply_orchestration(orch: Orchestration, keep_conf: bool = False):
+    """Substitui a orquestração da tela (os editores são recriados com os novos valores)."""
+    ss.inputs_base = pd.DataFrame([{c: getattr(i, c) for c in INPUT_COLUMNS} for i in orch.inputs],
+                                  columns=INPUT_COLUMNS)
+    if not keep_conf:
+        ss.conf_base = pd.DataFrame([{"chave": k, "valor": v} for k, v in orch.spark_conf.items()],
+                                    columns=["chave", "valor"])
+        ss.row_limit = int(orch.limit)
+    ss.default_db = orch.default_database
+    ss.orch_version += 1
+
+
+# ------------------------------------------------------------------------------------
+# Diálogo: orquestração (editar como JSON, salvar na máquina, abrir arquivo)
+# ------------------------------------------------------------------------------------
+@st.dialog("Orquestração", width="large")
+def orchestration_dialog():
+    st.caption("Ajuste o que for preciso e clique em **Aplicar**. Use **Salvar na máquina** para guardar o "
+               "arquivo e **Abrir arquivo** para carregar uma orquestração salva.")
+    up = st.file_uploader("Abrir arquivo", type=["json"], key=f"orch_file_{ss.orch_draft_version}")
+    if up is not None:
+        ss.orch_draft = up.getvalue().decode("utf-8", errors="replace")
+        ss.orch_draft_version += 1
+        st.rerun(scope="fragment")
+
+    key = f"orch_text_{ss.orch_draft_version}"
+    if st_ace is not None:
+        texto = st_ace(value=ss.orch_draft, language="json", theme="tomorrow_night", font_size=13, height=420,
+                       show_gutter=True, wrap=True, auto_update=True, key=key)
+        texto = ss.orch_draft if texto is None else texto
+    else:
+        texto = st.text_area("JSON da orquestração", ss.orch_draft, height=420, key=key)
+
+    erro, orch = None, None
+    try:
+        orch = orchestration_io.from_json(texto)
+    except orchestration_io.OrchestrationFormatError as e:
+        erro = str(e)
+    if erro:
+        st.error(erro)
+    else:
+        for e in validate_orchestration(orch):
+            st.warning(e)
+        st.caption(f"{len(orch.inputs)} entrada(s) · {len(orch.spark_conf)} configuração(ões) Spark")
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    nome = c3.text_input("Nome do arquivo", "orquestracao.json", label_visibility="collapsed")
+    c2.download_button("⬇️ Salvar na máquina", texto, nome if nome.endswith(".json") else nome + ".json",
+                       "application/json", width="stretch", on_click="ignore")
+    if c1.button("✅ Aplicar", type="primary", width="stretch", disabled=orch is None):
+        apply_orchestration(orch)
+        ss.orch_draft = orchestration_io.to_json(orch)
+        st.rerun()
+
+
+def open_orchestration_dialog():
+    ss.orch_draft = orchestration_io.to_json(current_orchestration())
+    ss.orch_draft_version += 1
+    orchestration_dialog()
+
+
+# ------------------------------------------------------------------------------------
+# Diálogo: importar query do Athena
+# ------------------------------------------------------------------------------------
+@st.dialog("Importar query do Athena", width="large")
+def athena_dialog():
+    if not athena_import.sqlglot_available():
+        st.error("Para importar queries do Athena instale o pacote **sqlglot** (`pip install sqlglot`).")
+        return
+    st.caption("Cole a query do Athena ou abra o arquivo. A orquestração é montada a partir das bases usadas e dos "
+               "filtros de partição das CTEs, e a query é traduzida para Spark SQL.")
+    up = st.file_uploader("Abrir arquivo", type=["sql", "txt"], key="athena_file")
+    inicial = up.getvalue().decode("utf-8", errors="replace") if up is not None else ""
+    sql_athena = st.text_area("Query do Athena", inicial, height=260, key=f"athena_sql_{up.file_id if up else 0}")
+    c1, c2 = st.columns(2)
+    db_padrao = c1.text_input("Database padrão", ss.default_db,
+                              help="Usado para tabelas escritas sem database na query.")
+    usar_glue = c2.checkbox("Consultar o Glue para saber as colunas de partição", ss.engine_kind == "glue",
+                            help="Sem o Glue, as colunas de partição são supostas pelo nome (dt, anomes...).")
+
+    if st.button("🔎 Gerar orquestração", type="primary", disabled=not sql_athena.strip()):
+        lookup = None
+        if usar_glue:
+            try:
+                lookup = athena_import.glue_partition_lookup(ss.account.boto_session().client("glue"))
+            except Exception as e:
+                st.warning(f"Não consegui conectar ao Glue ({e}). As partições serão supostas pelo nome.")
+        try:
+            ss.athena_result = athena_import.import_athena_query(sql_athena, lookup, db_padrao.strip())
+        except ValueError as e:
+            ss.athena_result = None
+            st.error(str(e))
+
+    r = ss.athena_result
+    if r is None:
+        return
+    st.divider()
+    for n in r.notes:
+        (st.warning if n.level == "atencao" else st.info)(n.text)
+    st.dataframe(pd.DataFrame([{
+        "alias": t.alias, "origem": f"{t.database}.{t.table}" if t.database else t.table,
+        "partições": ", ".join(t.partition_keys) or "—",
+        "partições vindas de": "Glue" if t.partition_source == "glue" else "suposição pelo nome",
+        "filtro": t.filter or "—"} for t in r.tables]), hide_index=True, width="stretch")
+    with st.expander("Query traduzida para Spark SQL"):
+        st.code(r.spark_sql, language="sql")
+    if st.button("✅ Aplicar e revisar a orquestração", type="primary"):
+        apply_orchestration(r.orchestration, keep_conf=True)
+        ss.sql = r.spark_sql
+        ss.editor_version += 1
+        ss.athena_result = None
+        ss.open_orch_after = True
+        st.rerun()
 
 
 # ------------------------------------------------------------------------------------
@@ -256,7 +382,16 @@ st.markdown(f"""
 # ------------------------------------------------------------------------------------
 st.markdown('<div class="sqs-step">Passo 1</div>', unsafe_allow_html=True)
 st.subheader("Orquestração das entradas")
-t_in, t_conf, t_opt, t_io = st.tabs(["📥 Entradas de dados", "🔧 Configurações Spark", "⚙️ Opções", "📁 Importar / exportar"])
+b_ath, b_orch, _ = st.columns([1, 1, 2])
+if b_ath.button("📥 Importar query do Athena", width="stretch"):
+    athena_dialog()
+if b_orch.button("📝 Abrir orquestração", width="stretch", help="Editar como arquivo, salvar na máquina ou abrir um salvo"):
+    open_orchestration_dialog()
+if ss.open_orch_after:
+    ss.open_orch_after = False
+    open_orchestration_dialog()
+
+t_in, t_conf, t_opt = st.tabs(["📥 Entradas de dados", "🔧 Configurações Spark", "⚙️ Opções"])
 
 with t_in:
     st.caption("Cada linha vira uma *temp view* que você usa pelo **alias** na query. "
@@ -288,24 +423,9 @@ with t_opt:
     ss.check_refs = st.checkbox(
         "Bloquear a execução se a query usar uma base que não está na orquestração", ss.check_refs,
         help="A conferência é feita antes de enviar ao cluster. Desligue só se ela acusar uma base por engano.")
-
-with t_io:
-    st.caption("Salve a orquestração (entradas + configs) em JSON para reutilizar ou compartilhar.")
-    orch_json = json.dumps({"inputs": ss.inputs_df.to_dict("records"), "conf": ss.conf_df.to_dict("records"),
-                            "default_db": ss.default_db, "limit": int(ss.row_limit)}, indent=2, default=str)
-    c1, c2 = st.columns(2)
-    c1.download_button("⬇️ Exportar orquestração", orch_json, "orquestracao.json", "application/json",
-                       width="stretch")
-    up = c2.file_uploader("Importar orquestração", type=["json"], label_visibility="collapsed", key="orch_upload")
-    if up is not None and ss.get("last_orch") != up.file_id:
-        data = json.loads(up.getvalue())
-        cols_in = ["alias", "kind", "source", "fmt", "options", "filter", "cache"]
-        ss.inputs_base = pd.DataFrame(data.get("inputs", []), columns=cols_in)
-        ss.conf_base = pd.DataFrame(data.get("conf", []), columns=["chave", "valor"])
-        ss.orch_version += 1
-        ss.default_db, ss.row_limit = data.get("default_db", ""), int(data.get("limit", DEFAULT_LIMIT))
-        ss.last_orch = up.file_id
-        st.rerun()
+    ss.profile = st.checkbox(
+        "Calcular estatísticas para os metadados (nulos, distintos, mínimo e máximo) no resultado completo",
+        ss.profile, help="Roda uma agregação extra sobre o resultado inteiro no cluster: a execução fica mais lenta.")
 
 # ------------------------------------------------------------------------------------
 # 2. Query
@@ -367,7 +487,8 @@ if run_clicked:
         for e in errors:
             st.error(e)
     else:
-        code = build_spark_code(ss.sql, orch)
+        code = build_spark_code(ss.sql, orch, profile=ss.profile)
+        ss.result_version += 1
         engine = make_engine()
         t0 = time.time()
         with st.status("Preparando…", expanded=False) as box:
@@ -386,6 +507,50 @@ if run_clicked:
             except Exception as e:
                 box.update(label="Falha", state="error")
                 ss.result = {"ok": False, "error": f"{type(e).__name__}: {e}", "traceback": "", "log": []}
+
+def render_metadata(res: dict, col_names: list[str]):
+    cols = [dict(c, name=n) for c, n in zip(res["columns"], col_names)]
+    profile = res.get("profile")
+    rows = metadata.build_dictionary(cols, profile)
+    if profile:
+        st.caption(f"Estatísticas calculadas sobre o resultado completo: **{profile['rows']:,}** linhas."
+                   .replace(",", "."))
+    else:
+        st.caption("Para ver nulos, distintos, mínimo e máximo, ligue **Calcular estatísticas** em Passo 1 › Opções.")
+    editado = st.data_editor(
+        pd.DataFrame(rows), hide_index=True, width="stretch", key=f"meta_{ss.result_version}",
+        disabled=[c for c in rows[0].keys() if c != "descricao"] if rows else True,
+        column_config={"descricao": st.column_config.TextColumn("descrição", width="large",
+                                                                help="Preencha: entra no dicionário e no DDL")})
+    rows = editado.to_dict("records")
+
+    c1, c2 = st.columns(2)
+    carimbo = time.strftime("%Y%m%d_%H%M%S")
+    c1.download_button("⬇️ Dicionário de dados (CSV)",
+                       pd.DataFrame(rows).to_csv(index=False, sep=";").encode("utf-8-sig"),
+                       f"metadados_{carimbo}.csv", "text/csv", width="stretch", on_click="ignore")
+    c2.download_button("⬇️ Dicionário de dados (JSON)",
+                       metadata.dictionary_to_json(rows, rows_total=(profile or {}).get("rows")),
+                       f"metadados_{carimbo}.json", "application/json", width="stretch", on_click="ignore")
+
+    st.markdown("##### DDL da tabela no Athena")
+    d1, d2, d3 = st.columns(3)
+    db = d1.text_input("Database", ss.default_db, key="ddl_db")
+    tabela = d2.text_input("Tabela", "", key="ddl_tabela", placeholder="nome_da_tabela")
+    fmt = d3.selectbox("Formato", ["parquet", "orc", "csv", "json"], key="ddl_fmt")
+    local = st.text_input("Localização no S3", "", key="ddl_local", placeholder="s3://bucket/caminho/tabela/")
+    parts = st.multiselect("Colunas de partição", [r["coluna"] for r in rows], key="ddl_parts")
+    comentario = st.text_input("Descrição da tabela (opcional)", "", key="ddl_coment")
+    if tabela.strip() and local.strip():
+        try:
+            ddl = metadata.build_ddl(rows, db, tabela, local, parts, fmt, comentario)
+            st.code(ddl, language="sql")
+            st.download_button("⬇️ Salvar DDL", ddl, f"{tabela.strip()}.sql", "text/plain", on_click="ignore")
+        except ValueError as e:
+            st.error(str(e))
+    else:
+        st.caption("Informe a tabela e a localização no S3 para gerar o DDL.")
+
 
 # ------------------------------------------------------------------------------------
 # 3. Resultado
@@ -408,18 +573,19 @@ if res:
         m2.metric("Colunas", len(df.columns))
         m3.metric("Tempo", f"{res.get('total', res.get('elapsed', 0))} s")
 
-        st.dataframe(df, width="stretch", height=min(38 + 35 * len(df), 560), hide_index=True)
+        t_dados, t_meta = st.tabs(["📋 Dados", "🧾 Metadados"])
+        with t_dados:
+            st.dataframe(df, width="stretch", height=min(38 + 35 * len(df), 560), hide_index=True)
 
-        c1, c2, c3 = st.columns([1, 1, 2])
-        sep = c1.selectbox("Separador", [";", ",", "\t"], format_func={";": "; (Excel BR)", ",": ", (padrão)", "\t": "tab"}.get)
-        csv_bytes = df.to_csv(index=False, sep=sep).encode("utf-8-sig")
-        c2.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
-        c2.download_button("⬇️ Exportar CSV", csv_bytes, f"resultado_{time.strftime('%Y%m%d_%H%M%S')}.csv",
-                           "text/csv", type="primary", width="stretch")
+            c1, c2, c3 = st.columns([1, 1, 2])
+            sep = c1.selectbox("Separador", [";", ",", "\t"], format_func={";": "; (Excel BR)", ",": ", (padrão)", "\t": "tab"}.get)
+            csv_bytes = df.to_csv(index=False, sep=sep).encode("utf-8-sig")
+            c2.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+            c2.download_button("⬇️ Exportar CSV", csv_bytes, f"resultado_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+                               "text/csv", type="primary", width="stretch")
 
-        with st.expander("Schema"):
-            st.dataframe(pd.DataFrame(res["columns"]).rename(columns={"name": "coluna", "type": "tipo"}),
-                         hide_index=True, width="stretch")
+        with t_meta:
+            render_metadata(res, uniq)
     else:
         faltando = missing_from_spark_error(res.get("error", ""))
         if faltando:

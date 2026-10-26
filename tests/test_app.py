@@ -73,7 +73,8 @@ def test_executa_com_motor_falso(app, monkeypatch):
     tabelas = [d.value for d in app.dataframe]
     resultado_df = next(df for df in tabelas if list(df.columns) == ["id", "id_2"])  # nomes repetidos ganham sufixo
     assert len(resultado_df) == 2
-    assert len(app.get("download_button")) == downloads_antes + 1   # botão Exportar CSV
+    # Exportar CSV + dicionário de dados em CSV e JSON (aba Metadados)
+    assert len(app.get("download_button")) == downloads_antes + 3
 
 
 def _motor_que_registra(monkeypatch, resultado):
@@ -129,6 +130,12 @@ def test_erro_de_tabela_do_spark_vira_mensagem_clara(app, monkeypatch):
     app.text_area[0].set_value("SELECT * FROM minha_view").run()
     _botao(app, "Executar").click().run()
     assert any("`db.sumida`" in e.value and "orquestração" in e.value for e in app.error)
+
+
+def test_botoes_de_orquestracao_e_athena(app):
+    rotulos = [b.label for b in app.button]
+    assert any("Importar query do Athena" in r for r in rotulos)
+    assert any("Abrir orquestração" in r for r in rotulos)
 
 
 def test_limpar(app):
