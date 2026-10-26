@@ -1,5 +1,7 @@
 # ⚡ Spark Query Studio
 
+[![testes](https://github.com/lucasfracaro/spark-query-studio/actions/workflows/testes.yml/badge.svg)](https://github.com/lucasfracaro/spark-query-studio/actions/workflows/testes.yml)
+
 Frontend em Streamlit para escrever ou importar uma query Spark SQL, configurar a orquestração das entradas e a instância, executar no **AWS Glue (Interactive Sessions)** e ver as primeiras linhas, com exportação para CSV. Assim você não precisa passar pelo Athena para validar uma ETL.
 
 ```
@@ -50,6 +52,18 @@ Uma Interactive Session é cobrada por DPU-hora enquanto estiver ativa (a barra 
 
 Para testar a interface sem gastar com a AWS, instale `pyspark` (requer Java 11/17) e escolha **Spark local**. Entradas `s3` funcionam com caminhos locais (ex.: `/dados/arquivo.parquet`). Para ler `s3a://` localmente, adicione `spark.jars.packages = org.apache.hadoop:hadoop-aws:3.3.4` nos argumentos extras.
 
+## Testes
+
+```bash
+pip install -r requirements-dev.txt
+pytest                                # tudo que estiver instalado
+pip install pyspark && pytest tests/test_local_spark.py   # integração com Spark real (Java 17)
+```
+
+Nenhum teste precisa de conta AWS. O motor Glue é testado com um cliente falso em memória, que simula sessões provisionando, falhando ou expirando, além de statements com erro, cancelados ou com saída inválida. O código PySpark gerado roda contra um Spark simulado e, no CI, contra um Spark local de verdade. A interface é testada com o `AppTest` do próprio Streamlit, sem navegador.
+
+O GitHub Actions roda tudo a cada push, em Python 3.10, 3.12 e 3.13.
+
 ## Estrutura
 
 | Arquivo | Função |
@@ -58,6 +72,7 @@ Para testar a interface sem gastar com a AWS, instale `pyspark` (requer Java 11/
 | `engines.py` | Motores: Glue Interactive Sessions e Spark local |
 | `code_builder.py` | Gera o código PySpark a partir da orquestração e da query, e lê o resultado |
 | `settings_store.py` | Salva e carrega a configuração (sem segredos) |
+| `tests/` | Testes (pytest); `fakes.py` tem o Spark e o cliente Glue simulados |
 
 ## Próximos passos possíveis
 
