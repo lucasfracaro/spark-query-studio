@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GlueInteractiveSessions",
+      "Effect": "Allow",
+      "Action": ["glue:CreateSession", "glue:GetSession", "glue:StopSession", "glue:DeleteSession",
+                 "glue:RunStatement", "glue:GetStatement", "glue:CancelStatement", "glue:ListSessions",
+                 "glue:TagResource"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassarRoleProGlue",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::SUA-CONTA:role/GlueInteractiveSessionRole",
+      "Condition": {"StringEquals": {"iam:PassedToService": "glue.amazonaws.com"}}
+    },
+    {"Sid": "TestarConexao", "Effect": "Allow", "Action": "sts:GetCallerIdentity", "Resource": "*"}
+  ]
+}
