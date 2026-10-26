@@ -77,10 +77,11 @@ class GlueSessionEngine:
     READY_TIMEOUT_S = 15 * 60
     POLL_S = 3
 
-    def __init__(self, account: AwsAccount, instance: InstanceConfig):
+    def __init__(self, account: AwsAccount, instance: InstanceConfig, glue_client=None):
         self.account = account
         self.instance = instance
-        self._glue = account.boto_session().client("glue")
+        # glue_client permite injetar um cliente falso nos testes
+        self._glue = glue_client if glue_client is not None else account.boto_session().client("glue")
         self.session_id: str | None = None
 
     # ---------- conta ----------
@@ -95,8 +96,10 @@ class GlueSessionEngine:
             return None
         try:
             return self._glue.get_session(Id=sid)["Session"]["Status"]
-        except self._glue.exceptions.EntityNotFoundException:
-            return None
+        except Exception as e:  # EntityNotFoundException: sessão não existe (mais)
+            if type(e).__name__ == "EntityNotFoundException":
+                return None
+            raise
 
     def attach(self, session_id: str) -> bool:
         """Reaproveita uma sessão existente se ainda estiver READY."""
@@ -138,11 +141,16 @@ class GlueSessionEngine:
         self.session_id = sid
 
         t0 = time.time()
+        not_found = 0
         while True:
             status = self.session_status()
             on_status(f"Sessão {sid}: {status} ({int(time.time() - t0)}s)")
             if status == "READY":
                 return sid
+            if status is None and not_found < 3:
+                not_found += 1          # logo após o create_session a sessão pode não aparecer ainda
+                time.sleep(self.POLL_S)
+                continue
             if status in ("FAILED", "TIMEOUT", "STOPPED", "STOPPING", None):
                 detail = self._glue.get_session(Id=sid)["Session"].get("ErrorMessage", "") if status else ""
                 raise EngineError(f"Sessão terminou com status {status}. {detail}")
@@ -190,7 +198,7 @@ class GlueSessionEngine:
                         "elapsed": round(time.time() - t0, 2), "log": []}
             if should_cancel():
                 self._glue.cancel_statement(SessionId=self.session_id, Id=stmt_id)
-            time.sleep(2)
+            time.sleep(self.POLL_S)
 
 
 # --------------------------------------------------------------------------------------

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from dataclasses import asdict
 
@@ -20,10 +21,12 @@ from code_builder import (DEFAULT_LIMIT, InputSource, Orchestration, build_spark
 from engines import (GLUE_VERSIONS, GLUE_WORKER_TYPES, AwsAccount, EngineError,
                      GlueSessionEngine, InstanceConfig, LocalSparkEngine)
 
-try:  # editor com destaque de sintaxe (opcional)
-    from streamlit_ace import st_ace
-except ImportError:  # pragma: no cover
-    st_ace = None
+st_ace = None
+if not os.environ.get("SQS_PLAIN_EDITOR"):   # SQS_PLAIN_EDITOR=1 força o editor simples (usado nos testes)
+    try:  # editor com destaque de sintaxe (opcional)
+        from streamlit_ace import st_ace
+    except ImportError:  # pragma: no cover
+        pass
 
 st.set_page_config(page_title="Spark Query Studio", page_icon="⚡", layout="wide")
 
@@ -140,13 +143,13 @@ def aws_dialog():
                      access_key=ak.strip(), secret_key=sk.strip(), session_token=tok.strip(),
                      glue_role_arn=role.strip(), temp_dir=temp.strip())
     b1, b2, _ = st.columns([1, 1, 2])
-    if b1.button("Testar conexão", use_container_width=True):
+    if b1.button("Testar conexão", width="stretch"):
         try:
             ident = GlueSessionEngine(new, ss.instance).whoami()
             st.success(f"Conectado como `{ident['Arn']}` (conta {ident['Account']})")
         except Exception as e:
             st.error(f"Falha: {e}")
-    if b2.button("Salvar", type="primary", use_container_width=True):
+    if b2.button("Salvar", type="primary", width="stretch"):
         ss.account = new
         path = settings_store.save(ss.account, ss.instance)
         st.toast(f"Configuração salva em {path}", icon="✅")
@@ -164,7 +167,7 @@ with st.sidebar:
         format_func={"glue": "AWS Glue", "local": "Spark local"}.get, label_visibility="collapsed")
 
     if ss.engine_kind == "glue":
-        if st.button("🔑 Configurar conta AWS", use_container_width=True):
+        if st.button("🔑 Configurar conta AWS", width="stretch"):
             aws_dialog()
         acc = ss.account
         st.caption(f"Região **{acc.region}** · auth **{acc.auth_mode}**"
@@ -189,11 +192,11 @@ with st.sidebar:
             if "args_base" not in ss:
                 ss.args_base = pd.DataFrame([{"argumento": k, "valor": v} for k, v in inst.extra_args.items()]
                                             or [{"argumento": "", "valor": ""}])
-            args_df = st.data_editor(ss.args_base, num_rows="dynamic", use_container_width=True,
+            args_df = st.data_editor(ss.args_base, num_rows="dynamic", width="stretch",
                                      key="args_editor")
             inst.extra_args = {clean(r["argumento"]): clean(r["valor"]) for _, r in args_df.iterrows()
                                if clean(r.get("argumento"))}
-        if st.button("💾 Salvar instância como padrão", use_container_width=True):
+        if st.button("💾 Salvar instância como padrão", width="stretch"):
             settings_store.save(ss.account, inst)
             st.toast("Instância salva", icon="✅")
 
@@ -215,14 +218,14 @@ with st.sidebar:
         st.success(f"Ativa: `{label}`")
         if ss.engine_kind == "glue" and ss.session_conf and ss.session_conf != instance_signature(ss.instance):
             st.warning(f"A sessão ativa usa **{ss.session_conf}**. Reinicie para aplicar a nova instância.")
-        if st.button("⏹️ Encerrar sessão", use_container_width=True):
+        if st.button("⏹️ Encerrar sessão", width="stretch"):
             engine.stop()
             ss.session_id, ss.session_conf = None, None
             st.rerun()
     else:
         st.info("Nenhuma sessão ativa. Ela é criada automaticamente na primeira execução "
                 "(no Glue isso leva ~30–90 s).")
-        if st.button("▶️ Iniciar sessão agora", use_container_width=True):
+        if st.button("▶️ Iniciar sessão agora", width="stretch"):
             with st.status("Iniciando sessão…", expanded=True) as box:
                 try:
                     sid = engine.start(lambda m: box.update(label=m))
@@ -257,7 +260,7 @@ with t_in:
     st.caption("Cada linha vira uma *temp view* que você usa pelo **alias** na query. "
                "`catalog` lê do Glue Data Catalog (as mesmas tabelas do Athena); `s3` lê arquivos direto do bucket.")
     ss.inputs_df = st.data_editor(
-        ss.inputs_base, num_rows="dynamic", use_container_width=True, key=f"inputs_editor_{ss.orch_version}",
+        ss.inputs_base, num_rows="dynamic", width="stretch", key=f"inputs_editor_{ss.orch_version}",
         column_config={
             "alias": st.column_config.TextColumn("Alias (view)", required=True),
             "kind": st.column_config.SelectboxColumn("Tipo", options=["catalog", "s3"], required=True, default="catalog"),
@@ -270,7 +273,7 @@ with t_in:
 
 with t_conf:
     st.caption("Aplicadas com `spark.conf.set` antes da query.")
-    ss.conf_df = st.data_editor(ss.conf_base, num_rows="dynamic", use_container_width=True,
+    ss.conf_df = st.data_editor(ss.conf_base, num_rows="dynamic", width="stretch",
                                 key=f"conf_editor_{ss.orch_version}",
                                 column_config={"chave": st.column_config.TextColumn("Chave", width="large"),
                                                "valor": st.column_config.TextColumn("Valor")})
@@ -287,7 +290,7 @@ with t_io:
                             "default_db": ss.default_db, "limit": int(ss.row_limit)}, indent=2, default=str)
     c1, c2 = st.columns(2)
     c1.download_button("⬇️ Exportar orquestração", orch_json, "orquestracao.json", "application/json",
-                       use_container_width=True)
+                       width="stretch")
     up = c2.file_uploader("Importar orquestração", type=["json"], label_visibility="collapsed", key="orch_upload")
     if up is not None and ss.get("last_orch") != up.file_id:
         data = json.loads(up.getvalue())
@@ -326,9 +329,9 @@ n_stmts = len(split_statements(ss.sql))
 st.caption(f"{n_stmts} comando(s). Separe vários com `;` — todos são executados e o resultado do **último** é exibido.")
 
 b1, b2, b3, _ = st.columns([1.2, 1, 1, 3])
-run_clicked = b1.button("▶️ Executar", type="primary", use_container_width=True)
-b2.download_button("💾 Salvar .sql", ss.sql, "query.sql", "text/plain", use_container_width=True)
-if b3.button("🧹 Limpar", use_container_width=True):
+run_clicked = b1.button("▶️ Executar", type="primary", width="stretch")
+b2.download_button("💾 Salvar .sql", ss.sql, "query.sql", "text/plain", width="stretch")
+if b3.button("🧹 Limpar", width="stretch"):
     ss.sql, ss.result = "", None
     ss.editor_version += 1
     st.rerun()
@@ -392,18 +395,18 @@ if res:
         m2.metric("Colunas", len(df.columns))
         m3.metric("Tempo", f"{res.get('total', res.get('elapsed', 0))} s")
 
-        st.dataframe(df, use_container_width=True, height=min(38 + 35 * len(df), 560), hide_index=True)
+        st.dataframe(df, width="stretch", height=min(38 + 35 * len(df), 560), hide_index=True)
 
         c1, c2, c3 = st.columns([1, 1, 2])
         sep = c1.selectbox("Separador", [";", ",", "\t"], format_func={";": "; (Excel BR)", ",": ", (padrão)", "\t": "tab"}.get)
         csv_bytes = df.to_csv(index=False, sep=sep).encode("utf-8-sig")
         c2.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
         c2.download_button("⬇️ Exportar CSV", csv_bytes, f"resultado_{time.strftime('%Y%m%d_%H%M%S')}.csv",
-                           "text/csv", type="primary", use_container_width=True)
+                           "text/csv", type="primary", width="stretch")
 
         with st.expander("Schema"):
             st.dataframe(pd.DataFrame(res["columns"]).rename(columns={"name": "coluna", "type": "tipo"}),
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width="stretch")
     else:
         st.error(res.get("error", "Erro desconhecido"))
         if res.get("traceback"):

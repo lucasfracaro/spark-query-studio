@@ -67,6 +67,11 @@ def split_statements(sql: str) -> list[str]:
                 buf = []
                 i += 1
                 continue
+        elif ch == "\\" and (in_single or in_double) and nxt:
+            # Spark SQL aceita escape com barra dentro de strings: 'it\'s'
+            buf.append(ch + nxt)
+            i += 2
+            continue
         if ch == "'" and not (in_double or in_backtick):
             in_single = not in_single
         elif ch == '"' and not (in_single or in_backtick):
@@ -79,6 +84,26 @@ def split_statements(sql: str) -> list[str]:
     if stmt:
         statements.append(stmt)
     return statements
+
+
+def parse_options(texto: str) -> dict[str, str]:
+    """Converte "chave=valor;chave2=valor2" em dict.
+
+    O próprio ";" pode ser valor: "header=true;sep=;" -> {"header": "true", "sep": ";"}.
+    Regra: um trecho sem "=" logo depois de uma chave com valor vazio vira o valor ";".
+    """
+    opcoes: dict[str, str] = {}
+    ultima = None
+    for trecho in (texto or "").split(";"):
+        if "=" in trecho:
+            k, v = trecho.split("=", 1)
+            ultima = k.strip()
+            if ultima:
+                opcoes[ultima] = v.strip()
+        elif ultima and opcoes.get(ultima) == "":
+            opcoes[ultima] = ";" + trecho.strip()
+            ultima = None
+    return {k: v for k, v in opcoes.items() if k}
 
 
 _ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -112,7 +137,7 @@ def build_spark_code(sql: str, orch: Orchestration, local_mode: bool = False) ->
 
     payload = {
         "statements": statements,
-        "inputs": [asdict(i) for i in orch.inputs if i.is_valid()],
+        "inputs": [dict(asdict(i), options=parse_options(i.options)) for i in orch.inputs if i.is_valid()],
         "conf": {k: v for k, v in orch.spark_conf.items() if k and str(k).strip()},
         "db": orch.default_database.strip(),
         "limit": int(orch.limit),
@@ -149,10 +174,8 @@ try:
         else:
             _fmt = (_inp.get("fmt") or "parquet").lower()
             _r = spark.read.format(_fmt)
-            for _opt in (_inp.get("options") or "").split(";"):
-                if "=" in _opt:
-                    _ok, _ov = _opt.split("=", 1)
-                    _r = _r.option(_ok.strip(), _ov.strip())
+            for _ok, _ov in (_inp.get("options") or {{}}).items():
+                _r = _r.option(_ok, _ov)
             _df = _r.load(_src)
         if (_inp.get("filter") or "").strip():
             _df = _df.where(_inp["filter"])
@@ -185,5 +208,9 @@ def parse_result(output_text: str) -> dict | None:
         idx = line.find(RESULT_MARKER)
         if idx != -1:
             raw = line[idx + len(RESULT_MARKER):].strip()
-            return json.loads(base64.b64decode(raw).decode("utf-8"))
+            try:
+                return json.loads(base64.b64decode(raw).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                # saída truncada ou corrompida: o chamador trata como "sem resultado"
+                return None
     return None
