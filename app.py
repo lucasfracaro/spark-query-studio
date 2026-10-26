@@ -18,6 +18,7 @@ import streamlit as st
 import settings_store
 from code_builder import (DEFAULT_LIMIT, InputSource, Orchestration, build_spark_code,
                           split_statements, validate_orchestration)
+from sql_refs import check_query_against_orchestration, missing_from_spark_error
 from engines import (GLUE_VERSIONS, GLUE_WORKER_TYPES, AwsAccount, EngineError,
                      GlueSessionEngine, InstanceConfig, LocalSparkEngine)
 
@@ -76,6 +77,7 @@ ss.inputs_df = ss.inputs_base
 ss.conf_df = ss.conf_base
 ss.setdefault("default_db", "")
 ss.setdefault("row_limit", DEFAULT_LIMIT)
+ss.setdefault("check_refs", True)
 
 
 def make_engine():
@@ -283,6 +285,9 @@ with t_opt:
     ss.default_db = c1.text_input("Database padrão (USE)", ss.default_db, placeholder="opcional")
     ss.row_limit = c2.number_input("Linhas exibidas", 1, 10000, int(ss.row_limit),
                                    help="Apenas estas linhas são trazidas para a tela; a query roda inteira no cluster.")
+    ss.check_refs = st.checkbox(
+        "Bloquear a execução se a query usar uma base que não está na orquestração", ss.check_refs,
+        help="A conferência é feita antes de enviar ao cluster. Desligue só se ela acusar uma base por engano.")
 
 with t_io:
     st.caption("Salve a orquestração (entradas + configs) em JSON para reutilizar ou compartilhar.")
@@ -327,6 +332,10 @@ else:
 
 n_stmts = len(split_statements(ss.sql))
 st.caption(f"{n_stmts} comando(s). Separe vários com `;` — todos são executados e o resultado do **último** é exibido.")
+ref_check = check_query_against_orchestration(ss.sql, current_orchestration().inputs)
+if ref_check.missing:
+    nomes = ", ".join(f"`{m.name}`" for m in ref_check.missing)
+    st.caption(f"⚠️ Fora da orquestração: {nomes}")
 
 b1, b2, b3, _ = st.columns([1.2, 1, 1, 3])
 run_clicked = b1.button("▶️ Executar", type="primary", width="stretch")
@@ -350,6 +359,10 @@ if run_clicked:
     errors = validate_orchestration(orch)
     if not ss.sql.strip():
         errors.append("A query está vazia.")
+    if ss.check_refs and not errors:
+        errors += [m.message() for m in ref_check.missing]
+    for aviso in ref_check.warnings:
+        st.warning(aviso)
     if errors:
         for e in errors:
             st.error(e)
@@ -408,7 +421,19 @@ if res:
             st.dataframe(pd.DataFrame(res["columns"]).rename(columns={"name": "coluna", "type": "tipo"}),
                          hide_index=True, width="stretch")
     else:
-        st.error(res.get("error", "Erro desconhecido"))
+        faltando = missing_from_spark_error(res.get("error", ""))
+        if faltando:
+            tipo, nome = faltando
+            if tipo == "tabela":
+                st.error(f"A base `{nome}` não foi encontrada pelo Spark. Ela precisa estar na orquestração: "
+                         f"adicione-a em Passo 1 › Entradas de dados.")
+            else:
+                st.error(f"O banco `{nome}` não foi encontrado pelo Spark. Confira o nome na orquestração "
+                         f"(Passo 1 › Entradas de dados) e o database padrão.")
+            with st.expander("Mensagem original do Spark"):
+                st.code(res.get("error", ""), language="text")
+        else:
+            st.error(res.get("error", "Erro desconhecido"))
         if res.get("traceback"):
             with st.expander("Detalhes do erro"):
                 st.code(res["traceback"], language="text")

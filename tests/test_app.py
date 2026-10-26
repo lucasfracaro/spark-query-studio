@@ -76,6 +76,61 @@ def test_executa_com_motor_falso(app, monkeypatch):
     assert len(app.get("download_button")) == downloads_antes + 1   # botão Exportar CSV
 
 
+def _motor_que_registra(monkeypatch, resultado):
+    import engines
+    chamadas = []
+
+    class Motor:
+        session_id = "local"
+
+        def __init__(self, *a, **k):
+            pass
+
+        def session_status(self, *a):
+            return "READY"
+
+        def start(self, on_status=None):
+            return "local"
+
+        def run(self, code, on_status=None, **k):
+            chamadas.append(code)
+            return dict(resultado)
+
+    monkeypatch.setattr(engines, "LocalSparkEngine", Motor)
+    return chamadas
+
+
+def test_bloqueia_base_fora_da_orquestracao(app, monkeypatch):
+    chamadas = _motor_que_registra(monkeypatch, {"ok": True, "columns": [], "rows": [], "log": []})
+    app.session_state["engine_kind"] = "local"
+    app.text_area[0].set_value("SELECT * FROM minha_view JOIN db.nao_declarada x ON 1=1").run()
+    assert any("db.nao_declarada" in c.value for c in app.caption)       # aviso já na digitação
+
+    _botao(app, "Executar").click().run()
+    assert not app.exception
+    assert any("`db.nao_declarada`" in e.value and "não está na orquestração" in e.value for e in app.error)
+    assert chamadas == []                                                # nada foi enviado ao cluster
+
+
+def test_desligar_a_conferencia_libera_a_execucao(app, monkeypatch):
+    chamadas = _motor_que_registra(monkeypatch, {"ok": True, "columns": [], "rows": [], "log": []})
+    app.session_state["engine_kind"] = "local"
+    next(c for c in app.checkbox if "orquestração" in c.label).uncheck().run()
+    app.text_area[0].set_value("SELECT * FROM db.nao_declarada").run()
+    _botao(app, "Executar").click().run()
+    assert len(chamadas) == 1
+
+
+def test_erro_de_tabela_do_spark_vira_mensagem_clara(app, monkeypatch):
+    _motor_que_registra(monkeypatch, {
+        "ok": False, "log": [], "traceback": "...",
+        "error": "AnalysisException: [TABLE_OR_VIEW_NOT_FOUND] The table or view `db`.`sumida` cannot be found."})
+    app.session_state["engine_kind"] = "local"
+    app.text_area[0].set_value("SELECT * FROM minha_view").run()
+    _botao(app, "Executar").click().run()
+    assert any("`db.sumida`" in e.value and "orquestração" in e.value for e in app.error)
+
+
 def test_limpar(app):
     _botao(app, "Limpar").click().run()
     assert app.text_area[0].value == ""

@@ -32,8 +32,9 @@ O navegador abre em `http://localhost:8501`.
    - `s3` + `s3://bucket/caminho/` + formato + opções (`header=true;sep=;`).
    Também dá para aplicar um filtro antes de criar a view, ligar cache, definir configs `spark.*`, escolher um database padrão e o limite de linhas. A orquestração pode ser exportada ou importada em JSON.
 4. **Passo 2 – Query**: escreva no editor ou importe um `.sql`/`.txt`. O conteúdo vai para o editor, onde pode ser alterado. Vários comandos separados por `;` são executados em ordem, e o resultado exibido é o do último.
-5. **▶️ Executar**: na primeira vez a sessão Glue é criada (~30–90 s). As execuções seguintes reaproveitam a mesma sessão e levam segundos.
-6. **Passo 3 – Resultado**: mostra as N primeiras linhas, o schema e o log. **Exportar CSV** baixa o arquivo para o seu PC; o separador `;` com UTF-8 BOM abre direto no Excel em português.
+5. **Conferência da orquestração**: antes de enviar ao cluster, a query é lida e cada base usada em `FROM`/`JOIN` é comparada com as entradas da orquestração. Se faltar alguma, a execução é bloqueada com uma mensagem como *"A base `db.produtos` é usada na query (linha 3), mas não está na orquestração"*. O aviso já aparece embaixo do editor enquanto você digita. CTEs (`WITH`), views criadas na própria query, subqueries e funções como `range()` não são cobradas. Se o Spark ainda assim não encontrar uma tabela, o erro dele é traduzido para a mesma mensagem. A conferência pode ser desligada em **Opções**.
+6. **▶️ Executar**: na primeira vez a sessão Glue é criada (~30–90 s). As execuções seguintes reaproveitam a mesma sessão e levam segundos.
+7. **Passo 3 – Resultado**: mostra as N primeiras linhas, o schema e o log. **Exportar CSV** baixa o arquivo para o seu PC; o separador `;` com UTF-8 BOM abre direto no Excel em português.
 
 Use **Ver código PySpark gerado** para conferir exatamente o que vai rodar no cluster.
 
@@ -70,6 +71,7 @@ O GitHub Actions roda tudo a cada push, em Python 3.10, 3.12 e 3.13.
 |---|---|
 | `app.py` | Interface (Streamlit) |
 | `engines.py` | Motores: Glue Interactive Sessions e Spark local |
+| `sql_refs.py` | Descobre as bases usadas pela query e confere com a orquestração |
 | `code_builder.py` | Gera o código PySpark a partir da orquestração e da query, e lê o resultado |
 | `settings_store.py` | Salva e carrega a configuração (sem segredos) |
 | `tests/` | Testes (pytest); `fakes.py` tem o Spark e o cliente Glue simulados |
