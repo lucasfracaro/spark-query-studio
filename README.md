@@ -2,6 +2,8 @@
 
 [![testes](https://github.com/lucasfracaro/spark-query-studio/actions/workflows/testes.yml/badge.svg)](https://github.com/lucasfracaro/spark-query-studio/actions/workflows/testes.yml)
 
+**⬇️ [Baixar o projeto completo (.zip)](https://github.com/lucasfracaro/spark-query-studio/raw/main/dist/spark-query-studio.zip)**: o arquivo também está na pasta [`dist/`](dist/) do repositório e é atualizado a cada versão.
+
 Frontend em Streamlit para escrever ou importar uma query Spark SQL, configurar a orquestração das entradas e a instância, executar no **AWS Glue (Interactive Sessions)** e ver as primeiras linhas, com exportação para CSV. Assim você não precisa passar pelo Athena para validar uma ETL.
 
 ```
@@ -90,6 +92,17 @@ Uma Interactive Session é cobrada por DPU-hora enquanto estiver ativa (a barra 
 
 Para testar a interface sem gastar com a AWS, instale `pyspark` (requer Java 11/17) e escolha **Spark local**. Entradas `s3` funcionam com caminhos locais (ex.: `/dados/arquivo.parquet`). Para ler `s3a://` localmente, adicione `spark.jars.packages = org.apache.hadoop:hadoop-aws:3.3.4` nos argumentos extras.
 
+## Atualizar o zip do projeto
+
+O arquivo `dist/spark-query-studio.zip` faz parte do repositório. Ao alterar o projeto, gere o zip de novo antes do commit:
+
+```bash
+python scripts/gerar_zip.py
+git add -A && git commit -m "..." && git push
+```
+
+O script só regrava o zip quando algum arquivo mudou. O GitHub Actions confere a cada push se o zip está em dia com o código e fica vermelho se alguém esquecer de gerar.
+
 ## Testes
 
 ```bash
@@ -114,6 +127,7 @@ O GitHub Actions roda tudo a cada push, em Python 3.10, 3.12 e 3.13.
 | `sql_refs.py` | Descobre as bases usadas pela query e confere com a orquestração |
 | `code_builder.py` | Gera o código PySpark a partir da orquestração e da query, e lê o resultado |
 | `settings_store.py` | Salva e carrega a configuração (sem segredos) |
+| `scripts/gerar_zip.py` | Gera `dist/spark-query-studio.zip` com o projeto completo |
 | `tests/` | Testes (pytest); `fakes.py` tem o Spark e o cliente Glue simulados |
 
 ## Próximos passos possíveis

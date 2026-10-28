@@ -21,6 +21,16 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: pytest --ignore=tests/test_local_spark.py
 
+  zip:
+    name: Zip do projeto atualizado
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/gerar_zip.py --check
+
   spark:
     name: Integração com Spark local
     runs-on: ubuntu-latest
