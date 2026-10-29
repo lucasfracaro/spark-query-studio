@@ -126,3 +126,105 @@ def test_query_grande_vai_comprimida(engine):
     res = engine.run(code)
     assert res["ok"], res
     assert len(res["columns"]) == 3000 and res["rows"][0][2999] == 2999
+
+
+# --------------------------------------------------------------------------- cache entre execuções
+def _vendas_csv(caminho, valores):
+    linhas = "\n".join(f"{i};{v}" for i, v in enumerate(valores, start=1))
+    caminho.write_text("id;valor\n" + linhas + "\n", encoding="utf-8")
+
+
+def test_cache_vale_entre_execucoes_ate_limpar(engine, tmp_path):
+    from code_builder import build_clear_cache_code
+    arq = tmp_path / "v.csv"
+    _vendas_csv(arq, [10, 20])
+    entrada = InputSource("v", "s3", str(arq), "csv", "header=true;sep=;;inferSchema=true", cache=True)
+    r1 = _run(engine, "SELECT SUM(valor) AS total FROM v", inputs=[entrada])
+    assert r1["ok"], r1
+    assert r1["rows"] == [[30]] and any("lido agora" in linha for linha in r1["log"])
+
+    _vendas_csv(arq, [1, 2])          # os dados mudam no "S3"
+    r2 = _run(engine, "SELECT SUM(valor) AS total, COUNT(*) AS n FROM v", inputs=[entrada])
+    assert r2["ok"], r2
+    assert r2["rows"] == [[30, 2]]                                     # veio do cache: não releu
+    assert any("cache reaproveitado" in linha for linha in r2["log"])
+
+    assert engine.run(build_clear_cache_code())["ok"]
+    r3 = _run(engine, "SELECT SUM(valor) AS total FROM v", inputs=[entrada])
+    assert r3["rows"] == [[3]]                                         # depois de limpar, relê
+
+
+def test_entrada_sem_cache_e_sempre_relida(engine, tmp_path):
+    arq = tmp_path / "v.csv"
+    _vendas_csv(arq, [5])
+    entrada = InputSource("v", "s3", str(arq), "csv", "header=true;sep=;;inferSchema=true")
+    assert _run(engine, "SELECT SUM(valor) FROM v", inputs=[entrada])["rows"] == [[5]]
+    _vendas_csv(arq, [7])
+    assert _run(engine, "SELECT SUM(valor) FROM v", inputs=[entrada])["rows"] == [[7]]
+
+
+def test_cache_table_da_query_vale_entre_execucoes(engine, tmp_path):
+    arq = tmp_path / "v.csv"
+    _vendas_csv(arq, [1, 1])
+    entrada = InputSource("v", "s3", str(arq), "csv", "header=true;sep=;;inferSchema=true")
+    sql = "CACHE TABLE base AS SELECT * FROM v WHERE valor > 0; SELECT SUM(valor) FROM base"
+    assert _run(engine, sql, inputs=[entrada])["rows"] == [[2]]
+    _vendas_csv(arq, [5, 5])
+    r2 = _run(engine, sql, inputs=[entrada])
+    assert r2["ok"], r2
+    assert r2["rows"] == [[2]]                                         # o CACHE TABLE foi reaproveitado
+    r3 = _run(engine, "SELECT SUM(valor) FROM v", inputs=[entrada])    # sem o CACHE TABLE: liberado
+    assert r3["rows"] == [[10]] and "cache liberado: base" in r3["log"]
+
+
+# --------------------------------------------------------------------------- Glue 4.0 + Lake Formation
+class _GlueContextLocal:
+    """Imita o awsglue: o DataFrame nasce na sessão principal, não na sessão da execução."""
+    tabelas: dict = {}
+    leituras: list = []
+
+    def __init__(self, sc):
+        from pyspark.sql import SparkSession
+        self._spark = SparkSession.builder.getOrCreate()
+        self.create_dynamic_frame = self
+
+    def from_catalog(self, database, table_name, push_down_predicate=""):
+        _GlueContextLocal.leituras.append((database, table_name, push_down_predicate))
+        df = (self._spark.read.option("header", "true").option("sep", ";").option("inferSchema", "true")
+              .csv(_GlueContextLocal.tabelas[f"{database}.{table_name}"]))
+        df = df.where(push_down_predicate) if push_down_predicate else df
+
+        class _Dyf:
+            def toDF(self):
+                return df
+        return _Dyf()
+
+
+@pytest.fixture
+def awsglue_local(monkeypatch):
+    import sys
+    import types
+    pacote, modulo = types.ModuleType("awsglue"), types.ModuleType("awsglue.context")
+    modulo.GlueContext = _GlueContextLocal
+    pacote.context = modulo
+    monkeypatch.setitem(sys.modules, "awsglue", pacote)
+    monkeypatch.setitem(sys.modules, "awsglue.context", modulo)
+    _GlueContextLocal.leituras.clear()
+    LocalSparkEngine._namespace.pop("_sqs_gc", None)
+    return _GlueContextLocal
+
+
+def test_glue_context_traz_os_dados_para_a_sessao_da_execucao(engine, tmp_path, awsglue_local):
+    arq = tmp_path / "vendas.csv"
+    _vendas_csv(arq, [10, 20, 30])
+    awsglue_local.tabelas["db.vendas"] = str(arq)
+    entrada = InputSource("vendas", "catalog", "db.vendas", filter="id >= 2", cache=True)
+    code = build_spark_code("SELECT SUM(valor) AS total FROM vendas", Orchestration(inputs=[entrada]),
+                            reader="glue_context")
+    r1 = engine.run(code)
+    assert r1["ok"], r1
+    assert r1["rows"] == [[50]]
+    assert awsglue_local.leituras == [("db", "vendas", "id >= 2")]
+    r2 = engine.run(code)
+    assert r2["rows"] == [[50]] and len(awsglue_local.leituras) == 1      # cache: não leu de novo
+    assert any("cache reaproveitado" in linha for linha in r2["log"])

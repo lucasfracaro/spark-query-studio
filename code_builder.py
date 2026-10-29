@@ -6,12 +6,18 @@ Gera o código PySpark que será executado no motor (Glue Interactive Session ou
   (68 mil caracteres por comando) a query e as configurações vão comprimidas (zlib + base64).
 - Cada execução usa uma sessão Spark nova (spark.newSession()): configurações, database
   atual e views de execuções anteriores não passam para a próxima, como num job novo.
+- O cache continua entre as execuções: entradas marcadas com "cache" (e CACHE TABLE da própria
+  query) não são relidas do S3 enquanto a definição não mudar. O que sai da orquestração é liberado.
+- reader="glue_context" (Glue 4.0 com Lake Formation): as entradas do catálogo são lidas com
+  glueContext.create_dynamic_frame.from_catalog, como num job do Glue, porque no Glue 4.0 só essa
+  leitura usa as permissões do Lake Formation (dados no S3 de outra conta).
 - O resultado volta como uma linha marcada com RESULT_MARKER, com o JSON comprimido em base64.
 """
 from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import pprint
 import re
@@ -21,6 +27,7 @@ from dataclasses import asdict, dataclass, field
 RESULT_MARKER = "__SQS_RESULT__"
 DEFAULT_LIMIT = 100
 GLUE_CODE_LIMIT = 68_000   # tamanho máximo do campo Code do RunStatement (API do Glue)
+READERS = ("spark", "glue_context")
 
 
 @dataclass
@@ -186,8 +193,9 @@ def _payload_compressed(statements: list[str], payload: dict) -> str:
             '_statements = _p.pop("statements")\n')
 
 
-_TEMPLATE = r'''
+_TEMPLATE = r"""
 import base64 as _b64, json as _json, time as _time, traceback as _tb, zlib as _zlib
+from decimal import Decimal as _Decimal
 
 #__PAYLOAD__
 _t0 = _time.time()
@@ -199,6 +207,14 @@ def _emit(obj):
     print(_p["marker"] + _b64.b64encode(_zlib.compress(_raw, 6)).decode("ascii"))
 
 
+def _valor(_x):
+    if _x is None or isinstance(_x, (int, float, bool, str)):
+        return _x
+    if isinstance(_x, _Decimal):
+        return format(_x, "f")              # "1.50" (e zero com casas decimais não vira "0E-10")
+    return str(_x)
+
+
 try:
     try:
         spark                       # no Glue (e no modo local) a sessão já existe
@@ -207,9 +223,8 @@ try:
         spark = SparkSession.builder.getOrCreate()
 
     # Sessão Spark nova a cada execução: configurações, database atual e views de execuções
-    # anteriores não passam para esta, como num job novo. O cache em memória também é limpo.
+    # anteriores não passam para esta, como num job novo.
     _s = spark.newSession()
-    _s.catalog.clearCache()
     for _row in spark.sql("SET").collect():      # configurações iniciais (ex.: as do Glue)
         try:
             if _s.conf.get(_row[0], None) != _row[1]:
@@ -228,33 +243,110 @@ try:
         _s.sql("USE " + _p["db"])
         _log.append("USE " + _p["db"])
 
+    # Cache entre execuções: o que foi marcado com "cache" continua em memória na sessão e não é relido
+    # do S3 enquanto a definição não mudar. O que saiu da orquestração (ou da query) é liberado.
+    _cache = globals().setdefault("_sqs_cache", {})        # {chave: [DataFrame, hora da leitura, nome]}
+    for _chave in [_c for _c in _cache if _c not in _p["keep_cached"]]:
+        try:
+            _cache[_chave][0].unpersist()
+        except Exception:
+            pass
+        _log.append("cache liberado: " + _cache.pop(_chave)[2])
+
+    def _ler_pelo_glue_context(_src, _filtro, _alias):
+        # Glue 4.0 com Lake Formation: só a leitura pelo GlueContext usa as permissões do Lake Formation,
+        # como nos jobs do Glue. O filtro vai como push_down_predicate: só as partições pedidas são lidas.
+        # Se o filtro não servir para escolher partições, a execução para: ler a tabela inteira sem
+        # avisar pode levar horas.
+        _gc = globals().get("_sqs_gc")
+        if _gc is None:
+            from awsglue.context import GlueContext
+            _gc = globals()["_sqs_gc"] = GlueContext(spark.sparkContext)
+        _db, _tabela = _src.split(".", 1) if "." in _src else ((_p["db"] or "default"), _src)
+        _t = _time.time()
+        try:
+            _d = _gc.create_dynamic_frame.from_catalog(database=_db, table_name=_tabela,
+                                                       push_down_predicate=_filtro).toDF()
+        except Exception as _e:
+            if not _filtro:
+                raise
+            raise RuntimeError(
+                "O filtro da entrada " + _alias + " (" + _filtro + ") não pôde ser usado para escolher as "
+                "partições de " + _src + ". Na leitura pelo GlueContext, o filtro da orquestração deve usar só "
+                "colunas de partição; as outras condições vão na query. Erro do Glue: "
+                + (str(_e).strip().splitlines() or [""])[0][:300]) from _e
+        _log.append("leitura de " + _alias + " pelo GlueContext preparada em " + str(round(_time.time() - _t, 1))
+                    + "s" + (" (partições: " + _filtro + ")" if _filtro else " (SEM filtro: a tabela inteira)"))
+        return _d.where(_filtro) if _filtro else _d
+
+    def _para_esta_sessao(_d):
+        # o GlueContext cria o DataFrame na sessão principal; a query roda na sessão desta execução
+        return type(_d)(_s._jsparkSession.createDataFrame(_d._jdf.rdd(), _d._jdf.schema()), _s)
+
     for _inp in _p["inputs"]:
         _alias, _src = _inp["alias"].strip(), _inp["source"].strip()
-        if _inp["kind"] == "catalog":
-            _df = _s.table(_src)
+        _filtro = (_inp.get("filter") or "").strip()
+        _chave, _cachear, _reaproveitado = _inp["key"], bool(_inp.get("cache")), False
+        if _inp["kind"] == "catalog" and _p["reader"] == "glue_context":
+            if _cachear and _chave in _cache:
+                _base, _reaproveitado = _cache[_chave][0], True
+            else:
+                _base = _ler_pelo_glue_context(_src, _filtro, _alias)
+                if _cachear:
+                    _base.cache()
+                    _cache[_chave] = [_base, _time.strftime("%H:%M:%S"), _alias]
+            _df = _para_esta_sessao(_base)
         else:
-            _r = _s.read.format((_inp.get("fmt") or "parquet").lower())
-            for _ok, _ov in (_inp.get("options") or {}).items():
-                _r = _r.option(_ok, _ov)
-            _df = _r.load(_src)
-        if (_inp.get("filter") or "").strip():
-            _df = _df.where(_inp["filter"])
+            if _inp["kind"] == "catalog":
+                _df = _s.table(_src)
+            else:
+                _r = _s.read.format((_inp.get("fmt") or "parquet").lower())
+                for _ok, _ov in (_inp.get("options") or {}).items():
+                    _r = _r.option(_ok, _ov)
+                _df = _r.load(_src)
+            if _filtro:
+                _df = _df.where(_filtro)
+            if _cachear:
+                # o cache do Spark vale para todas as sessões: se esta leitura é igual à de uma execução
+                # anterior, os dados já estão em memória
+                _nivel = _df.storageLevel
+                _reaproveitado = bool(_nivel.useMemory or _nivel.useDisk or _nivel.useOffHeap)
+                if not _reaproveitado:
+                    if _chave in _cache:
+                        try:
+                            _cache.pop(_chave)[0].unpersist()
+                        except Exception:
+                            pass
+                    _df.cache()
+                if _chave not in _cache:
+                    _cache[_chave] = [_df, _time.strftime("%H:%M:%S") if not _reaproveitado else "antes", _alias]
         _df.createOrReplaceTempView(_alias)
-        if _inp.get("cache"):
-            _s.catalog.cacheTable(_alias)
-        _log.append("view " + _alias + " <- " + _src)
+        _msg = "view " + _alias + " <- " + _src
+        if _cachear:
+            _msg += (" (cache reaproveitado: dados lidos " + ("às " if _cache[_chave][1] != "antes" else "")
+                     + _cache[_chave][1] + "; para reler, use Limpar cache)" if _reaproveitado
+                     else " (cache: lido agora e mantido para as próximas execuções)")
+        elif _inp["kind"] == "catalog" and _p["reader"] == "glue_context":
+            _msg += " (dica: marque Cache para esta leitura acontecer uma vez só por sessão)"
+        _log.append(_msg)
 
     # comandos (CREATE VIEW, SET, CACHE...) rodam na hora; um SELECT só roda quando é o último
     _df = None
     for _cmd in _statements:
         _df = _s.sql(_cmd)
 
+    # CACHE TABLE da própria query: os dados ficam em memória enquanto o comando continuar na query
+    for _c in _p["sql_caches"]:
+        if _c["key"] not in _cache:
+            try:
+                _cache[_c["key"]] = [_s.table(_c["name"]), _time.strftime("%H:%M:%S"), _c["name"]]
+            except Exception:
+                pass
+
     _fields = _df.schema.fields
     _cols = [{"name": _f.name, "type": _f.dataType.simpleString(), "nullable": bool(getattr(_f, "nullable", True))}
              for _f in _fields]
-    _rows = []
-    for _row in _df.limit(_p["limit"]).collect():
-        _rows.append([None if _x is None else (_x if isinstance(_x, (int, float, bool, str)) else str(_x)) for _x in _row])
+    _rows = [[_valor(_x) for _x in _row] for _row in _df.limit(_p["limit"]).collect()]
     _out = {"ok": True, "columns": _cols, "rows": _rows, "elapsed": round(_time.time() - _t0, 2), "log": _log}
 
     if _p["profile"] and _fields:
@@ -271,13 +363,9 @@ try:
                 _aggs += [_F.approx_count_distinct(_c).alias("d%d" % _i), _F.min(_c).alias("mn%d" % _i),
                           _F.max(_c).alias("mx%d" % _i)]
         _a = _dfp.agg(*_aggs).collect()[0].asDict()
-
-        def _txt(_v):
-            return None if _v is None else (_v if isinstance(_v, (int, float, bool)) else str(_v))
-
         _out["profile"] = {"rows": _a["__n"], "columns": [
             {"nulls": _a["__n"] - _a["n%d" % _i], "distinct": _a.get("d%d" % _i),
-             "min": _txt(_a.get("mn%d" % _i)), "max": _txt(_a.get("mx%d" % _i))}
+             "min": _valor(_a.get("mn%d" % _i)), "max": _valor(_a.get("mx%d" % _i))}
             for _i in range(len(_fields))]}
         _log.append("estatísticas calculadas em " + str(_a["__n"]) + " linhas")
 
@@ -285,25 +373,66 @@ try:
 except Exception as _e:
     _emit({"ok": False, "error": type(_e).__name__ + ": " + str(_e), "traceback": _tb.format_exc(),
            "elapsed": round(_time.time() - _t0, 2), "log": _log})
-'''.strip()
+""".strip()
 
 
-def build_spark_code(sql: str, orch: Orchestration, profile: bool = False) -> str:
+def _key(*partes) -> str:
+    texto = json.dumps(partes, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(texto.encode("utf-8")).hexdigest()[:12]
+
+
+def input_cache_key(inp: InputSource, default_database: str = "", reader: str = "spark") -> str:
+    """Identifica o que é lido por uma entrada: se não mudar, o cache da execução anterior serve.
+    O alias não entra: renomear a view não obriga a reler os dados."""
+    if inp.kind == "s3":
+        ident = ("s3", inp.source.strip(), (inp.fmt or "parquet").lower(), parse_options(inp.options))
+    else:
+        db = "" if "." in inp.source else default_database.strip()
+        ident = ("catalog", inp.source.strip().lower(), db.lower(), reader)
+    return "e:" + _key(*ident, inp.filter.strip())
+
+
+_LEADING_COMMENTS_RE = re.compile(r"^(\s+|--[^\n]*(\n|$)|/\*.*?\*/)+", re.S)
+_CACHE_RE = re.compile(r"CACHE\s+(?:LAZY\s+)?TABLE\s+((?:`[^`]+`|[\w$]+)(?:\.(?:`[^`]+`|[\w$]+))*)", re.I)
+
+
+def sql_cache_targets(statements: list[str]) -> list[dict]:
+    """Tabelas/views que a própria query coloca em cache (CACHE TABLE ...)."""
+    alvos = []
+    for comando in statements:
+        texto = _LEADING_COMMENTS_RE.sub("", comando)
+        m = _CACHE_RE.match(texto)
+        if m:
+            alvos.append({"key": "q:" + _key(" ".join(texto.split())), "name": m.group(1)})
+    return alvos
+
+
+def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reader: str = "spark") -> str:
     """Monta o script PySpark que cria as entradas, roda a query e imprime o resultado.
 
     O código mostrado na tela é exatamente o que roda. Se a versão legível passar do limite do
     Glue, a query vai comprimida; se nem assim couber, levanta ValueError.
+    reader="glue_context": entradas do catálogo lidas pelo GlueContext (Glue 4.0 com Lake Formation).
     """
+    if reader not in READERS:
+        raise ValueError(f"Leitor desconhecido: {reader}")
     statements = split_statements((sql or "").replace("\r\n", "\n"))
     if not statements:
         raise ValueError("A query está vazia.")
 
+    db = orch.default_database.strip()
+    inputs = [dict(asdict(i), options=parse_options(i.options), key=input_cache_key(i, db, reader))
+              for i in orch.inputs if i.is_valid()]
+    caches_sql = sql_cache_targets(statements)
     payload = {
-        "inputs": [dict(asdict(i), options=parse_options(i.options)) for i in orch.inputs if i.is_valid()],
+        "inputs": inputs,
         "conf": {k: v for k, v in orch.spark_conf.items() if k and str(k).strip()},
-        "db": orch.default_database.strip(),
+        "db": db,
         "limit": int(orch.limit),
         "profile": bool(profile),
+        "reader": reader,
+        "keep_cached": [i["key"] for i in inputs if i["cache"]] + [c["key"] for c in caches_sql],
+        "sql_caches": caches_sql,
         "marker": RESULT_MARKER,
     }
     code = _TEMPLATE.replace("#__PAYLOAD__", _payload_readable(statements, payload))
@@ -313,6 +442,27 @@ def build_spark_code(sql: str, orch: Orchestration, profile: bool = False) -> st
         raise ValueError(f"A query é grande demais para o Glue: mesmo comprimido, o código tem "
                          f"{len(code):,} caracteres e o limite é {GLUE_CODE_LIMIT:,}.".replace(",", "."))
     return code
+
+
+_CLEAR_CACHE = r"""
+import base64 as _b64, json as _json, zlib as _zlib
+try:
+    spark
+except NameError:
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
+_n = len(globals().get("_sqs_cache", {}))
+spark.catalog.clearCache()
+globals()["_sqs_cache"] = {}
+_raw = _json.dumps({"ok": True, "columns": [], "rows": [],
+                    "log": ["cache da sessão limpo (%d entrada(s) guardada(s) pela ferramenta)" % _n]})
+print("#__MARKER__" + _b64.b64encode(_zlib.compress(_raw.encode("utf-8"), 6)).decode("ascii"))
+""".strip()
+
+
+def build_clear_cache_code() -> str:
+    """Código que tira tudo do cache da sessão (para reler dados que mudaram no S3)."""
+    return _CLEAR_CACHE.replace("#__MARKER__", RESULT_MARKER)
 
 
 def parse_result(output_text: str) -> dict | None:

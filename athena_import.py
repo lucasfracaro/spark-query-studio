@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 from code_builder import DEFAULT_LIMIT, InputSource, Orchestration
 from sql_refs import is_read_table

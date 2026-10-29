@@ -6,9 +6,22 @@ import zlib
 import pytest
 
 import code_builder
-from code_builder import (GLUE_CODE_LIMIT, RESULT_MARKER, InputSource, Orchestration, build_spark_code,
-                          parse_options, parse_result, py_literal, split_statements, validate_orchestration)
-from fakes import FakeSpark, run_generated
+from code_builder import (
+    GLUE_CODE_LIMIT,
+    RESULT_MARKER,
+    InputSource,
+    Orchestration,
+    build_clear_cache_code,
+    build_spark_code,
+    input_cache_key,
+    parse_options,
+    parse_result,
+    py_literal,
+    split_statements,
+    sql_cache_targets,
+    validate_orchestration,
+)
+from fakes import FakeGlueContext, FakeSpark, run_generated
 
 
 # --------------------------------------------------------------------------- split_statements
@@ -145,13 +158,13 @@ def test_execucao_completa():
     assert set(s.views) == {"vendas", "clientes"}
     assert ("where", "dt >= '2026-01-01'") in s.calls
     assert ("load", "csv", "s3://b/clientes/", {"header": "true", "sep": ";"}) in s.calls
-    assert s.cached == ["clientes"]
+    assert spark.cached == [("load", "csv", "s3://b/clientes/", (("header", "true"), ("sep", ";")))]
     assert any("view vendas" in linha for linha in res["log"])
     # a sessão original não é alterada
     assert spark.conf_values == {} and spark.views == {} and spark.sql_log == ["SET"]
 
 
-def test_cada_execucao_usa_sessao_nova_e_limpa_o_cache():
+def test_cada_execucao_usa_sessao_nova():
     spark = FakeSpark(settings={"spark.sql.catalogImplementation": "hive", "spark.glue.algo": "x"})
     orch = Orchestration(inputs=[InputSource("v", "catalog", "db.v")],
                          spark_conf={"spark.sql.shuffle.partitions": "7"})
@@ -161,7 +174,156 @@ def test_cada_execucao_usa_sessao_nova_e_limpa_o_cache():
     assert primeira is not segunda
     assert "v" in primeira.views and segunda.views == {}            # a view da 1ª execução não existe na 2ª
     assert segunda.conf_values == {"spark.sql.catalogImplementation": "hive", "spark.glue.algo": "x"}
-    assert primeira.cache_cleared == 1 and segunda.cache_cleared == 1
+    assert spark.cache_cleared == 0                                 # o cache não é jogado fora a cada execução
+
+
+# --------------------------------------------------------------------------- cache entre execuções
+def _cacheada(alias="clientes", filtro="", fonte="s3://b/clientes/"):
+    return InputSource(alias, "s3", fonte, "csv", "header=true", filter=filtro, cache=True)
+
+
+def _rodar(spark, ns, sql="SELECT 1", *inputs, **kw):
+    return run_generated(build_spark_code(sql, Orchestration(inputs=list(inputs)), **kw), spark, ns)
+
+
+def test_entrada_em_cache_nao_e_relida_na_execucao_seguinte():
+    spark, ns = FakeSpark(), {}
+    r1 = _rodar(spark, ns, "SELECT * FROM clientes", _cacheada())
+    assert r1["ok"] and any("lido agora" in linha for linha in r1["log"])
+    r2 = _rodar(spark, ns, "SELECT count(*) FROM clientes", _cacheada())
+    assert r2["ok"] and any("cache reaproveitado" in linha for linha in r2["log"])
+    assert len(spark.cached) == 1 and spark.uncached == []        # leu e guardou uma vez só
+
+
+def test_renomear_o_alias_nao_obriga_a_reler():
+    spark, ns = FakeSpark(), {}
+    _rodar(spark, ns, "SELECT 1", _cacheada("a"))
+    r2 = _rodar(spark, ns, "SELECT 1", _cacheada("b"))
+    assert any("cache reaproveitado" in linha for linha in r2["log"]) and len(spark.cached) == 1
+
+
+def test_entrada_que_sai_da_orquestracao_e_liberada():
+    spark, ns = FakeSpark(), {}
+    _rodar(spark, ns, "SELECT 1", _cacheada())
+    r2 = _rodar(spark, ns, "SELECT 1", InputSource("outra", "catalog", "db.t"))
+    assert spark.uncached == spark.cached and spark.shared_cache == set()
+    assert "cache liberado: clientes" in r2["log"]
+
+
+def test_filtro_diferente_libera_o_antigo_e_le_de_novo():
+    spark, ns = FakeSpark(), {}
+    _rodar(spark, ns, "SELECT 1", _cacheada(filtro="dt = '1'"))
+    _rodar(spark, ns, "SELECT 1", _cacheada(filtro="dt = '2'"))
+    antigo, novo = spark.cached
+    assert spark.uncached == [antigo] and spark.shared_cache == {novo}
+
+
+def test_cache_que_o_spark_perdeu_e_refeito():
+    spark, ns = FakeSpark(), {}
+    _rodar(spark, ns, "SELECT 1", _cacheada())
+    spark.shared_cache.clear()                     # ex.: alguém rodou CLEAR CACHE na sessão
+    r2 = _rodar(spark, ns, "SELECT 1", _cacheada())
+    assert len(spark.cached) == 2 and any("lido agora" in linha for linha in r2["log"])
+
+
+def test_cache_table_da_query_fica_enquanto_o_comando_continuar_na_query():
+    spark, ns = FakeSpark(), {}
+    sql = "-- base\nCACHE TABLE tmp AS SELECT 1; SELECT * FROM tmp"
+    _rodar(spark, ns, sql)
+    _rodar(spark, ns, sql + " WHERE 1 = 1")       # o CACHE TABLE é o mesmo: continua
+    assert spark.uncached == []
+    r3 = _rodar(spark, ns, "SELECT 2")
+    assert spark.uncached == [("table", "tmp")] and "cache liberado: tmp" in r3["log"]
+
+
+def test_limpar_cache():
+    spark, ns = FakeSpark(), {}
+    _rodar(spark, ns, "SELECT 1", _cacheada())
+    res = run_generated(build_clear_cache_code(), spark, ns)
+    assert res["ok"] and "1 entrada" in res["log"][0]
+    assert spark.cache_cleared == 1 and ns["_sqs_cache"] == {}
+
+
+def test_chave_do_cache():
+    base = input_cache_key(_cacheada("a"))
+    assert base == input_cache_key(_cacheada("b"))                                  # alias não importa
+    assert base != input_cache_key(_cacheada(filtro="x = 1"))
+    assert base != input_cache_key(_cacheada(fonte="s3://b/outro/"))
+    tabela = InputSource("v", "catalog", "vendas")
+    assert input_cache_key(tabela, "db1") != input_cache_key(tabela, "db2")         # sem database: o padrão conta
+    assert input_cache_key(tabela, "db1") != input_cache_key(tabela, "db1", "glue_context")
+    completa = InputSource("v", "catalog", "db.vendas")
+    assert input_cache_key(completa, "db1") == input_cache_key(completa, "db2")
+
+
+@pytest.mark.parametrize("sql, nomes", [
+    ("CACHE TABLE t AS SELECT 1", ["t"]),
+    ("-- comentário\n/* outro */ cache lazy table db.t", ["db.t"]),
+    ("CACHE TABLE `minha view` OPTIONS ('storageLevel' 'DISK_ONLY') SELECT 1", ["`minha view`"]),
+    ("SELECT 'CACHE TABLE x'", []),
+    ("UNCACHE TABLE t", []),
+])
+def test_cache_table_na_query(sql, nomes):
+    assert [a["name"] for a in sql_cache_targets([sql])] == nomes
+
+
+# --------------------------------------------------------------------------- Glue 4.0 + Lake Formation
+@pytest.fixture
+def glue_context(monkeypatch):
+    import sys
+    import types
+    pacote, modulo = types.ModuleType("awsglue"), types.ModuleType("awsglue.context")
+    modulo.GlueContext = FakeGlueContext
+    pacote.context = modulo
+    monkeypatch.setitem(sys.modules, "awsglue", pacote)
+    monkeypatch.setitem(sys.modules, "awsglue.context", modulo)
+    FakeGlueContext.instancias.clear()
+    return FakeGlueContext.instancias
+
+
+def test_glue_context_le_o_catalogo_com_push_down_predicate(glue_context):
+    spark, ns = FakeSpark(), {}
+    orch = Orchestration(inputs=[InputSource("vendas", "catalog", "db.vendas", filter="dt >= '2026-10-01'"),
+                                 InputSource("itens", "catalog", "itens"),
+                                 InputSource("arquivo", "s3", "s3://b/p/")],
+                         default_database="analytics")
+    res = run_generated(build_spark_code("SELECT * FROM vendas", orch, reader="glue_context"), spark, ns)
+    assert res["ok"], res
+    [gc] = glue_context
+    assert gc.reads == [("db", "vendas", "dt >= '2026-10-01'"), ("analytics", "itens", "")]
+    s = spark.last_session
+    vendas = s.views["vendas"]
+    assert vendas.spark is s                                       # trazido para a sessão da execução
+    assert vendas.plan == ("rdd", "glue", "db", "vendas", "dt >= '2026-10-01'", ("where", "dt >= '2026-10-01'"))
+    assert s.views["arquivo"].plan[0] == "load"                    # S3 direto continua igual
+
+
+def test_glue_context_filtro_fora_das_particoes_para_em_vez_de_ler_tudo(glue_context):
+    spark, ns = FakeSpark(), {}
+    r1 = _rodar(spark, ns, "SELECT 1", InputSource("v", "catalog", "db.v"), reader="glue_context")
+    assert any("SEM filtro" in linha for linha in r1["log"]) and any("dica: marque Cache" in linha for linha in r1["log"])
+    glue_context[0].falhar_com_filtro = True
+    res = _rodar(spark, ns, "SELECT 1", InputSource("v", "catalog", "db.v", filter="valor > 10"),
+                 reader="glue_context")
+    assert res["ok"] is False
+    assert "só colunas de partição" in res["error"] and "valor > 10" in res["error"]
+    assert glue_context[0].reads == [("db", "v", "")]          # não leu a tabela inteira por conta própria
+
+
+def test_glue_context_criado_uma_vez_e_cache_sem_reler(glue_context):
+    spark, ns = FakeSpark(), {}
+    entrada = InputSource("v", "catalog", "db.v", filter="dt = '1'", cache=True)
+    _rodar(spark, ns, "SELECT 1", entrada, reader="glue_context")
+    r2 = _rodar(spark, ns, "SELECT 2", entrada, reader="glue_context")
+    assert len(glue_context) == 1 and len(glue_context[0].reads) == 1
+    assert any("cache reaproveitado" in linha for linha in r2["log"])
+    _rodar(spark, ns, "SELECT 3", InputSource("v", "catalog", "db.v", filter="dt = '1'"), reader="glue_context")
+    assert spark.uncached and len(glue_context[0].reads) == 2     # sem cache: liberou e leu de novo
+
+
+def test_leitor_desconhecido():
+    with pytest.raises(ValueError):
+        build_spark_code("SELECT 1", Orchestration(), reader="outro")
 
 
 def test_comandos_intermediarios_nao_sao_trazidos_para_o_driver():
@@ -194,6 +356,14 @@ def test_tipos_nao_json_viram_texto():
     cols = [("d", "decimal(10,2)"), ("dt", "date"), ("b", "binary"), ("arr", "array<int>"), ("ok", "boolean")]
     res = run_generated(build_spark_code("SELECT 1", Orchestration()), FakeSpark(rows=rows, columns=cols))
     assert res["rows"] == [["1.50", "2026-10-26", "b'bin'", "[1, 2]", True]]
+
+
+def test_decimal_sem_notacao_cientifica():
+    import decimal
+    rows = [(decimal.Decimal("0E-10"), decimal.Decimal("1E+2"))]
+    res = run_generated(build_spark_code("SELECT 1", Orchestration()),
+                        FakeSpark(rows=rows, columns=[("a", "decimal(20,10)"), ("b", "decimal(10,0)")]))
+    assert res["rows"] == [["0.0000000000", "100"]]
 
 
 def test_query_viaja_intacta():

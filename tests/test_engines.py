@@ -11,7 +11,6 @@ from fakes import FakeGlueClient, FakeSts
 
 @pytest.fixture(autouse=True)
 def sem_espera(monkeypatch):
-    monkeypatch.setattr(GlueSessionEngine, "POLL_S", 0)
     monkeypatch.setattr(engines.time, "sleep", lambda s: None)
 
 
@@ -111,7 +110,7 @@ def test_run_devolve_resultado():
     glue = FakeGlueClient(statement_states=["WAITING", "RUNNING", "AVAILABLE"], output=_saida(esperado))
     status = []
     assert _engine_pronto(glue).run("print(1)", status.append) == esperado
-    assert glue.statements == ["print(1)"]
+    assert [codigo for _sessao, codigo in glue.statements] == ["print(1)"]
     assert any("50%" in s for s in status)          # progresso repassado para a tela
 
 
@@ -341,3 +340,54 @@ def test_outros_erros_de_permissao_continuam_aparecendo():
 
     with pytest.raises(AccessDeniedException):
         GlueSessionEngine(_conta(), InstanceConfig(), glue_client=Glue(), sts_client=FakeSts()).start()
+
+
+# --------------------------------------------------------------------------- Lake Formation e consultas
+def test_lake_formation_no_glue_5_vai_na_configuracao_da_sessao():
+    glue = FakeGlueClient(session_states=["READY"])
+    inst = InstanceConfig(glue_version="5.1", lake_formation=True, extra_args={"--conf": "spark.x=1"})
+    GlueSessionEngine(_conta(), inst, glue_client=glue, sts_client=FakeSts()).start()
+    conf = glue.created[0]["DefaultArguments"]["--conf"]
+    assert conf.startswith("spark.x=1 --conf ")                       # o que você já tinha continua lá
+    assert ("spark.hadoop.fs.s3.credentialsResolverClass="
+            "com.amazonaws.glue.accesscontrol.AWSLakeFormationCredentialResolver") in conf
+    assert conf.count("--conf ") == len(engines.LAKE_FORMATION_CONF)
+    assert glue.created[0]["Description"].endswith("Lake Formation · --conf=spark.x=1")
+
+
+def test_lake_formation_no_glue_4_nao_mexe_na_sessao():
+    # no Glue 4.0 o Lake Formation só vale nas leituras pelo GlueContext (o código gerado cuida disso)
+    glue = FakeGlueClient(session_states=["READY"])
+    inst = InstanceConfig(glue_version="4.0", lake_formation=True)
+    GlueSessionEngine(_conta(), inst, glue_client=glue, sts_client=FakeSts()).start()
+    assert "--conf" not in glue.created[0]["DefaultArguments"]
+    assert engines.lake_formation_mode(inst) == "glue_context"
+    # ligar ou desligar o Lake Formation no Glue 4.0 não pede outra sessão
+    assert inst.fingerprint() == InstanceConfig(glue_version="4.0").fingerprint()
+    assert engines.lake_formation_mode(InstanceConfig(glue_version="6.0", lake_formation=True)) == "fta"
+    assert engines.lake_formation_mode(InstanceConfig(glue_version="6.0")) is None
+
+
+def test_configuracao_da_sessao_vai_na_descricao():
+    inst = InstanceConfig(worker_type="G.2X", num_workers=4, glue_version="5.0")
+    glue = FakeGlueClient(session_states=["READY"])
+    GlueSessionEngine(_conta(), inst, glue_client=glue, sts_client=FakeSts()).start()
+    sessao = {"Description": glue.created[0]["Description"]}
+    assert engines.session_fingerprint(sessao) == inst.fingerprint() == "4 x G.2X · Glue 5.0"
+    antiga = {"Description": "Spark Query Studio", "NumberOfWorkers": 2, "WorkerType": "G.1X", "GlueVersion": "4.0"}
+    assert engines.session_fingerprint(antiga) == "2 x G.1X · Glue 4.0"
+
+
+def test_consultas_comecam_curtas_e_crescem_ate_o_maximo():
+    import itertools
+    seq = list(itertools.islice(engines.poll_intervals(0.25, 2.0), 8))
+    assert seq[0] == 0.25 and seq == sorted(seq) and seq[-1] == 2.0
+
+
+def test_query_rapida_e_conferida_logo():
+    esperas = []
+    glue = FakeGlueClient(statement_states=["RUNNING", "AVAILABLE"], output=_saida({"ok": True}))
+    eng = _engine_pronto(glue)
+    engines.time.sleep = esperas.append            # o fixture sem_espera devolve o original depois
+    eng.run("x")
+    assert esperas and esperas[0] <= 0.25           # antes: 3 s fixos entre as consultas

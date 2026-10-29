@@ -23,6 +23,17 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: pytest --ignore=tests/test_local_spark.py
 
+  lint:
+    name: Verificador de código (ruff)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install "ruff==0.14.0"
+      - run: ruff check .
+
   zip:
     name: Zip do projeto atualizado
     runs-on: ubuntu-24.04

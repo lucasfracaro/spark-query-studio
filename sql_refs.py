@@ -328,7 +328,7 @@ def _find_tables_cached(sql: str) -> tuple[tuple[tuple[str, int], ...], frozense
 
 def find_tables(sql: str) -> QueryTables:
     refs, defined = _find_tables_cached(sql or "")
-    return QueryTables([TableRef(n, l) for n, l in refs], set(defined))
+    return QueryTables([TableRef(nome, linha) for nome, linha in refs], set(defined))
 
 
 # --------------------------------------------------------------------------------------------
@@ -346,17 +346,35 @@ class MissingTable:
 
 
 @dataclass
+class FullNameRef:
+    """A query usa "db.tabela" em vez do alias de uma entrada que está na orquestração."""
+    name: str
+    alias: str
+    line: int
+
+    def message(self) -> str:
+        return (f"Com o Lake Formation no Glue 4.0, use o alias `{self.alias}` em vez de `{self.name}` "
+                f"(linha {self.line}): só as entradas da orquestração são lidas pelo GlueContext, que é o que "
+                f"usa as permissões do Lake Formation.")
+
+
+@dataclass
 class OrchestrationCheck:
     missing: list[MissingTable] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    full_names: list[FullNameRef] = field(default_factory=list)    # bloqueiam só com require_alias
 
     @property
     def ok(self) -> bool:
-        return not self.missing
+        return not self.missing and not self.full_names
 
 
-def check_query_against_orchestration(sql: str, inputs) -> OrchestrationCheck:
-    """inputs: lista de code_builder.InputSource (só as válidas são consideradas)."""
+def check_query_against_orchestration(sql: str, inputs, require_alias: bool = False) -> OrchestrationCheck:
+    """inputs: lista de code_builder.InputSource (só as válidas são consideradas).
+
+    require_alias: a query precisa usar os aliases (leitura pelo GlueContext, no Glue 4.0 com Lake
+    Formation). Sem isso, usar o nome completo de uma entrada é só um aviso.
+    """
     found = find_tables(sql)
     aliases = {_norm(i.alias.strip()): i for i in inputs if i.is_valid()}
     by_source = {_norm(i.source.strip()): i for i in inputs if i.is_valid() and i.kind == "catalog"}
@@ -370,10 +388,13 @@ def check_query_against_orchestration(sql: str, inputs) -> OrchestrationCheck:
         if ref.name in by_source:
             inp = by_source[ref.name]
             if ref.name not in warned:
-                aviso = (f"`{ref.name}` está na orquestração com o alias `{inp.alias.strip()}`, mas a query usa "
-                         f"o nome completo (linha {ref.line}). Use o alias")
-                aviso += " para que o filtro de partição seja aplicado." if inp.filter.strip() else "."
-                check.warnings.append(aviso)
+                if require_alias:
+                    check.full_names.append(FullNameRef(ref.name, inp.alias.strip(), ref.line))
+                else:
+                    aviso = (f"`{ref.name}` está na orquestração com o alias `{inp.alias.strip()}`, mas a query "
+                             f"usa o nome completo (linha {ref.line}). Use o alias")
+                    aviso += " para que o filtro de partição seja aplicado." if inp.filter.strip() else "."
+                    check.warnings.append(aviso)
                 warned.add(ref.name)
             continue
         missing.setdefault(ref.name, MissingTable(ref.name, []))

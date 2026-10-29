@@ -15,6 +15,12 @@
       "Resource": "*"
     },
     {
+      "Sid": "LakeFormationDadosDeOutraConta",
+      "Effect": "Allow",
+      "Action": ["lakeformation:GetDataAccess"],
+      "Resource": "*"
+    },
+    {
       "Sid": "Logs",
       "Effect": "Allow",
       "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],

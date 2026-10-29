@@ -4,15 +4,17 @@ Motores de execução Spark.
 - GlueSessionEngine: AWS Glue Interactive Sessions (Spark gerenciado, mesmo mecanismo do
   kernel PySpark do Glue). Você escolhe tipo de worker (G.1X, G.2X...) e quantidade.
 - LocalSparkEngine: Spark local, para testar a ferramenta sem custo na AWS.
+
+Quem guarda a sessão entre as execuções (e entre abas do navegador) é o session_hub.
 """
 from __future__ import annotations
 
 import io
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
-from typing import Callable
 
 from code_builder import parse_result
 
@@ -23,6 +25,25 @@ IdCallback = Callable[[str], None]
 TERMINAL_SESSION_STATES = {"FAILED", "TIMEOUT", "STOPPED", "STOPPING"}
 # Estados de um statement que ainda está na fila ou rodando
 ACTIVE_STATEMENT_STATES = {"WAITING", "RUNNING"}
+
+
+def poll_intervals(first: float, maximum: float, factor: float = 1.6) -> Iterator[float]:
+    """Intervalos de consulta que começam curtos e crescem até o máximo.
+
+    Uma query rápida aparece logo (a primeira conferência é em 0,25 s, não em 3 s) e uma demorada
+    não fica consultando a AWS sem necessidade.
+    """
+    atual = first
+    while True:
+        yield atual
+        atual = min(maximum, atual * factor)
+
+
+def aws_client_config():
+    """Timeouts curtos para as chamadas à AWS: com a rede bloqueada (proxy, VPN), a tela avisa
+    em segundos em vez de ficar parada por minutos esperando a conexão."""
+    from botocore.config import Config
+    return Config(connect_timeout=5, read_timeout=30, retries={"mode": "standard", "max_attempts": 3})
 
 @dataclass(frozen=True)
 class WorkerType:
@@ -68,6 +89,54 @@ GLUE_VERSION_NOTES = {
 # Tag com quem criou a sessão: permite reencontrar as próprias sessões depois de recarregar a página
 OWNER_TAG = "spark-query-studio-owner"
 SESSION_PREFIX = "sqs-"
+SESSION_DESCRIPTION = "Spark Query Studio"
+
+# Lake Formation "Full Table Access" (Glue 5.0 em diante): as tabelas registradas no Lake Formation
+# são lidas com as credenciais que ele fornece, como faz o Athena. É o que permite ler dados que estão
+# no S3 de outra conta sem a role ter permissão no bucket. Só vale se for configurado ao criar a sessão.
+# https://docs.aws.amazon.com/glue/latest/dg/security-access-control-fta.html
+LAKE_FORMATION_CONF = {
+    "spark.hadoop.fs.s3.credentialsResolverClass":
+        "com.amazonaws.glue.accesscontrol.AWSLakeFormationCredentialResolver",
+    "spark.hadoop.fs.s3.useDirectoryHeaderAsFolderObject": "true",
+    "spark.hadoop.fs.s3.folderObject.autoAction.disabled": "true",
+    "spark.sql.catalog.skipLocationValidationOnCreateTable.enabled": "true",
+    "spark.sql.catalog.createDirectoryAfterTable.enabled": "true",
+    "spark.sql.catalog.dropDirectoryBeforeTable.enabled": "true",
+}
+
+
+def glue_version_tuple(version: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(p) for p in str(version).split("."))
+    except ValueError:
+        return (0,)
+
+
+def lake_formation_mode(instance: InstanceConfig) -> str | None:
+    """Como a sessão lê pelo Lake Formation: None (desligado), "fta" (Glue 5.0+, configuração da sessão)
+    ou "glue_context" (Glue 4.0: só as leituras feitas pelo GlueContext usam o Lake Formation)."""
+    if not instance.lake_formation:
+        return None
+    return "fta" if glue_version_tuple(instance.glue_version) >= (5, 0) else "glue_context"
+
+
+def session_fingerprint(session: dict) -> str:
+    """Configuração com que uma sessão listada pela AWS foi criada (ver InstanceConfig.fingerprint)."""
+    descricao = session.get("Description") or ""
+    prefixo = f"{SESSION_DESCRIPTION} · "
+    if descricao.startswith(prefixo):
+        return descricao[len(prefixo):]
+    # sessões criadas antes de a configuração ir na descrição
+    return f"{session.get('NumberOfWorkers')} x {session.get('WorkerType')} · Glue {session.get('GlueVersion')}"
+
+
+def add_spark_conf(args: dict[str, str], conf: dict[str, str]) -> dict[str, str]:
+    """Junta configurações Spark ao argumento --conf do Glue, que leva várias no formato
+    "a=1 --conf b=2", preservando o que já estava lá."""
+    novas = " --conf ".join(f"{k}={v}" for k, v in conf.items())
+    atual = (args.get("--conf") or "").strip()
+    return {**args, "--conf": f"{atual} --conf {novas}" if atual else novas}
 
 
 @dataclass
@@ -94,6 +163,14 @@ class AwsAccount:
             )
         return boto3.Session(region_name=self.region)
 
+    def client(self, service: str):
+        return self.boto_session().client(service, config=aws_client_config())
+
+    def key(self) -> tuple:
+        """Identifica a conta/região: cada uma tem a sua sessão no app (o segredo não entra na chave)."""
+        return (self.region, self.auth_mode, self.profile if self.auth_mode == "profile" else "",
+                self.access_key if self.auth_mode == "keys" else "")
+
 
 @dataclass
 class InstanceConfig:
@@ -103,6 +180,19 @@ class InstanceConfig:
     idle_timeout_min: int = 30
     extra_args: dict[str, str] = field(default_factory=dict)   # DefaultArguments extras
     tags: dict[str, str] = field(default_factory=dict)
+    start_on_open: bool = False      # iniciar a sessão em segundo plano assim que o app abre
+    lake_formation: bool = False     # ler as tabelas do catálogo com as permissões do Lake Formation
+
+    def signature(self) -> str:
+        """Resumo da configuração que define a sessão, para mostrar na tela. O Lake Formation só entra
+        quando muda a sessão (Glue 5+); no Glue 4.0 ele muda só a leitura, não a sessão."""
+        texto = f"{self.num_workers} x {self.worker_type} · Glue {self.glue_version}"
+        return texto + (" · Lake Formation" if lake_formation_mode(self) == "fta" else "")
+
+    def fingerprint(self) -> str:
+        """Tudo o que só vale ao criar a sessão: se mudar, a sessão ativa precisa ser recriada."""
+        extras = ";".join(f"{k}={v}" for k, v in sorted(self.extra_args.items()))
+        return self.signature() + (f" · {extras}" if extras else "")
 
 
 class EngineError(RuntimeError):
@@ -113,14 +203,17 @@ class EngineError(RuntimeError):
 # AWS Glue Interactive Sessions
 # --------------------------------------------------------------------------------------
 class GlueSessionEngine:
+    kind = "glue"
     READY_TIMEOUT_S = 15 * 60
-    POLL_S = 3
+    # Consultas do statement: 0,25 s, 0,4 s, 0,64 s... até 2 s. Da sessão subindo: 1 s até 3 s.
+    POLL_FIRST_S, POLL_MAX_S = 0.25, 2.0
+    READY_POLL_FIRST_S, READY_POLL_MAX_S = 1.0, 3.0
 
     def __init__(self, account: AwsAccount, instance: InstanceConfig, glue_client=None, sts_client=None):
         self.account = account
         self.instance = instance
         # glue_client / sts_client permitem reaproveitar clientes (cache) ou injetar falsos nos testes
-        self._glue = glue_client if glue_client is not None else account.boto_session().client("glue")
+        self._glue = glue_client if glue_client is not None else account.client("glue")
         self._sts = sts_client
         self._caller_arn: str | None = None
         self.session_id: str | None = None
@@ -128,7 +221,7 @@ class GlueSessionEngine:
     # ---------- conta ----------
     def whoami(self) -> dict:
         if self._sts is None:
-            self._sts = self.account.boto_session().client("sts")
+            self._sts = self.account.client("sts")
         return self._sts.get_caller_identity()
 
     def caller_arn(self) -> str | None:
@@ -158,7 +251,7 @@ class GlueSessionEngine:
             token = resp.get("NextToken")
             if not token:
                 break
-        ativas = [s for s in sessoes
+        ativas = [dict(s, fingerprint=session_fingerprint(s)) for s in sessoes
                   if s.get("Id", "").startswith(SESSION_PREFIX) and s.get("Status") in ("READY", "PROVISIONING")]
         return sorted(ativas, key=lambda s: str(s.get("CreatedOn", "")), reverse=True)
 
@@ -189,7 +282,7 @@ class GlueSessionEngine:
         e pode continuar esperando a mesma sessão em vez de criar outra.
         """
         if not self.account.glue_role_arn:
-            raise EngineError("Informe o ARN da IAM Role do Glue em 'Configurar conta AWS'.")
+            raise EngineError("Informe o ARN da IAM Role do Glue em ⚙️ Configuração.")
 
         inst = self.instance
         # O Spark UI não vem ligado: em sessões interativas ele só funciona com --spark-event-logs-path
@@ -200,6 +293,8 @@ class GlueSessionEngine:
         if self.account.temp_dir:
             args["--TempDir"] = self.account.temp_dir
         args.update({k: v for k, v in inst.extra_args.items() if k})
+        if lake_formation_mode(inst) == "fta":
+            args = add_spark_conf(args, LAKE_FORMATION_CONF)
 
         sid = f"{SESSION_PREFIX}{uuid.uuid4().hex[:12]}"
         params = dict(
@@ -211,7 +306,8 @@ class GlueSessionEngine:
             NumberOfWorkers=int(inst.num_workers),
             IdleTimeout=int(inst.idle_timeout_min),
             DefaultArguments=args,
-            Description="Spark Query Studio",
+            # a configuração vai na descrição: assim dá para saber se uma sessão antiga serve
+            Description=f"{SESSION_DESCRIPTION} · {inst.fingerprint()}"[:2048],
         )
         tags = dict(inst.tags)
         arn = self.caller_arn()
@@ -242,6 +338,7 @@ class GlueSessionEngine:
         sid = self.session_id
         t0 = time.time()
         not_found = 0
+        intervalos = poll_intervals(self.READY_POLL_FIRST_S, self.READY_POLL_MAX_S, 1.5)
         while True:
             status = self.session_status()
             on_status(f"Sessão {sid}: {status} ({int(time.time() - t0)}s)")
@@ -249,14 +346,14 @@ class GlueSessionEngine:
                 return sid
             if status is None and not_found < 3:
                 not_found += 1          # logo após o create_session a sessão pode não aparecer ainda
-                time.sleep(self.POLL_S)
+                time.sleep(next(intervalos))
                 continue
             if status in TERMINAL_SESSION_STATES or status is None:
                 detail = self._glue.get_session(Id=sid)["Session"].get("ErrorMessage", "") if status else ""
-                raise EngineError(f"Sessão terminou com status {status}. {detail}")
+                raise EngineError(f"Sessão terminou com status {status}. {detail}".strip())
             if time.time() - t0 > self.READY_TIMEOUT_S:
                 raise EngineError("Tempo esgotado esperando a sessão ficar READY.")
-            time.sleep(self.POLL_S)
+            time.sleep(next(intervalos))
 
     def ensure_session(self, on_status: StatusCallback = lambda s: None, on_created: IdCallback = lambda sid: None) -> str:
         """Garante uma sessão READY: reaproveita a atual, espera se ela ainda está subindo, ou cria outra."""
@@ -300,7 +397,7 @@ class GlueSessionEngine:
         while time.time() - t0 < wait_s:
             if self.statement_state(statement_id) not in ACTIVE_STATEMENT_STATES | {"CANCELLING"}:
                 break
-            time.sleep(min(self.POLL_S, 1))
+            time.sleep(0.5)
         return True
 
     # ---------- execução ----------
@@ -315,6 +412,7 @@ class GlueSessionEngine:
         stmt_id = self._glue.run_statement(SessionId=self.session_id, Code=code)["Id"]
         on_submitted(stmt_id)
         t0 = time.time()
+        intervalos = poll_intervals(self.POLL_FIRST_S, self.POLL_MAX_S)
         while True:
             st = self._glue.get_statement(SessionId=self.session_id, Id=stmt_id)["Statement"]
             state = st["State"]
@@ -339,22 +437,36 @@ class GlueSessionEngine:
                         "elapsed": round(time.time() - t0, 2), "log": []}
             if should_cancel():
                 self._glue.cancel_statement(SessionId=self.session_id, Id=stmt_id)
-            time.sleep(self.POLL_S)
+            time.sleep(next(intervalos))
 
 
 # --------------------------------------------------------------------------------------
 # Spark local (teste sem AWS)
 # --------------------------------------------------------------------------------------
 class LocalSparkEngine:
+    """Spark local. Como no Glue, a sessão e as variáveis do código ficam vivas entre as execuções
+    (é o que permite reaproveitar o cache das entradas)."""
+    kind = "local"
     _spark = None
+    _namespace: dict | None = None
 
     def __init__(self, instance: InstanceConfig | None = None, account: AwsAccount | None = None):
         self.instance = instance or InstanceConfig()
         self.account = account
         self.session_id = "local"
 
+    @classmethod
+    def _alive(cls) -> bool:
+        """A sessão local existe e o Spark ainda está de pé (ele pode ter caído, ex.: falta de memória)."""
+        if cls._spark is None:
+            return False
+        try:
+            return not cls._spark.sparkContext._jsc.sc().isStopped()
+        except Exception:
+            return False
+
     def start(self, on_status: StatusCallback = lambda s: None, on_created: IdCallback = lambda sid: None) -> str:
-        if LocalSparkEngine._spark is None:
+        if not LocalSparkEngine._alive():
             on_status("Iniciando Spark local…")
             from pyspark.sql import SparkSession
             builder = (SparkSession.builder.appName("SparkQueryStudio")
@@ -366,10 +478,13 @@ class LocalSparkEngine:
                 if k.startswith("spark."):
                     builder = builder.config(k, v)
             LocalSparkEngine._spark = builder.getOrCreate()
+            LocalSparkEngine._namespace = None
+        if LocalSparkEngine._namespace is None:
+            LocalSparkEngine._namespace = {"spark": LocalSparkEngine._spark}
         return "local"
 
     def session_status(self, *_):
-        return "READY" if LocalSparkEngine._spark is not None else None
+        return "READY" if LocalSparkEngine._alive() else None
 
     def ensure_session(self, on_status: StatusCallback = lambda s: None, on_created: IdCallback = lambda sid: None) -> str:
         return self.start(on_status, on_created)
@@ -378,19 +493,22 @@ class LocalSparkEngine:
         return False
 
     def attach(self, *_):
-        return LocalSparkEngine._spark is not None
+        return LocalSparkEngine._alive()
 
-    def stop(self):
+    def stop(self, *_):
         if LocalSparkEngine._spark is not None:
-            LocalSparkEngine._spark.stop()
-            LocalSparkEngine._spark = None
+            try:
+                LocalSparkEngine._spark.stop()
+            finally:
+                LocalSparkEngine._spark = None
+                LocalSparkEngine._namespace = None
 
     def run(self, code: str, on_status: StatusCallback = lambda s: None, **_) -> dict:
         self.start(on_status)
         on_status("Executando query no Spark local…")
         buf = io.StringIO()
         with redirect_stdout(buf):
-            exec(code, {"spark": LocalSparkEngine._spark})
+            exec(code, LocalSparkEngine._namespace)
         result = parse_result(buf.getvalue())
         if result is None:
             return {"ok": False, "error": "Sem resultado.", "traceback": buf.getvalue()[-4000:], "log": []}

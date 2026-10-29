@@ -22,7 +22,8 @@ NOME = "spark-query-studio"
 DESTINO = RAIZ / "dist" / f"{NOME}.zip"
 DATA_FIXA = (2026, 1, 1, 0, 0, 0)
 IGNORAR_PREFIXOS = ("dist/", ".github/")
-IGNORAR_NOMES = {".gitignore"}
+# a configuração de cada um (pode ter chaves de acesso) nunca entra no zip, mesmo sem git
+IGNORAR_NOMES = {".gitignore", "configuracao.toml", "configuracao.toml.tmp"}
 
 
 def arquivos_do_projeto() -> list[str]:

@@ -30,3 +30,13 @@ def test_zip_inexistente_ou_corrompido(tmp_path):
     ruim = tmp_path / "ruim.zip"
     ruim.write_bytes(b"isso nao e um zip")
     assert gerar_zip.conteudo_do_zip(ruim) is None
+
+
+def test_configuracao_pessoal_nunca_entra_no_zip(tmp_path, monkeypatch):
+    # mesmo sem git (que já ignoraria o arquivo pelo .gitignore)
+    (tmp_path / "app.py").write_text("x")
+    (tmp_path / "configuracao.toml").write_text('secret_key = "x"')
+    (tmp_path / "configuracao.exemplo.toml").write_text("# modelo")
+    monkeypatch.setattr(gerar_zip, "RAIZ", tmp_path)
+    nomes = gerar_zip.arquivos_do_projeto()
+    assert "configuracao.toml" not in nomes and "configuracao.exemplo.toml" in nomes

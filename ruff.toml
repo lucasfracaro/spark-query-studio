@@ -1,0 +1,18 @@
+# Verificador de código (roda no CI: ruff check .)
+line-length = 120
+target-version = "py310"
+
+[lint]
+# erros (E/W/F), import em ordem (I), bugs comuns (B) e sintaxe moderna do Python (UP)
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = [
+    "E501",    # linhas longas: o formatador não é usado; o limite acima é só uma referência
+    "B008",    # chamadas em valores padrão (dataclasses usam field(default_factory=...))
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[lint.isort]
+known-first-party = ["athena_import", "code_builder", "engines", "export", "metadata", "orchestration_io",
+                     "session_hub", "settings_store", "spark_errors", "sql_refs", "ui", "fakes"]

@@ -28,17 +28,44 @@ class _Schema:
         self.fields = fields
 
 
+class _StorageLevel:
+    def __init__(self, cached: bool):
+        self.useMemory = self.useDisk = cached
+        self.useOffHeap = False
+
+
+class _FakeJdf:
+    """O lado "Java" de um DataFrame, só com o que o código gerado usa para trocá-lo de sessão."""
+
+    def __init__(self, df):
+        self.df = df
+
+    def rdd(self):
+        return ("rdd", self.df)
+
+    def schema(self):
+        return self.df.columns
+
+
 class FakeDataFrame:
-    def __init__(self, rows, columns, spark=None):
+    """plan identifica o que o DataFrame lê (como o plano lógico do Spark): é a chave do cache, que,
+    como no Spark, vale para todas as sessões."""
+
+    def __init__(self, rows, columns=None, spark=None, plan=()):
+        if isinstance(rows, _FakeJdf):                  # DataFrame(jdf, sessão), como no PySpark
+            origem, spark = rows.df, columns
+            rows, columns, plan = origem.rows, origem.columns, ("rdd",) + origem.plan
         self.rows = rows
         self.columns = columns          # [(nome, tipo)]
         self.schema = _Schema([_Field(n, t) for n, t in columns])
         self.spark = spark
+        self.plan = tuple(plan)
+        self._jdf = _FakeJdf(self)
 
     def where(self, cond):
         if self.spark is not None:
             self.spark.calls.append(("where", cond))
-        return self
+        return FakeDataFrame(self.rows, self.columns, self.spark, self.plan + (("where", cond),))
 
     def createOrReplaceTempView(self, alias):
         self.spark.views[alias] = self
@@ -49,7 +76,21 @@ class FakeDataFrame:
         return list(self.rows)
 
     def limit(self, n):
-        return FakeDataFrame(self.rows[:n], self.columns, self.spark)
+        return FakeDataFrame(self.rows[:n], self.columns, self.spark, self.plan + (("limit", n),))
+
+    @property
+    def storageLevel(self):
+        return _StorageLevel(self.plan in self.spark.shared_cache)
+
+    def cache(self):
+        self.spark.shared_cache.add(self.plan)
+        self.spark.cached.append(self.plan)
+        return self
+
+    def unpersist(self):
+        self.spark.shared_cache.discard(self.plan)
+        self.spark.uncached.append(self.plan)
+        return self
 
 
 class _Reader:
@@ -68,7 +109,7 @@ class _Reader:
 
     def load(self, path):
         self.spark.calls.append(("load", self.fmt, path, dict(self.options)))
-        return self.spark.default_df()
+        return self.spark.default_df(("load", self.fmt, path, tuple(sorted(self.options.items()))))
 
 
 class _Conf:
@@ -88,51 +129,75 @@ class _Catalog:
     def __init__(self, spark):
         self.spark = spark
 
-    def cacheTable(self, name):
-        self.spark.cached.append(name)
-
     def clearCache(self):
+        self.spark.shared_cache.clear()
         self.spark.cache_cleared += 1
+
+
+class _JvmSession:
+    def __init__(self, spark):
+        self.spark = spark
+
+    def createDataFrame(self, rdd, schema):
+        assert rdd[0] == "rdd"
+        return _FakeJdf(rdd[1])
 
 
 class FakeSpark:
     """Imita o pedaço da API do SparkSession que o código gerado usa."""
 
-    def __init__(self, rows=None, columns=None, fail_on=None, bad_conf=(), settings=None):
+    def __init__(self, rows=None, columns=None, fail_on=None, bad_conf=(), settings=None, parent=None):
         self.rows = rows if rows is not None else [(1, "a", None), (2, "b", 3.5), (3, "c", 1.0)]
         self.columns = columns or [("id", "int"), ("nome", "string"), ("valor", "double")]
         self.fail_on = fail_on            # texto que, se aparecer na query, gera erro
         self.bad_conf = set(bad_conf)
         # configurações "iniciais" da sessão (o que o comando SET devolve)
         self.settings = dict(settings if settings is not None else {"spark.sql.catalogImplementation": "hive"})
-        self.calls, self.sql_log, self.cached = [], [], []
+        self.calls, self.sql_log = [], []
         self.views, self.conf_values = {}, {}
-        self.cache_cleared = 0
         self.sessions: list[FakeSpark] = []   # sessões criadas com newSession()
+        self.root = parent.root if parent is not None else self
+        if parent is None:                    # como no Spark, o cache é compartilhado pelas sessões
+            self.shared_cache, self.cached, self.uncached = set(), [], []
+            self.cache_cleared = 0
         self.conf = _Conf(self)
         self.catalog = _Catalog(self)
+        self._jsparkSession = _JvmSession(self)
+        self.sparkContext = ("sparkContext", self.root)
+
+    # cache e contadores ficam na sessão principal
+    def __getattr__(self, nome):
+        if nome in ("shared_cache", "cached", "uncached", "cache_cleared"):
+            return getattr(self.root, nome)
+        raise AttributeError(nome)
+
+    def __setattr__(self, nome, valor):
+        if nome in ("shared_cache", "cached", "uncached", "cache_cleared") and self.__dict__.get("root") not in (None, self):
+            setattr(self.root, nome, valor)
+        else:
+            object.__setattr__(self, nome, valor)
 
     def newSession(self):
         """Sessão nova: começa sem views, sem configurações alteradas e no database padrão."""
         child = FakeSpark(rows=self.rows, columns=self.columns, fail_on=self.fail_on,
-                          bad_conf=self.bad_conf, settings={})
+                          bad_conf=self.bad_conf, settings={}, parent=self)
         self.sessions.append(child)
         return child
 
     @property
-    def last_session(self) -> "FakeSpark":
+    def last_session(self) -> FakeSpark:
         return self.sessions[-1]
 
     @property
     def read(self):
         return _Reader(self)
 
-    def default_df(self):
-        return FakeDataFrame(self.rows, self.columns, self)
+    def default_df(self, plan=()):
+        return FakeDataFrame(self.rows, self.columns, self, plan)
 
     def table(self, name):
         self.calls.append(("table", name))
-        return self.default_df()
+        return self.default_df(("table", name.lower()))
 
     def sql(self, query):
         self.sql_log.append(query)
@@ -140,20 +205,55 @@ class FakeSpark:
             return FakeDataFrame(list(self.settings.items()), [("key", "string"), ("value", "string")], self)
         if self.fail_on and self.fail_on in query:
             raise RuntimeError(f"[TABLE_OR_VIEW_NOT_FOUND] {self.fail_on}")
-        return self.default_df()
+        return self.default_df(("sql", query))
 
 
-def run_generated(code: str, spark: FakeSpark) -> dict:
-    """Executa o código gerado como o motor local faz e devolve o resultado decodificado."""
+class FakeGlueContext:
+    """awsglue.context.GlueContext mínimo: create_dynamic_frame.from_catalog lê na sessão principal."""
+    instancias: list[FakeGlueContext] = []
+
+    def __init__(self, spark_context):
+        self.spark = spark_context[1]
+        self.reads = []
+        self.create_dynamic_frame = self
+        self.falhar_com_filtro = False
+        FakeGlueContext.instancias.append(self)
+
+    def from_catalog(self, database, table_name, push_down_predicate=""):
+        if push_down_predicate and self.falhar_com_filtro:
+            raise RuntimeError("cannot resolve column used in push_down_predicate")
+        self.reads.append((database, table_name, push_down_predicate))
+        plano = ("glue", database, table_name, push_down_predicate)
+        df = self.spark.default_df(plano)
+
+        class _Dyf:
+            def toDF(self):
+                return df
+        return _Dyf()
+
+
+def run_generated(code: str, spark: FakeSpark, namespace: dict | None = None) -> dict:
+    """Executa o código gerado como o motor faz e devolve o resultado decodificado.
+    namespace: variáveis que sobrevivem entre execuções (no Glue, a sessão guarda as variáveis)."""
     buf = io.StringIO()
+    ns = namespace if namespace is not None else {}
+    ns["spark"] = spark
     with redirect_stdout(buf):
-        exec(code, {"spark": spark})
+        exec(code, ns)
     return parse_result(buf.getvalue())
 
 
 # --------------------------------------------------------------------------- Glue falso
 class EntityNotFoundException(Exception):
     pass
+
+
+class IllegalSessionStateException(Exception):
+    """A sessão não aceita comandos (encerrou por tempo sem uso, por exemplo)."""
+
+
+class SessionBusyException(Exception):
+    """A sessão já está rodando outro comando."""
 
 
 class FakeGlueClient:
@@ -164,13 +264,15 @@ class FakeGlueClient:
     """
 
     def __init__(self, session_states=("PROVISIONING", "READY"), statement_states=("RUNNING", "AVAILABLE"),
-                 output=None, listed_sessions=()):
+                 output=None, listed_sessions=(), run_errors=(), get_statement_errors=()):
         self.session_states = list(session_states)
         self.statement_states = list(statement_states)
         self.output = output if output is not None else {"Status": "OK", "Data": {"TextPlain": ""}}
         self.listed_sessions = list(listed_sessions)     # o que list_sessions devolve (com "Tags")
+        self.run_errors = list(run_errors)               # exceções que os próximos run_statement levantam
+        self.get_statement_errors = list(get_statement_errors)
         self.created, self.statements, self.stopped, self.cancelled = [], [], [], []
-        self.list_calls = []
+        self.list_calls, self.get_session_calls = [], []
 
     @staticmethod
     def _next(states):
@@ -181,16 +283,21 @@ class FakeGlueClient:
         return {"Session": {"Id": params["Id"], "Status": "PROVISIONING"}}
 
     def get_session(self, Id):
+        self.get_session_calls.append(Id)
         status = self._next(self.session_states)
         if status is None:
             raise EntityNotFoundException(Id)
         return {"Session": {"Id": Id, "Status": status, "ErrorMessage": "falhou de propósito"}}
 
     def run_statement(self, SessionId, Code):
-        self.statements.append(Code)
+        if self.run_errors:
+            raise self.run_errors.pop(0)
+        self.statements.append((SessionId, Code))
         return {"Id": len(self.statements)}
 
     def get_statement(self, SessionId, Id):
+        if self.get_statement_errors:
+            raise self.get_statement_errors.pop(0)
         state = self._next(self.statement_states)
         st = {"Id": Id, "State": state, "Progress": 0.5}
         if state == "AVAILABLE":

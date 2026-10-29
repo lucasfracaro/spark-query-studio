@@ -2,8 +2,7 @@ import pytest
 
 import sql_refs
 from code_builder import InputSource
-from sql_refs import (check_query_against_orchestration, find_tables, find_write_statements,
-                      missing_from_spark_error)
+from sql_refs import check_query_against_orchestration, find_tables, find_write_statements, missing_from_spark_error
 
 # Cada teste de leitura roda nos dois caminhos: com o sqlglot e só com o leitor de tokens (reserva).
 MODOS = ["sqlglot", "tokens"]
@@ -230,3 +229,16 @@ def test_mensagem_do_modo_somente_leitura():
 ])
 def test_traduz_erro_do_spark(mensagem, esperado):
     assert missing_from_spark_error(mensagem) == esperado
+
+
+def test_nome_completo_bloqueia_quando_o_alias_e_obrigatorio():
+    from code_builder import InputSource
+    entradas = [InputSource("vendas", "catalog", "db.vendas", filter="dt = '1'")]
+    sql = "SELECT *\nFROM db.vendas v JOIN vendas x ON 1 = 1"
+    normal = check_query_against_orchestration(sql, entradas)
+    assert normal.ok and normal.warnings and not normal.full_names
+    lf = check_query_against_orchestration(sql, entradas, require_alias=True)
+    assert not lf.ok and not lf.warnings
+    [ref] = lf.full_names
+    assert (ref.name, ref.alias, ref.line) == ("db.vendas", "vendas", 2)
+    assert "use o alias `vendas` em vez de `db.vendas`" in ref.message()
