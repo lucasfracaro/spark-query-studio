@@ -24,17 +24,50 @@ TERMINAL_SESSION_STATES = {"FAILED", "TIMEOUT", "STOPPED", "STOPPING"}
 # Estados de um statement que ainda está na fila ou rodando
 ACTIVE_STATEMENT_STATES = {"WAITING", "RUNNING"}
 
-# Tipos de worker do Glue (vCPU / memória por worker)
+@dataclass(frozen=True)
+class WorkerType:
+    vcpu: int
+    memoria_gb: int
+    dpu: int
+    nota: str = ""
+
+    def descricao(self) -> str:
+        texto = f"{self.vcpu} vCPU / {self.memoria_gb} GB · {self.dpu} DPU"
+        return f"{texto} ({self.nota})" if self.nota else texto
+
+
+# Tipos de worker do Glue para jobs/sessões Spark (o G.025X é só para jobs de streaming)
+_DEMORA = "pode demorar mais para iniciar"
 GLUE_WORKER_TYPES = {
-    "G.025X": "2 vCPU / 4 GB (apenas streaming)",
-    "G.1X": "4 vCPU / 16 GB",
-    "G.2X": "8 vCPU / 32 GB",
-    "G.4X": "16 vCPU / 64 GB",
-    "G.8X": "32 vCPU / 128 GB",
-    "R.1X": "4 vCPU / 32 GB (memória otimizada)",
-    "R.2X": "8 vCPU / 64 GB (memória otimizada)",
+    "G.1X": WorkerType(4, 16, 1),
+    "G.2X": WorkerType(8, 32, 2),
+    "G.4X": WorkerType(16, 64, 4),
+    "G.8X": WorkerType(32, 128, 8),
+    "G.12X": WorkerType(48, 192, 12, _DEMORA),
+    "G.16X": WorkerType(64, 256, 16, _DEMORA),
+    "R.1X": WorkerType(4, 32, 1, "memória otimizada; " + _DEMORA),
+    "R.2X": WorkerType(8, 64, 2, "memória otimizada; " + _DEMORA),
+    "R.4X": WorkerType(16, 128, 4, "memória otimizada; " + _DEMORA),
+    "R.8X": WorkerType(32, 256, 8, "memória otimizada; " + _DEMORA),
 }
-GLUE_VERSIONS = ["5.0", "4.0"]
+DEFAULT_WORKER_TYPE = "G.1X"
+
+# Versões do Glue com Spark e Python de cada uma
+GLUE_VERSIONS = {
+    "6.0": "Spark 4.1 · Python 3.13",
+    "5.1": "Spark 3.5.6 · Python 3.11",
+    "5.0": "Spark 3.5.4 · Python 3.11",
+    "4.0": "Spark 3.3 · Python 3.10",
+}
+DEFAULT_GLUE_VERSION = "5.0"
+GLUE_VERSION_NOTES = {
+    "6.0": ("O Glue 6.0 usa Spark 4.1 com o modo ANSI ligado: overflow, divisão por zero e cast inválido "
+            "viram erro em vez de NULL. Se a produção roda Glue 5.x, teste com 5.x."),
+}
+
+# Tag com quem criou a sessão: permite reencontrar as próprias sessões depois de recarregar a página
+OWNER_TAG = "spark-query-studio-owner"
+SESSION_PREFIX = "sqs-"
 
 
 @dataclass
@@ -64,9 +97,9 @@ class AwsAccount:
 
 @dataclass
 class InstanceConfig:
-    worker_type: str = "G.1X"
+    worker_type: str = DEFAULT_WORKER_TYPE
     num_workers: int = 2
-    glue_version: str = "5.0"
+    glue_version: str = DEFAULT_GLUE_VERSION
     idle_timeout_min: int = 30
     extra_args: dict[str, str] = field(default_factory=dict)   # DefaultArguments extras
     tags: dict[str, str] = field(default_factory=dict)
@@ -83,17 +116,51 @@ class GlueSessionEngine:
     READY_TIMEOUT_S = 15 * 60
     POLL_S = 3
 
-    def __init__(self, account: AwsAccount, instance: InstanceConfig, glue_client=None):
+    def __init__(self, account: AwsAccount, instance: InstanceConfig, glue_client=None, sts_client=None):
         self.account = account
         self.instance = instance
-        # glue_client permite injetar um cliente falso nos testes
+        # glue_client / sts_client permitem reaproveitar clientes (cache) ou injetar falsos nos testes
         self._glue = glue_client if glue_client is not None else account.boto_session().client("glue")
+        self._sts = sts_client
+        self._caller_arn: str | None = None
         self.session_id: str | None = None
 
     # ---------- conta ----------
     def whoami(self) -> dict:
-        sts = self.account.boto_session().client("sts")
-        return sts.get_caller_identity()
+        if self._sts is None:
+            self._sts = self.account.boto_session().client("sts")
+        return self._sts.get_caller_identity()
+
+    def caller_arn(self) -> str | None:
+        """ARN de quem está usando (para marcar as sessões). None se não der para descobrir."""
+        if self._caller_arn is None:
+            try:
+                self._caller_arn = self.whoami()["Arn"]
+            except Exception:
+                return None
+        return self._caller_arn
+
+    def reusable_sessions(self) -> list[dict]:
+        """Sessões desta ferramenta, criadas por você, que ainda estão ativas (mais recente primeiro).
+
+        Servem para continuar usando a sessão depois de recarregar a página, em vez de pagar outra.
+        """
+        arn = self.caller_arn()
+        if not arn:
+            return []
+        sessoes, token = [], None
+        while True:
+            kw = {"Tags": {OWNER_TAG: arn}, "MaxResults": 100}
+            if token:
+                kw["NextToken"] = token
+            resp = self._glue.list_sessions(**kw)
+            sessoes += resp.get("Sessions", [])
+            token = resp.get("NextToken")
+            if not token:
+                break
+        ativas = [s for s in sessoes
+                  if s.get("Id", "").startswith(SESSION_PREFIX) and s.get("Status") in ("READY", "PROVISIONING")]
+        return sorted(ativas, key=lambda s: str(s.get("CreatedOn", "")), reverse=True)
 
     # ---------- sessão ----------
     def session_status(self, session_id: str | None = None) -> str | None:
@@ -134,7 +201,7 @@ class GlueSessionEngine:
             args["--TempDir"] = self.account.temp_dir
         args.update({k: v for k, v in inst.extra_args.items() if k})
 
-        sid = f"sqs-{uuid.uuid4().hex[:12]}"
+        sid = f"{SESSION_PREFIX}{uuid.uuid4().hex[:12]}"
         params = dict(
             Id=sid,
             Role=self.account.glue_role_arn,
@@ -146,11 +213,26 @@ class GlueSessionEngine:
             DefaultArguments=args,
             Description="Spark Query Studio",
         )
-        if inst.tags:
-            params["Tags"] = inst.tags
+        tags = dict(inst.tags)
+        arn = self.caller_arn()
+        if arn:
+            tags[OWNER_TAG] = arn[:256]
+        if tags:
+            params["Tags"] = tags
 
         on_status(f"Criando sessão {sid} ({inst.num_workers} x {inst.worker_type}, Glue {inst.glue_version})…")
-        self._glue.create_session(**params)
+        try:
+            self._glue.create_session(**params)
+        except Exception as e:
+            # Sem permissão para tags (glue:TagResource): cria sem a tag de dono, em vez de falhar.
+            # A sessão só não aparece em "reaproveitar" depois de recarregar a página.
+            sem_permissao = type(e).__name__ == "AccessDeniedException" and "tag" in str(e).lower()
+            if not (sem_permissao and OWNER_TAG in params.get("Tags", {})):
+                raise
+            params["Tags"] = {k: v for k, v in params["Tags"].items() if k != OWNER_TAG}
+            if not params["Tags"]:
+                params.pop("Tags")
+            self._glue.create_session(**params)
         self.session_id = sid
         on_created(sid)
         return self.wait_ready(on_status)
@@ -188,15 +270,17 @@ class GlueSessionEngine:
             self.session_id = None                          # encerrada ou inexistente: cria outra
         return self.start(on_status, on_created)
 
-    def stop(self):
-        """Encerra a sessão. Erros (ex.: sem permissão) sobem para quem chamou mostrar."""
-        if self.session_id:
+    def stop(self, session_id: str | None = None):
+        """Encerra a sessão atual (ou a indicada). Erros (ex.: sem permissão) sobem para quem chamou mostrar."""
+        sid = session_id or self.session_id
+        if sid:
             try:
-                self._glue.stop_session(Id=self.session_id)
+                self._glue.stop_session(Id=sid)
             except Exception as e:
                 if type(e).__name__ != "EntityNotFoundException":
                     raise
-            self.session_id = None
+            if sid == self.session_id:
+                self.session_id = None
 
     # ---------- statements ----------
     def statement_state(self, statement_id: int) -> str | None:

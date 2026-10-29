@@ -164,11 +164,13 @@ class FakeGlueClient:
     """
 
     def __init__(self, session_states=("PROVISIONING", "READY"), statement_states=("RUNNING", "AVAILABLE"),
-                 output=None):
+                 output=None, listed_sessions=()):
         self.session_states = list(session_states)
         self.statement_states = list(statement_states)
         self.output = output if output is not None else {"Status": "OK", "Data": {"TextPlain": ""}}
+        self.listed_sessions = list(listed_sessions)     # o que list_sessions devolve (com "Tags")
         self.created, self.statements, self.stopped, self.cancelled = [], [], [], []
+        self.list_calls = []
 
     @staticmethod
     def _next(states):
@@ -200,3 +202,23 @@ class FakeGlueClient:
 
     def stop_session(self, Id):
         self.stopped.append(Id)
+
+    def list_sessions(self, Tags=None, MaxResults=None, NextToken=None):
+        self.list_calls.append(Tags)
+        filtradas = [{k: v for k, v in sessao.items() if k != "Tags"} for sessao in self.listed_sessions
+                     if all(sessao.get("Tags", {}).get(k) == v for k, v in (Tags or {}).items())]
+        # devolve em duas páginas, para exercitar a paginação
+        if NextToken is None and len(filtradas) > 1:
+            return {"Sessions": filtradas[:1], "NextToken": "pagina2"}
+        return {"Sessions": filtradas[1:] if NextToken else filtradas}
+
+
+class FakeSts:
+    def __init__(self, arn="arn:aws:sts::123456789012:assumed-role/Dev/lucas", falha=False):
+        self.arn, self.falha, self.calls = arn, falha, 0
+
+    def get_caller_identity(self):
+        self.calls += 1
+        if self.falha:
+            raise PermissionError("AccessDenied")
+        return {"Arn": self.arn, "Account": "123456789012", "UserId": "X"}

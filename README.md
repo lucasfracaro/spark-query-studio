@@ -28,7 +28,14 @@ O navegador abre em `http://localhost:8501`.
 ## Fluxo
 
 1. **🔑 Configurar conta AWS** (barra lateral): região, autenticação (perfil do AWS CLI, chaves ou cadeia padrão/SSO) e o **ARN da IAM Role do Glue**. Use **Testar conexão** para conferir. As chaves de acesso ficam só na memória e nunca vão para o disco; o restante é salvo em `~/.spark_query_studio/config.json`.
-2. **🖥️ Instância**: tipo de worker (G.1X, G.2X, …), número de workers, versão do Glue, idle timeout e argumentos extras do job (ex.: `--datalake-formats = iceberg`).
+2. **🖥️ Instância**: tipo de worker (G.1X a G.16X e os R.1X a R.8X, de memória otimizada, com os DPUs de cada um), número de workers, versão do Glue, tempo sem uso até encerrar e argumentos extras do job (ex.: `--datalake-formats = iceberg`). Escolha a **mesma versão do Glue do job em produção**:
+
+   | Glue | Spark | Python | Observação |
+   |---|---|---|---|
+   | 6.0 | 4.1 | 3.13 | modo ANSI ligado: overflow, divisão por zero e cast inválido viram erro |
+   | 5.1 | 3.5.6 | 3.11 | |
+   | 5.0 | 3.5.4 | 3.11 | padrão |
+   | 4.0 | 3.3 | 3.10 | |
 3. **Passo 1 – Orquestração**: cada linha de entrada vira uma *temp view*:
    - `catalog` + `database.tabela` → lê do Glue Data Catalog;
    - `s3` + `s3://bucket/caminho/` + formato + opções (`header=true;sep=;`).
@@ -37,7 +44,10 @@ O navegador abre em `http://localhost:8501`.
 5. **Conferência da orquestração**: antes de enviar ao cluster, a query é lida e cada base usada em `FROM`/`JOIN` é comparada com as entradas da orquestração. Se faltar alguma, a execução é bloqueada com uma mensagem como *"A base `db.produtos` é usada na query (linha 3), mas não está na orquestração"*. O aviso já aparece embaixo do editor enquanto você digita. CTEs (`WITH`), views criadas na própria query, subqueries e funções como `range()` não são cobradas. Se o Spark ainda assim não encontrar uma tabela, o erro dele é traduzido para a mesma mensagem. A conferência pode ser desligada em **Opções**.
 6. **🔒 Modo somente leitura** (ligado por padrão): comandos que gravam ou alteram dados ou o catálogo (`INSERT`, `CREATE TABLE`, `DROP`, `ALTER`, `MERGE`, `DELETE`, `MSCK REPAIR`…) são bloqueados antes de ir para o cluster, com o número e a linha do comando. Consultas e comandos que só afetam a sessão (`CREATE TEMP VIEW`, `CACHE TABLE`, `SET`, `USE`) rodam normalmente. A role do Glue costuma ter permissão de escrita, então um comando esquecido na query gravaria de verdade; para executar mesmo assim, ligue **Permitir comandos que gravam** em **Opções**.
 7. **▶️ Executar**: na primeira vez a sessão Glue é criada (~30–90 s). As execuções seguintes reaproveitam a mesma sessão e levam segundos. Cada execução roda numa **sessão Spark nova** dentro dessa sessão do Glue: configurações Spark, `USE database` e views de execuções anteriores não passam para a próxima, como num job novo.
+   - Durante a execução no Glue aparece **⏹️ Cancelar execução**, que cancela a query no cluster.
    - Se você mexer na tela enquanto a sessão sobe ou a query roda, o Streamlit reinicia a tela, mas a ferramenta continua sabendo da sessão: a próxima execução espera a mesma sessão ficar pronta (em vez de criar outra, que também seria cobrada) e cancela a query que tinha ficado rodando.
+   - Ao recarregar a página, a ferramenta procura sessões criadas por você que ainda estão ativas (cada sessão leva uma tag com quem a criou) e oferece **♻️ Reaproveitar** ou **⏹️ Encerrar**.
+   - A conexão com a AWS é criada uma vez e reaproveitada, e o status da sessão é consultado no máximo a cada poucos segundos, para a tela não ficar lenta enquanto você digita.
 8. **Passo 3 – Resultado**: mostra as N primeiras linhas, o schema e o log. **Exportar CSV** baixa o arquivo para o seu PC; o separador `;` com UTF-8 BOM abre direto no Excel em português.
 
 ### 📥 Importar query do Athena
@@ -104,7 +114,7 @@ O Spark UI não vem ligado: em sessões interativas ele só funciona com um cami
 
 ## Modo Spark local
 
-Para testar a interface sem gastar com a AWS, instale `pyspark` (requer Java 11/17) e escolha **Spark local**. Entradas `s3` funcionam com caminhos locais (ex.: `/dados/arquivo.parquet`). Para ler `s3a://` localmente, adicione `spark.jars.packages = org.apache.hadoop:hadoop-aws:3.3.4` nos argumentos extras.
+Para testar a interface sem gastar com a AWS, instale o PySpark da mesma versão do Spark do seu Glue e escolha **Spark local**. Para o Glue 5.x: `pip install "pyspark==3.5.*"` (Python 3.11 e Java 8, 11 ou 17, como no Glue). Para o Glue 6.0: `pip install "pyspark==4.1.*"`, que exige Java 17 ou mais novo. Entradas `s3` funcionam com caminhos locais (ex.: `/dados/arquivo.parquet`). Para ler `s3a://` localmente, adicione `spark.jars.packages = org.apache.hadoop:hadoop-aws:3.3.4` nos argumentos extras.
 
 ## Atualizar o zip do projeto
 
@@ -127,7 +137,7 @@ pip install pyspark && pytest tests/test_local_spark.py   # integração com Spa
 
 Nenhum teste precisa de conta AWS. O motor Glue é testado com um cliente falso em memória, que simula sessões provisionando, falhando ou expirando, além de statements com erro, cancelados ou com saída inválida. O código PySpark gerado roda contra um Spark simulado e, no CI, contra um Spark local de verdade. A interface é testada com o `AppTest` do próprio Streamlit, sem navegador.
 
-O GitHub Actions roda tudo a cada push, em Python 3.10, 3.12 e 3.13.
+O GitHub Actions roda tudo a cada push: os testes unitários e de tela em Python 3.10, 3.12 e 3.13, e os de Spark local com o mesmo Spark e Python de cada versão do Glue (4.0 com Spark 3.3, 5.x com Spark 3.5 e 6.0 com Spark 4.1).
 
 ## Estrutura
 

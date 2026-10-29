@@ -20,8 +20,9 @@ import orchestration_io
 import settings_store
 from code_builder import (DEFAULT_LIMIT, InputSource, Orchestration, build_spark_code,
                           split_statements, validate_orchestration)
-from engines import (GLUE_VERSIONS, GLUE_WORKER_TYPES, TERMINAL_SESSION_STATES, AwsAccount, EngineError,
-                     GlueSessionEngine, InstanceConfig, LocalSparkEngine)
+from engines import (DEFAULT_GLUE_VERSION, DEFAULT_WORKER_TYPE, GLUE_VERSION_NOTES, GLUE_VERSIONS,
+                     GLUE_WORKER_TYPES, TERMINAL_SESSION_STATES, AwsAccount, EngineError, GlueSessionEngine,
+                     InstanceConfig, LocalSparkEngine)
 from sql_refs import check_query_against_orchestration, find_write_statements, missing_from_spark_error
 
 st_ace = None
@@ -91,14 +92,26 @@ ss.setdefault("running_stmt", None)      # {"session": id, "id": n} enquanto uma
 ss.setdefault("engine_error", None)
 
 
+@st.cache_resource(show_spinner=False)
+def _aws_client(service: str, region: str, auth_mode: str, profile: str, access_key: str, secret_key: str,
+                session_token: str):
+    """Cliente boto3 reaproveitado entre as interações (criar um custa caro e acontecia a cada tecla)."""
+    conta = AwsAccount(region=region, auth_mode=auth_mode, profile=profile, access_key=access_key,
+                       secret_key=secret_key, session_token=session_token)
+    return conta.boto_session().client(service)
+
+
 def make_engine():
     """Cria o motor. Se a configuração AWS estiver inválida (perfil inexistente, região vazia...),
     devolve None e guarda o erro em ss.engine_error, em vez de derrubar a tela."""
     ss.engine_error = None
     if ss.engine_kind == "local":
         return LocalSparkEngine(ss.instance, ss.account)
+    acc = ss.account
+    chave = (acc.region, acc.auth_mode, acc.profile, acc.access_key, acc.secret_key, acc.session_token)
     try:
-        eng = GlueSessionEngine(ss.account, ss.instance)
+        eng = GlueSessionEngine(acc, ss.instance, glue_client=_aws_client("glue", *chave),
+                                sts_client=_aws_client("sts", *chave))
     except Exception as e:
         ss.engine_error = f"{type(e).__name__}: {e}"
         return None
@@ -114,6 +127,25 @@ def instance_signature(inst: InstanceConfig) -> str:
 def remember_session(session_id: str):
     """Guarda o ID da sessão Glue assim que ela é criada (antes de esperar ficar pronta)."""
     ss.session_id, ss.session_conf = session_id, instance_signature(ss.instance)
+
+
+# Por quanto tempo (s) o status da sessão consultado na AWS é reaproveitado entre as interações
+STATUS_TTL = {"READY": 20, "PROVISIONING": 5}
+
+
+def session_status_cached(engine) -> str | None:
+    """Status da sessão, consultando a AWS no máximo a cada poucos segundos (e não a cada tecla)."""
+    cache = ss.get("status_cache")
+    agora = time.time()
+    if cache and cache["id"] == engine.session_id and agora - cache["t"] < STATUS_TTL.get(cache["status"], 0):
+        return cache["status"]
+    status = engine.session_status()
+    ss.status_cache = {"id": engine.session_id, "status": status, "t": agora}
+    return status
+
+
+def mark_session_status(session_id: str | None, status: str | None):
+    ss.status_cache = {"id": session_id, "status": status, "t": time.time()} if session_id else None
 
 
 def server_is_local_only() -> bool:
@@ -349,18 +381,24 @@ with st.sidebar:
 
         st.markdown("### 🖥️ Instância")
         inst: InstanceConfig = ss.instance
+        tipos = list(GLUE_WORKER_TYPES)
         inst.worker_type = st.selectbox(
-            "Tipo de worker", list(GLUE_WORKER_TYPES),
-            index=list(GLUE_WORKER_TYPES).index(inst.worker_type) if inst.worker_type in GLUE_WORKER_TYPES else 1,
-            format_func=lambda w: f"{w} — {GLUE_WORKER_TYPES[w]}")
+            "Tipo de worker", tipos,
+            index=tipos.index(inst.worker_type if inst.worker_type in GLUE_WORKER_TYPES else DEFAULT_WORKER_TYPE),
+            format_func=lambda w: f"{w} — {GLUE_WORKER_TYPES[w].descricao()}")
         inst.num_workers = st.slider("Número de workers", 2, 100, int(inst.num_workers))
-        c1, c2 = st.columns(2)
-        inst.glue_version = c1.selectbox("Versão Glue", GLUE_VERSIONS,
-                                         index=GLUE_VERSIONS.index(inst.glue_version) if inst.glue_version in GLUE_VERSIONS else 0)
-        inst.idle_timeout_min = c2.number_input("Idle (min)", 1, 480, int(inst.idle_timeout_min),
-                                                help="A sessão é encerrada sozinha após esse tempo sem uso.")
-        dpu = {"G.025X": .25, "G.1X": 1, "G.2X": 2, "G.4X": 4, "G.8X": 8, "R.1X": 1, "R.2X": 2}[inst.worker_type]
-        st.caption(f"≈ **{dpu * inst.num_workers:g} DPU** enquanto a sessão estiver ativa.")
+        versoes = list(GLUE_VERSIONS)
+        inst.glue_version = st.selectbox(
+            "Versão do Glue", versoes,
+            index=versoes.index(inst.glue_version if inst.glue_version in GLUE_VERSIONS else DEFAULT_GLUE_VERSION),
+            format_func=lambda v: f"{v} — {GLUE_VERSIONS[v]}",
+            help="Use a mesma versão do job em produção: o Spark muda de uma versão para outra.")
+        if inst.glue_version in GLUE_VERSION_NOTES:
+            st.caption("⚠️ " + GLUE_VERSION_NOTES[inst.glue_version])
+        inst.idle_timeout_min = st.number_input("Encerrar sozinha após (min sem uso)", 1, 480,
+                                                int(inst.idle_timeout_min))
+        dpu = GLUE_WORKER_TYPES[inst.worker_type].dpu * inst.num_workers
+        st.caption(f"≈ **{dpu:g} DPU** enquanto a sessão estiver ativa.")
         with st.expander("Argumentos extras do job"):
             st.caption("Ex: `--datalake-formats` = `iceberg`, `--additional-python-modules` = `pyarrow==14`")
             if "args_base" not in ss:
@@ -386,11 +424,12 @@ with st.sidebar:
                  "Revise em **Configurar conta AWS**.")
     elif ss.engine_kind == "glue" and ss.session_id:
         try:
-            status = engine.session_status()
+            status = session_status_cached(engine)
         except Exception as e:
             status_error = e           # falha momentânea: a sessão continua registrada
         if status_error is None and (status is None or status in TERMINAL_SESSION_STATES):
             ss.session_id, ss.session_conf, ss.running_stmt = None, None, None
+            mark_session_status(None, None)
     elif ss.engine_kind == "local":
         status = engine.session_status()
 
@@ -402,6 +441,8 @@ with st.sidebar:
                 st.error(f"Não consegui encerrar a sessão: {e}")
             else:
                 ss.session_id, ss.session_conf, ss.running_stmt = None, None, None
+                mark_session_status(None, None)
+                ss.pop("reusable", None)
                 st.rerun()
 
     if status == "READY":
@@ -418,6 +459,32 @@ with st.sidebar:
         st.info(f"Sessão `{ss.session_id}` iniciando ({status}). Ela será usada na próxima execução.")
         _botao_encerrar()
     else:
+        # Depois de recarregar a página, a sessão que você estava usando continua ativa (e cobrando)
+        # até o tempo sem uso acabar: a ferramenta procura as suas sessões e oferece reaproveitar.
+        if ss.engine_kind == "glue" and engine is not None and "reusable" not in ss:
+            try:
+                ss.reusable = engine.reusable_sessions()
+            except Exception:
+                ss.reusable = []
+        anteriores = ss.get("reusable") or [] if ss.engine_kind == "glue" else []
+        if anteriores:
+            s0 = anteriores[0]
+            conf_s0 = f"{s0.get('NumberOfWorkers')} x {s0.get('WorkerType')} · Glue {s0.get('GlueVersion')}"
+            st.info(f"Você tem uma sessão ainda ativa: `{s0['Id']}` ({s0.get('Status')}, {conf_s0}). "
+                    "Reaproveitar evita esperar outra subir e pagar pelas duas.")
+            r1, r2 = st.columns(2)
+            if r1.button("♻️ Reaproveitar", width="stretch"):
+                ss.session_id, ss.session_conf = s0["Id"], conf_s0
+                ss.reusable = anteriores[1:]
+                st.rerun()
+            if r2.button("⏹️ Encerrar", width="stretch", key="encerrar_anterior"):
+                try:
+                    engine.stop(s0["Id"])
+                except Exception as e:
+                    st.error(f"Não consegui encerrar a sessão: {e}")
+                else:
+                    ss.reusable = anteriores[1:]
+                    st.rerun()
         st.info("Nenhuma sessão ativa. Ela é criada automaticamente na primeira execução "
                 "(no Glue isso leva ~30–90 s).")
         if st.button("▶️ Iniciar sessão agora", width="stretch", disabled=engine is None):
@@ -426,6 +493,7 @@ with st.sidebar:
                     engine.ensure_session(lambda m: box.update(label=m), on_created=remember_session)
                     if ss.engine_kind == "glue":
                         remember_session(engine.session_id)
+                        mark_session_status(engine.session_id, "READY")
                     box.update(label="Sessão pronta", state="complete")
                     st.rerun()
                 except Exception as e:
@@ -565,6 +633,17 @@ with st.expander("Ver código PySpark gerado"):
 # ------------------------------------------------------------------------------------
 # Execução
 # ------------------------------------------------------------------------------------
+# Cancelar: o clique reinicia o script (interrompendo a espera da execução em andamento); aqui a
+# query que estava rodando no Glue é cancelada de fato.
+if ss.get("cancelar_execucao") and ss.running_stmt and engine is not None and ss.engine_kind == "glue":
+    try:
+        engine.session_id = ss.running_stmt["session"]
+        engine.cancel_statement(ss.running_stmt["id"])
+        ss.result = {"ok": False, "error": "Execução cancelada.", "traceback": "", "log": []}
+    except Exception as e:
+        st.error(f"Não consegui cancelar a execução: {e}")
+    ss.running_stmt = None
+
 if run_clicked:
     orch = current_orchestration()
     errors = validate_orchestration(orch)
@@ -594,6 +673,9 @@ if run_clicked:
         def _guardar_statement(statement_id: int):
             ss.running_stmt = {"session": engine.session_id, "id": statement_id}
 
+        botao_cancelar = st.empty()
+        if ss.engine_kind == "glue":
+            botao_cancelar.button("⏹️ Cancelar execução", key="cancelar_execucao")
         with st.status("Preparando…", expanded=False) as box:
             try:
                 if ss.engine_kind == "glue":
@@ -610,6 +692,8 @@ if run_clicked:
                     ss.running_stmt = None
                 res = engine.run(code, lambda m: box.update(label=m), on_submitted=_guardar_statement)
                 ss.running_stmt = None
+                if ss.engine_kind == "glue":
+                    mark_session_status(engine.session_id, "READY")
                 res["total"] = round(time.time() - t0, 1)
                 ss.result = res
                 box.update(label=("Concluído" if res.get("ok") else "Erro na query") + f" em {res['total']}s",
@@ -620,6 +704,8 @@ if run_clicked:
             except Exception as e:
                 box.update(label="Falha", state="error")
                 ss.result = {"ok": False, "error": f"{type(e).__name__}: {e}", "traceback": "", "log": []}
+        botao_cancelar.empty()
+
 
 def render_metadata(res: dict, col_names: list[str]):
     cols = [dict(c, name=n) for c, n in zip(res["columns"], col_names)]

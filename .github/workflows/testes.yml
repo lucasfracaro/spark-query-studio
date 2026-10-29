@@ -7,14 +7,16 @@ on:
 jobs:
   unitarios:
     name: Unitários e interface (Python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         python: ["3.10", "3.12", "3.13"]
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"   # sem credenciais no CI: falha rápido em vez de esperar
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -23,26 +25,40 @@ jobs:
 
   zip:
     name: Zip do projeto atualizado
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: python scripts/gerar_zip.py --check
 
   spark:
-    name: Integração com Spark local
-    runs-on: ubuntu-latest
+    # O mesmo Spark e Python de cada versão do Glue, para o teste local se comportar como a produção
+    name: Spark local (${{ matrix.glue }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - glue: "Glue 4.0 · Spark 3.3"
+            python: "3.10"
+            pyspark: "3.3.*"
+          - glue: "Glue 5.x · Spark 3.5"
+            python: "3.11"
+            pyspark: "3.5.*"
+          - glue: "Glue 6.0 · Spark 4.1"
+            python: "3.13"
+            pyspark: "4.1.*"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           cache: pip
-      - run: pip install -r requirements-dev.txt pyspark
+      - run: pip install -r requirements-dev.txt "pyspark==${{ matrix.pyspark }}"
       - run: pytest tests/test_local_spark.py -v

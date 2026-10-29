@@ -14,6 +14,7 @@ APP = str(Path(__file__).resolve().parent.parent / "app.py")
 def app(tmp_path, monkeypatch):
     import settings_store
     monkeypatch.setenv("SQS_PLAIN_EDITOR", "1")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")    # sem credenciais: falha rápido
     # não lê nem grava a configuração real do usuário
     monkeypatch.setattr(settings_store, "CONFIG_DIR", tmp_path)
     monkeypatch.setattr(settings_store, "CONFIG_FILE", tmp_path / "config.json")
@@ -192,3 +193,25 @@ def test_perfil_aws_inexistente_nao_derruba_a_tela(app):
     app.run()
     assert not app.exception, app.exception
     assert any("Configurar conta AWS" in e.value for e in app.error)
+
+
+
+def test_oferece_reaproveitar_sessao_ativa(app, monkeypatch):
+    import engines
+    monkeypatch.setattr(engines.GlueSessionEngine, "session_status", lambda self, *a: "READY")
+    app.session_state["engine_kind"] = "glue"
+    app.session_state["reusable"] = [{"Id": "sqs-abc", "Status": "READY", "WorkerType": "G.1X",
+                                      "NumberOfWorkers": 2, "GlueVersion": "5.0"}]
+    app.run()
+    assert any("sqs-abc" in i.value for i in app.info)
+    _botao(app, "Reaproveitar").click().run()
+    assert not app.exception, app.exception
+    assert app.session_state["session_id"] == "sqs-abc"
+    assert any("sqs-abc" in s.value for s in app.success)
+
+
+def test_glue_6_avisa_do_modo_ansi(app):
+    app.session_state["engine_kind"] = "glue"
+    app.run()
+    next(s for s in app.selectbox if s.label == "Versão do Glue").set_value("6.0").run()
+    assert any("ANSI" in c.value for c in app.caption)
