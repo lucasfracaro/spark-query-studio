@@ -95,3 +95,34 @@ def test_estatisticas_com_nomes_repetidos_e_tipos_complexos(engine):
     cols = res["profile"]["columns"]
     assert cols[0]["max"] == 1 and cols[1]["max"] == 2              # renomeadas por posição: sem ambiguidade
     assert cols[2]["distinct"] is None and cols[2]["nulls"] == 0    # complexos: só contagem de nulos
+
+
+def test_execucoes_nao_compartilham_configuracoes_nem_views(engine):
+    r1 = _run(engine, "CREATE OR REPLACE TEMP VIEW sobra AS SELECT 1 AS x; SELECT * FROM sobra",
+              spark_conf={"spark.sql.shuffle.partitions": "7"})
+    assert r1["ok"], r1
+    r2 = _run(engine, "SET spark.sql.shuffle.partitions")
+    assert r2["ok"], r2
+    assert r2["rows"] == [["spark.sql.shuffle.partitions", "200"]]      # voltou ao padrão
+    r3 = _run(engine, "SELECT * FROM sobra")
+    assert r3["ok"] is False and "sobra" in r3["error"]                 # a view da execução anterior sumiu
+
+
+def test_hints_e_comentarios_chegam_ao_spark(engine):
+    sql = ("-- comentário no topo\n"
+           "SELECT /*+ BROADCAST(b) */ a.id, b.v/*sem espaço*/AS valor\n"
+           "FROM range(3) a JOIN (SELECT id, id * 10 AS v FROM range(3)) b ON a.id = b.id\n"
+           "ORDER BY a.id")
+    res = _run(engine, sql)
+    assert res["ok"], res
+    assert [c["name"] for c in res["columns"]] == ["id", "valor"]
+    assert res["rows"] == [[0, 0], [1, 10], [2, 20]]
+
+
+def test_query_grande_vai_comprimida(engine):
+    sql = "SELECT " + ", ".join(f"{i} AS coluna_numero_{i:05d}" for i in range(3000))
+    code = build_spark_code(sql, Orchestration())
+    assert "_zlib.decompress" in code
+    res = engine.run(code)
+    assert res["ok"], res
+    assert len(res["columns"]) == 3000 and res["rows"][0][2999] == 2999

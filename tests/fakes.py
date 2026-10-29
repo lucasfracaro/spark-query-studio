@@ -80,6 +80,9 @@ class _Conf:
             raise ValueError(f"Cannot modify the value of a static config: {k}")
         self.spark.conf_values[k] = v
 
+    def get(self, k, default=None):
+        return self.spark.conf_values.get(k, self.spark.settings.get(k, default))
+
 
 class _Catalog:
     def __init__(self, spark):
@@ -88,19 +91,37 @@ class _Catalog:
     def cacheTable(self, name):
         self.spark.cached.append(name)
 
+    def clearCache(self):
+        self.spark.cache_cleared += 1
+
 
 class FakeSpark:
     """Imita o pedaço da API do SparkSession que o código gerado usa."""
 
-    def __init__(self, rows=None, columns=None, fail_on=None, bad_conf=()):
+    def __init__(self, rows=None, columns=None, fail_on=None, bad_conf=(), settings=None):
         self.rows = rows if rows is not None else [(1, "a", None), (2, "b", 3.5), (3, "c", 1.0)]
         self.columns = columns or [("id", "int"), ("nome", "string"), ("valor", "double")]
         self.fail_on = fail_on            # texto que, se aparecer na query, gera erro
         self.bad_conf = set(bad_conf)
+        # configurações "iniciais" da sessão (o que o comando SET devolve)
+        self.settings = dict(settings if settings is not None else {"spark.sql.catalogImplementation": "hive"})
         self.calls, self.sql_log, self.cached = [], [], []
         self.views, self.conf_values = {}, {}
+        self.cache_cleared = 0
+        self.sessions: list[FakeSpark] = []   # sessões criadas com newSession()
         self.conf = _Conf(self)
         self.catalog = _Catalog(self)
+
+    def newSession(self):
+        """Sessão nova: começa sem views, sem configurações alteradas e no database padrão."""
+        child = FakeSpark(rows=self.rows, columns=self.columns, fail_on=self.fail_on,
+                          bad_conf=self.bad_conf, settings={})
+        self.sessions.append(child)
+        return child
+
+    @property
+    def last_session(self) -> "FakeSpark":
+        return self.sessions[-1]
 
     @property
     def read(self):
@@ -115,6 +136,8 @@ class FakeSpark:
 
     def sql(self, query):
         self.sql_log.append(query)
+        if query.strip().upper() == "SET":
+            return FakeDataFrame(list(self.settings.items()), [("key", "string"), ("value", "string")], self)
         if self.fail_on and self.fail_on in query:
             raise RuntimeError(f"[TABLE_OR_VIEW_NOT_FOUND] {self.fail_on}")
         return self.default_df()

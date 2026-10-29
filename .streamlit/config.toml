@@ -7,4 +7,11 @@ textColor = "#e5e7eb"
 font = "sans serif"
 
 [server]
+# Só este computador acessa o app. Sem isso, o Streamlit aceita conexões de qualquer máquina
+# da rede, e quem abrisse http://seu-ip:8501 rodaria queries com as suas credenciais AWS.
+address = "localhost"
 maxUploadSize = 50
+
+[browser]
+# Não envia estatísticas de uso para o Streamlit.
+gatherUsageStats = false

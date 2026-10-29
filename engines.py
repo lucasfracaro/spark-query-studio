@@ -17,6 +17,12 @@ from typing import Callable
 from code_builder import parse_result
 
 StatusCallback = Callable[[str], None]
+IdCallback = Callable[[str], None]
+
+# Estados finais de uma sessão Glue: depois deles a sessão não volta a ficar READY
+TERMINAL_SESSION_STATES = {"FAILED", "TIMEOUT", "STOPPED", "STOPPING"}
+# Estados de um statement que ainda está na fila ou rodando
+ACTIVE_STATEMENT_STATES = {"WAITING", "RUNNING"}
 
 # Tipos de worker do Glue (vCPU / memória por worker)
 GLUE_WORKER_TYPES = {
@@ -108,14 +114,21 @@ class GlueSessionEngine:
             return True
         return False
 
-    def start(self, on_status: StatusCallback = lambda s: None) -> str:
+    def start(self, on_status: StatusCallback = lambda s: None, on_created: IdCallback = lambda sid: None) -> str:
+        """Cria uma sessão e espera ficar READY.
+
+        on_created é chamado logo depois da criação, antes da espera: se a espera for interrompida
+        (ex.: o Streamlit reinicia o script porque você mexeu na tela), quem chamou já guardou o ID
+        e pode continuar esperando a mesma sessão em vez de criar outra.
+        """
         if not self.account.glue_role_arn:
             raise EngineError("Informe o ARN da IAM Role do Glue em 'Configurar conta AWS'.")
 
         inst = self.instance
+        # O Spark UI não vem ligado: em sessões interativas ele só funciona com --spark-event-logs-path
+        # (um caminho no S3) e um Spark History Server. Dá para ligar em "Argumentos extras".
         args = {
             "--enable-glue-datacatalog": "true",   # permite ler as mesmas tabelas do Athena
-            "--enable-spark-ui": "true",
         }
         if self.account.temp_dir:
             args["--TempDir"] = self.account.temp_dir
@@ -139,7 +152,12 @@ class GlueSessionEngine:
         on_status(f"Criando sessão {sid} ({inst.num_workers} x {inst.worker_type}, Glue {inst.glue_version})…")
         self._glue.create_session(**params)
         self.session_id = sid
+        on_created(sid)
+        return self.wait_ready(on_status)
 
+    def wait_ready(self, on_status: StatusCallback = lambda s: None) -> str:
+        """Espera a sessão atual ficar READY (ou falha com EngineError)."""
+        sid = self.session_id
         t0 = time.time()
         not_found = 0
         while True:
@@ -151,28 +169,67 @@ class GlueSessionEngine:
                 not_found += 1          # logo após o create_session a sessão pode não aparecer ainda
                 time.sleep(self.POLL_S)
                 continue
-            if status in ("FAILED", "TIMEOUT", "STOPPED", "STOPPING", None):
+            if status in TERMINAL_SESSION_STATES or status is None:
                 detail = self._glue.get_session(Id=sid)["Session"].get("ErrorMessage", "") if status else ""
                 raise EngineError(f"Sessão terminou com status {status}. {detail}")
             if time.time() - t0 > self.READY_TIMEOUT_S:
                 raise EngineError("Tempo esgotado esperando a sessão ficar READY.")
             time.sleep(self.POLL_S)
 
+    def ensure_session(self, on_status: StatusCallback = lambda s: None, on_created: IdCallback = lambda sid: None) -> str:
+        """Garante uma sessão READY: reaproveita a atual, espera se ela ainda está subindo, ou cria outra."""
+        if self.session_id:
+            status = self.session_status()
+            if status == "READY":
+                return self.session_id
+            if status is not None and status not in TERMINAL_SESSION_STATES:   # PROVISIONING
+                on_status(f"Sessão {self.session_id} ainda está iniciando…")
+                return self.wait_ready(on_status)
+            self.session_id = None                          # encerrada ou inexistente: cria outra
+        return self.start(on_status, on_created)
+
     def stop(self):
+        """Encerra a sessão. Erros (ex.: sem permissão) sobem para quem chamou mostrar."""
         if self.session_id:
             try:
                 self._glue.stop_session(Id=self.session_id)
-            except Exception:
-                pass
+            except Exception as e:
+                if type(e).__name__ != "EntityNotFoundException":
+                    raise
             self.session_id = None
+
+    # ---------- statements ----------
+    def statement_state(self, statement_id: int) -> str | None:
+        try:
+            return self._glue.get_statement(SessionId=self.session_id, Id=statement_id)["Statement"]["State"]
+        except Exception as e:
+            if type(e).__name__ == "EntityNotFoundException":
+                return None
+            raise
+
+    def cancel_statement(self, statement_id: int, wait_s: float = 30) -> bool:
+        """Cancela um statement que ainda está na fila ou rodando. Devolve True se precisou cancelar."""
+        if not self.session_id or self.statement_state(statement_id) not in ACTIVE_STATEMENT_STATES:
+            return False
+        self._glue.cancel_statement(SessionId=self.session_id, Id=statement_id)
+        t0 = time.time()
+        while time.time() - t0 < wait_s:
+            if self.statement_state(statement_id) not in ACTIVE_STATEMENT_STATES | {"CANCELLING"}:
+                break
+            time.sleep(min(self.POLL_S, 1))
+        return True
 
     # ---------- execução ----------
     def run(self, code: str, on_status: StatusCallback = lambda s: None,
-            should_cancel: Callable[[], bool] = lambda: False) -> dict:
+            should_cancel: Callable[[], bool] = lambda: False,
+            on_submitted: Callable[[int], None] = lambda stmt_id: None) -> dict:
+        """Roda o código na sessão. on_submitted recebe o ID do statement logo depois do envio,
+        para que uma execução interrompida possa ser cancelada depois."""
         if not self.session_id:
             self.start(on_status)
 
         stmt_id = self._glue.run_statement(SessionId=self.session_id, Code=code)["Id"]
+        on_submitted(stmt_id)
         t0 = time.time()
         while True:
             st = self._glue.get_statement(SessionId=self.session_id, Id=stmt_id)["Statement"]
@@ -212,7 +269,7 @@ class LocalSparkEngine:
         self.account = account
         self.session_id = "local"
 
-    def start(self, on_status: StatusCallback = lambda s: None) -> str:
+    def start(self, on_status: StatusCallback = lambda s: None, on_created: IdCallback = lambda sid: None) -> str:
         if LocalSparkEngine._spark is None:
             on_status("Iniciando Spark local…")
             from pyspark.sql import SparkSession
@@ -229,6 +286,12 @@ class LocalSparkEngine:
 
     def session_status(self, *_):
         return "READY" if LocalSparkEngine._spark is not None else None
+
+    def ensure_session(self, on_status: StatusCallback = lambda s: None, on_created: IdCallback = lambda sid: None) -> str:
+        return self.start(on_status, on_created)
+
+    def cancel_statement(self, *_args, **_kw) -> bool:
+        return False
 
     def attach(self, *_):
         return LocalSparkEngine._spark is not None

@@ -8,21 +8,21 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import time
-from dataclasses import asdict
 
 import pandas as pd
 import streamlit as st
 
-import settings_store
-from code_builder import (DEFAULT_LIMIT, InputSource, Orchestration, build_spark_code,
-                          split_statements, validate_orchestration)
-from sql_refs import check_query_against_orchestration, missing_from_spark_error
 import athena_import
 import metadata
 import orchestration_io
-from engines import (GLUE_VERSIONS, GLUE_WORKER_TYPES, AwsAccount, EngineError,
+import settings_store
+from code_builder import (DEFAULT_LIMIT, InputSource, Orchestration, build_spark_code,
+                          split_statements, validate_orchestration)
+from engines import (GLUE_VERSIONS, GLUE_WORKER_TYPES, TERMINAL_SESSION_STATES, AwsAccount, EngineError,
                      GlueSessionEngine, InstanceConfig, LocalSparkEngine)
+from sql_refs import check_query_against_orchestration, find_write_statements, missing_from_spark_error
 
 st_ace = None
 if not os.environ.get("SQS_PLAIN_EDITOR"):   # SQS_PLAIN_EDITOR=1 força o editor simples (usado nos testes)
@@ -86,12 +86,22 @@ ss.setdefault("orch_draft", "")
 ss.setdefault("orch_draft_version", 0)
 ss.setdefault("open_orch_after", False)
 ss.setdefault("athena_result", None)
+ss.setdefault("allow_writes", False)     # modo somente leitura ligado por padrão
+ss.setdefault("running_stmt", None)      # {"session": id, "id": n} enquanto uma query roda no Glue
+ss.setdefault("engine_error", None)
 
 
 def make_engine():
+    """Cria o motor. Se a configuração AWS estiver inválida (perfil inexistente, região vazia...),
+    devolve None e guarda o erro em ss.engine_error, em vez de derrubar a tela."""
+    ss.engine_error = None
     if ss.engine_kind == "local":
         return LocalSparkEngine(ss.instance, ss.account)
-    eng = GlueSessionEngine(ss.account, ss.instance)
+    try:
+        eng = GlueSessionEngine(ss.account, ss.instance)
+    except Exception as e:
+        ss.engine_error = f"{type(e).__name__}: {e}"
+        return None
     if ss.session_id:
         eng.session_id = ss.session_id
     return eng
@@ -99,6 +109,27 @@ def make_engine():
 
 def instance_signature(inst: InstanceConfig) -> str:
     return f"{inst.num_workers} x {inst.worker_type} · Glue {inst.glue_version}"
+
+
+def remember_session(session_id: str):
+    """Guarda o ID da sessão Glue assim que ela é criada (antes de esperar ficar pronta)."""
+    ss.session_id, ss.session_conf = session_id, instance_signature(ss.instance)
+
+
+def server_is_local_only() -> bool:
+    endereco = (st.get_option("server.address") or "").strip().lower()
+    return endereco in ("localhost", "127.0.0.1", "::1") or endereco.startswith("unix://")
+
+
+REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+$")
+
+
+def aws_profiles() -> list[str]:
+    try:
+        import boto3
+        return sorted(boto3.session.Session().available_profiles)
+    except Exception:
+        return []
 
 
 def clean(v) -> str:
@@ -216,6 +247,9 @@ def athena_dialog():
         except ValueError as e:
             ss.athena_result = None
             st.error(str(e))
+        except Exception as e:      # qualquer outra falha vira mensagem, sem derrubar a janela
+            ss.athena_result = None
+            st.error(f"Não consegui importar a query ({type(e).__name__}: {e}).")
 
     r = ss.athena_result
     if r is None:
@@ -270,14 +304,26 @@ def aws_dialog():
     new = AwsAccount(region=region.strip(), auth_mode=auth_mode, profile=profile.strip(),
                      access_key=ak.strip(), secret_key=sk.strip(), session_token=tok.strip(),
                      glue_role_arn=role.strip(), temp_dir=temp.strip())
+
+    problemas = []
+    if not REGION_RE.match(new.region):
+        problemas.append("Informe uma região válida, por exemplo `sa-east-1` ou `us-east-1`.")
+    if auth_mode == "profile" and new.profile:
+        perfis = aws_profiles()
+        if perfis and new.profile not in perfis:
+            problemas.append(f"O perfil `{new.profile}` não existe no AWS CLI deste computador. "
+                             f"Perfis encontrados: {', '.join(perfis)}.")
+    for p in problemas:
+        st.warning(p)
+
     b1, b2, _ = st.columns([1, 1, 2])
-    if b1.button("Testar conexão", width="stretch"):
+    if b1.button("Testar conexão", width="stretch", disabled=bool(problemas)):
         try:
             ident = GlueSessionEngine(new, ss.instance).whoami()
             st.success(f"Conectado como `{ident['Arn']}` (conta {ident['Account']})")
         except Exception as e:
             st.error(f"Falha: {e}")
-    if b2.button("Salvar", type="primary", width="stretch"):
+    if b2.button("Salvar", type="primary", width="stretch", disabled=bool(problemas)):
         ss.account = new
         path = settings_store.save(ss.account, ss.instance)
         st.toast(f"Configuração salva em {path}", icon="✅")
@@ -328,37 +374,58 @@ with st.sidebar:
             settings_store.save(ss.account, inst)
             st.toast("Instância salva", icon="✅")
 
+    if not server_is_local_only():
+        st.warning("⚠️ O app está aceitando conexões de outras máquinas da rede. Abra pelo `run.sh` / "
+                   "`run_windows.bat` ou use `streamlit run app.py --server.address localhost`.")
+
     st.markdown("### 🔌 Sessão")
     engine = make_engine()
-    status = None
-    if ss.engine_kind == "glue" and ss.session_id:
+    status, status_error = None, None
+    if engine is None:
+        st.error(f"Não consegui preparar a conexão com a AWS ({ss.engine_error}). "
+                 "Revise em **Configurar conta AWS**.")
+    elif ss.engine_kind == "glue" and ss.session_id:
         try:
             status = engine.session_status()
         except Exception as e:
-            st.warning(f"Não consegui consultar a sessão: {e}")
-        if status != "READY":
-            ss.session_id, ss.session_conf = None, None
+            status_error = e           # falha momentânea: a sessão continua registrada
+        if status_error is None and (status is None or status in TERMINAL_SESSION_STATES):
+            ss.session_id, ss.session_conf, ss.running_stmt = None, None, None
     elif ss.engine_kind == "local":
         status = engine.session_status()
+
+    def _botao_encerrar():
+        if st.button("⏹️ Encerrar sessão", width="stretch"):
+            try:
+                engine.stop()
+            except Exception as e:
+                st.error(f"Não consegui encerrar a sessão: {e}")
+            else:
+                ss.session_id, ss.session_conf, ss.running_stmt = None, None, None
+                st.rerun()
 
     if status == "READY":
         label = ss.session_id if ss.engine_kind == "glue" else "local"
         st.success(f"Ativa: `{label}`")
         if ss.engine_kind == "glue" and ss.session_conf and ss.session_conf != instance_signature(ss.instance):
             st.warning(f"A sessão ativa usa **{ss.session_conf}**. Reinicie para aplicar a nova instância.")
-        if st.button("⏹️ Encerrar sessão", width="stretch"):
-            engine.stop()
-            ss.session_id, ss.session_conf = None, None
-            st.rerun()
+        _botao_encerrar()
+    elif ss.engine_kind == "glue" and ss.session_id and status_error is not None:
+        st.warning(f"Não consegui consultar a sessão `{ss.session_id}` ({type(status_error).__name__}). "
+                   "Ela continua registrada; a próxima execução tenta de novo.")
+        _botao_encerrar()
+    elif ss.engine_kind == "glue" and ss.session_id:
+        st.info(f"Sessão `{ss.session_id}` iniciando ({status}). Ela será usada na próxima execução.")
+        _botao_encerrar()
     else:
         st.info("Nenhuma sessão ativa. Ela é criada automaticamente na primeira execução "
                 "(no Glue isso leva ~30–90 s).")
-        if st.button("▶️ Iniciar sessão agora", width="stretch"):
+        if st.button("▶️ Iniciar sessão agora", width="stretch", disabled=engine is None):
             with st.status("Iniciando sessão…", expanded=True) as box:
                 try:
-                    sid = engine.start(lambda m: box.update(label=m))
+                    engine.ensure_session(lambda m: box.update(label=m), on_created=remember_session)
                     if ss.engine_kind == "glue":
-                        ss.session_id, ss.session_conf = sid, instance_signature(ss.instance)
+                        remember_session(engine.session_id)
                     box.update(label="Sessão pronta", state="complete")
                     st.rerun()
                 except Exception as e:
@@ -368,7 +435,12 @@ with st.sidebar:
 # ------------------------------------------------------------------------------------
 # Cabeçalho
 # ------------------------------------------------------------------------------------
-pill = ("sqs-ready", "Sessão pronta") if status == "READY" else ("sqs-off", "Sem sessão")
+if status == "READY":
+    pill = ("sqs-ready", "Sessão pronta")
+elif ss.engine_kind == "glue" and ss.session_id:
+    pill = ("sqs-busy", "Sessão iniciando")
+else:
+    pill = ("sqs-off", "Sem sessão")
 engine_label = (f"AWS Glue · {instance_signature(ss.instance)}" if ss.engine_kind == "glue" else "Spark local")
 st.markdown(f"""
 <div class="sqs-header">
@@ -383,13 +455,16 @@ st.markdown(f"""
 st.markdown('<div class="sqs-step">Passo 1</div>', unsafe_allow_html=True)
 st.subheader("Orquestração das entradas")
 b_ath, b_orch, _ = st.columns([1, 1, 2])
+# As janelas só abrem depois das abas abaixo: assim elas já veem as edições feitas nas tabelas
+# (as tabelas só são lidas quando são desenhadas).
+abrir_janela = None
 if b_ath.button("📥 Importar query do Athena", width="stretch"):
-    athena_dialog()
+    abrir_janela = "athena"
 if b_orch.button("📝 Abrir orquestração", width="stretch", help="Editar como arquivo, salvar na máquina ou abrir um salvo"):
-    open_orchestration_dialog()
+    abrir_janela = "orquestracao"
 if ss.open_orch_after:
     ss.open_orch_after = False
-    open_orchestration_dialog()
+    abrir_janela = "orquestracao"
 
 t_in, t_conf, t_opt = st.tabs(["📥 Entradas de dados", "🔧 Configurações Spark", "⚙️ Opções"])
 
@@ -426,6 +501,17 @@ with t_opt:
     ss.profile = st.checkbox(
         "Calcular estatísticas para os metadados (nulos, distintos, mínimo e máximo) no resultado completo",
         ss.profile, help="Roda uma agregação extra sobre o resultado inteiro no cluster: a execução fica mais lenta.")
+    ss.allow_writes = st.checkbox(
+        "Permitir comandos que gravam ou alteram dados (INSERT, CREATE TABLE, DROP, ALTER, MERGE…)",
+        ss.allow_writes,
+        help="Desligado (padrão), a ferramenta funciona em modo somente leitura: só roda consultas e comandos "
+             "que afetam a própria sessão, como CREATE TEMP VIEW e SET. A role do Glue costuma ter permissão "
+             "de escrita, então um comando esquecido na query gravaria de verdade.")
+
+if abrir_janela == "athena":
+    athena_dialog()
+elif abrir_janela == "orquestracao":
+    open_orchestration_dialog()
 
 # ------------------------------------------------------------------------------------
 # 2. Query
@@ -456,6 +542,10 @@ ref_check = check_query_against_orchestration(ss.sql, current_orchestration().in
 if ref_check.missing:
     nomes = ", ".join(f"`{m.name}`" for m in ref_check.missing)
     st.caption(f"⚠️ Fora da orquestração: {nomes}")
+escritas = [] if ss.allow_writes else find_write_statements(ss.sql)
+if escritas:
+    st.caption("🔒 Modo somente leitura: " + ", ".join(f"o comando {w.number} ({w.keyword})" for w in escritas)
+               + " grava dados e será bloqueado.")
 
 b1, b2, b3, _ = st.columns([1.2, 1, 1, 3])
 run_clicked = b1.button("▶️ Executar", type="primary", width="stretch")
@@ -467,7 +557,8 @@ if b3.button("🧹 Limpar", width="stretch"):
 
 with st.expander("Ver código PySpark gerado"):
     try:
-        st.code(build_spark_code(ss.sql, current_orchestration()), language="python")
+        st.caption("É exatamente o código que vai rodar. Dá para copiar e rodar num notebook do Glue.")
+        st.code(build_spark_code(ss.sql, current_orchestration(), profile=ss.profile), language="python")
     except ValueError as e:
         st.caption(str(e))
 
@@ -481,22 +572,44 @@ if run_clicked:
         errors.append("A query está vazia.")
     if ss.check_refs and not errors:
         errors += [m.message() for m in ref_check.missing]
+    if not errors:
+        errors += [w.message() for w in escritas]
+    code = None
+    if not errors:
+        try:
+            code = build_spark_code(ss.sql, orch, profile=ss.profile)
+        except ValueError as e:
+            errors.append(str(e))
+    if engine is None and not errors:
+        errors.append(f"A conexão com a AWS não está pronta ({ss.engine_error}). Revise em **Configurar conta AWS**.")
     for aviso in ref_check.warnings:
         st.warning(aviso)
     if errors:
         for e in errors:
             st.error(e)
     else:
-        code = build_spark_code(ss.sql, orch, profile=ss.profile)
         ss.result_version += 1
-        engine = make_engine()
         t0 = time.time()
+
+        def _guardar_statement(statement_id: int):
+            ss.running_stmt = {"session": engine.session_id, "id": statement_id}
+
         with st.status("Preparando…", expanded=False) as box:
             try:
-                if ss.engine_kind == "glue" and not ss.session_id:
-                    ss.session_id = engine.start(lambda m: box.update(label=m))
-                    ss.session_conf = instance_signature(ss.instance)
-                res = engine.run(code, lambda m: box.update(label=m))
+                if ss.engine_kind == "glue":
+                    engine.session_id = ss.session_id
+                    engine.ensure_session(lambda m: box.update(label=m), on_created=remember_session)
+                    if ss.session_id != engine.session_id:
+                        remember_session(engine.session_id)
+                    # uma execução interrompida (você mexeu na tela no meio) pode ter deixado a query
+                    # anterior rodando na sessão; ela atrasaria esta, então é cancelada
+                    anterior = ss.running_stmt
+                    if anterior and anterior.get("session") == engine.session_id:
+                        if engine.cancel_statement(anterior["id"]):
+                            box.update(label="A execução anterior, que tinha ficado rodando, foi cancelada")
+                    ss.running_stmt = None
+                res = engine.run(code, lambda m: box.update(label=m), on_submitted=_guardar_statement)
+                ss.running_stmt = None
                 res["total"] = round(time.time() - t0, 1)
                 ss.result = res
                 box.update(label=("Concluído" if res.get("ok") else "Erro na query") + f" em {res['total']}s",

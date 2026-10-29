@@ -7,6 +7,8 @@ Importa uma query do Athena (Trino) e monta a orquestração automaticamente.
    usam só colunas de partição dessa base. Essas condições viram o filtro da entrada na orquestração.
    Elas são COPIADAS: a query continua com os filtros originais, então o resultado não muda.
 4. Traduz a query para Spark SQL, trocando "db.tabela" pelo alias da orquestração.
+   INSERT ... SELECT e CREATE TABLE ... AS SELECT viram só o SELECT: a ferramenta mostra o que
+   seria gravado, sem gravar. O destino da escrita não entra na orquestração.
 5. Devolve um relatório do que foi feito automaticamente e do que precisa de revisão.
 """
 from __future__ import annotations
@@ -17,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from code_builder import DEFAULT_LIMIT, InputSource, Orchestration
+from sql_refs import is_read_table
 
 try:
     import sqlglot
@@ -24,6 +27,9 @@ try:
 except ImportError:  # pragma: no cover - tratado na tela
     sqlglot = None
     exp = None
+
+# nome do argumento WITH nos nós do sqlglot ("with_" nas versões novas, "with" nas antigas)
+_WITH_KEY = ("with_" if exp is not None and "with_" in exp.Select.arg_types else "with")
 
 # nomes comuns de colunas de partição (usados só quando não dá para consultar o Glue)
 _LIKELY_PARTITION_NAMES = {
@@ -197,6 +203,29 @@ def _analyze_occurrence(table, key, partition_keys: set[str], lookup_keys) -> _O
     return occ
 
 
+def _select_of_write(stmt):
+    """INSERT ... SELECT e CREATE TABLE ... AS SELECT -> (destino, SELECT). Outros comandos -> None."""
+    if not isinstance(stmt, (exp.Insert, exp.Create)):
+        return None
+    query = stmt.args.get("expression")
+    if not isinstance(query, exp.Query):            # INSERT ... VALUES, CREATE TABLE sem AS SELECT
+        return None
+    destino = stmt.this.this if isinstance(stmt.this, exp.Schema) else stmt.this
+    query = query.copy()
+    with_ = stmt.args.get(_WITH_KEY)                 # WITH ... INSERT INTO ...: o WITH fica no INSERT
+    if with_ is not None and query.args.get(_WITH_KEY) is None:
+        query.set(_WITH_KEY, with_.copy())
+    return destino.sql(dialect="athena"), query
+
+
+def _is_sql_command(stmt) -> bool:
+    """Diferencia um comando SQL de um trecho solto que o sqlglot leu como expressão (ex.: "SELEC * FRM t")."""
+    tipos = [exp.Query] + [getattr(exp, n) for n in (
+        "DDL", "DML", "Insert", "Create", "Merge", "Delete", "Update", "Drop", "Alter", "TruncateTable",
+        "Command", "Set", "Use", "Describe", "Show", "Cache", "Uncache") if hasattr(exp, n)]
+    return isinstance(stmt, tuple(tipos))
+
+
 # --------------------------------------------------------------------------------------------
 # Importação
 # --------------------------------------------------------------------------------------------
@@ -212,10 +241,30 @@ def import_athena_query(sql: str, partition_lookup: PartitionLookup | None = Non
     try:
         try:
             statements = [s for s in sqlglot.parse(sql, read="athena") if s is not None]
-        except sqlglot.errors.ParseError as e:
+        except sqlglot.errors.SqlglotError as e:      # ParseError, TokenError (ex.: string sem fechar)...
             raise ValueError(f"Não consegui ler a query do Athena: {e}") from None
         if not statements:
             raise ValueError("A query está vazia.")
+        for i, stmt in enumerate(statements):
+            if not _is_sql_command(stmt):
+                inicio = " ".join(stmt.sql(dialect="athena").split())[:40]
+                raise ValueError(f"Não consegui ler a query do Athena: o comando {i + 1} não parece SQL válido "
+                                 f"(lido como `{inicio}`).")
+
+        # INSERT ... SELECT / CREATE TABLE ... AS SELECT -> só o SELECT (o que seria gravado)
+        for i, stmt in enumerate(statements):
+            convertido = _select_of_write(stmt)
+            if convertido is not None:
+                destino, query = convertido
+                statements[i] = query
+                notes.append(Note("info", f"O comando {i + 1} gravaria em `{destino}`; ficou só o SELECT, para "
+                                          "você ver o que seria gravado sem gravar nada."))
+            elif not isinstance(stmt, exp.Query):
+                tipo = type(stmt).__name__.upper()
+                if isinstance(stmt, (exp.Insert, exp.Create, exp.Merge, exp.Delete, exp.Update, exp.Drop,
+                                     exp.Alter, exp.TruncateTable)):
+                    notes.append(Note("atencao", f"O comando {i + 1} ({tipo}) altera dados e foi mantido como está. "
+                                                 "Com o modo somente leitura ele não é executado."))
 
         cte_names = {c.alias_or_name.lower() for s in statements for c in s.find_all(exp.CTE)}
 
@@ -224,7 +273,8 @@ def import_athena_query(sql: str, partition_lookup: PartitionLookup | None = Non
             return ((t.db or default_database or "").lower(), t.name.lower())
 
         def is_base(t) -> bool:
-            return bool(t.name) and not (not t.db and t.name.lower() in cte_names)
+            # só bases LIDAS: destino de escrita, hints, funções de tabela e CTEs ficam de fora
+            return is_read_table(t) and not (not t.db and t.name.lower() in cte_names)
 
         occurrences = [t for s in statements for t in s.find_all(exp.Table) if is_base(t)]
         keys: list[tuple[str, str]] = []

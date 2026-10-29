@@ -50,7 +50,10 @@ def from_dict(data: dict) -> Orchestration:
         if not isinstance(item, dict):
             raise OrchestrationFormatError(f"Entrada {n}: deve ser um objeto com alias, source...")
         values = {k: v for k, v in item.items() if k in _INPUT_FIELDS and v is not None}
-        values = {k: (_as_bool(v) if k == "cache" else str(v)) for k, v in values.items()}
+        values = {k: (_as_bool(v) if k == "cache" else str(v).strip() if k in ("kind", "fmt") else str(v))
+                  for k, v in values.items()}
+        values["kind"] = values.get("kind") or "catalog"        # vazio = padrão
+        values["fmt"] = (values.get("fmt") or "parquet").lower()
         inp = InputSource(**{"alias": "", **values})
         if inp.kind not in _KINDS:
             raise OrchestrationFormatError(f"Entrada {n} ({inp.alias}): tipo '{inp.kind}' inválido; use catalog ou s3.")

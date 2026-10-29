@@ -1,10 +1,13 @@
 import base64
 import json
+import random
+import zlib
 
 import pytest
 
-from code_builder import (RESULT_MARKER, InputSource, Orchestration, build_spark_code,
-                          parse_options, parse_result, split_statements, validate_orchestration)
+import code_builder
+from code_builder import (GLUE_CODE_LIMIT, RESULT_MARKER, InputSource, Orchestration, build_spark_code,
+                          parse_options, parse_result, py_literal, split_statements, validate_orchestration)
 from fakes import FakeSpark, run_generated
 
 
@@ -19,10 +22,12 @@ from fakes import FakeSpark, run_generated
     ("SELECT `col;x` FROM t", ["SELECT `col;x` FROM t"]),
     ("SELECT 'it''s; ok'", ["SELECT 'it''s; ok'"]),
     ("SELECT 'it\\'s; ok'; SELECT 2", ["SELECT 'it\\'s; ok'", "SELECT 2"]),
-    ("SELECT 1 -- comentário; com ponto e vírgula\n; SELECT 2", ["SELECT 1", "SELECT 2"]),
-    ("SELECT /* ; */ 1; SELECT 2", ["SELECT  1", "SELECT 2"]),
+    ("SELECT 1 -- comentário; com ponto e vírgula\n; SELECT 2",
+     ["SELECT 1 -- comentário; com ponto e vírgula", "SELECT 2"]),
+    ("SELECT /* ; */ 1; SELECT 2", ["SELECT /* ; */ 1", "SELECT 2"]),
     ("SELECT '--não é comentário' AS a", ["SELECT '--não é comentário' AS a"]),
     ("-- só comentário", []),
+    ("SELECT 1; -- comentário depois do último comando\n/* outro */", ["SELECT 1"]),
     ("", []),
 ])
 def test_split_statements(sql, esperado):
@@ -30,7 +35,19 @@ def test_split_statements(sql, esperado):
 
 
 def test_split_statements_comentario_de_bloco_sem_fim():
-    assert split_statements("SELECT 1 /* nunca fecha ; SELECT 2") == ["SELECT 1"]
+    assert split_statements("SELECT 1 /* nunca fecha ; SELECT 2") == ["SELECT 1 /* nunca fecha ; SELECT 2"]
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT /*+ BROADCAST(b) */ * FROM a JOIN b ON a.id = b.id",
+    "SELECT valor/*comentário*/AS total FROM t",
+    "-- cabeçalho do arquivo\nSELECT 1",
+])
+def test_comentarios_e_hints_chegam_intactos_ao_spark(sql):
+    assert split_statements(sql) == [sql]
+    spark = FakeSpark()
+    run_generated(build_spark_code(sql, Orchestration()), spark)
+    assert spark.last_session.sql_log == [sql]
 
 
 # --------------------------------------------------------------------------- parse_options
@@ -122,13 +139,36 @@ def test_execucao_completa():
     assert res["ok"] is True
     assert [c["name"] for c in res["columns"]] == ["id", "nome", "valor"]
     assert res["rows"] == [[1, "a", None], [2, "b", 3.5]]           # limite aplicado
-    assert spark.conf_values == {"spark.sql.shuffle.partitions": "10"}
-    assert spark.sql_log == ["USE analytics", "SET x=1", "SELECT * FROM vendas"]
-    assert set(spark.views) == {"vendas", "clientes"}
-    assert ("where", "dt >= '2026-01-01'") in spark.calls
-    assert ("load", "csv", "s3://b/clientes/", {"header": "true", "sep": ";"}) in spark.calls
-    assert spark.cached == ["clientes"]
+    s = spark.last_session                                          # tudo roda numa sessão nova
+    assert s.conf_values == {"spark.sql.catalogImplementation": "hive", "spark.sql.shuffle.partitions": "10"}
+    assert s.sql_log == ["USE analytics", "SET x=1", "SELECT * FROM vendas"]
+    assert set(s.views) == {"vendas", "clientes"}
+    assert ("where", "dt >= '2026-01-01'") in s.calls
+    assert ("load", "csv", "s3://b/clientes/", {"header": "true", "sep": ";"}) in s.calls
+    assert s.cached == ["clientes"]
     assert any("view vendas" in linha for linha in res["log"])
+    # a sessão original não é alterada
+    assert spark.conf_values == {} and spark.views == {} and spark.sql_log == ["SET"]
+
+
+def test_cada_execucao_usa_sessao_nova_e_limpa_o_cache():
+    spark = FakeSpark(settings={"spark.sql.catalogImplementation": "hive", "spark.glue.algo": "x"})
+    orch = Orchestration(inputs=[InputSource("v", "catalog", "db.v")],
+                         spark_conf={"spark.sql.shuffle.partitions": "7"})
+    run_generated(build_spark_code("SELECT * FROM v", orch), spark)
+    run_generated(build_spark_code("SELECT 1", Orchestration()), spark)
+    primeira, segunda = spark.sessions
+    assert primeira is not segunda
+    assert "v" in primeira.views and segunda.views == {}            # a view da 1ª execução não existe na 2ª
+    assert segunda.conf_values == {"spark.sql.catalogImplementation": "hive", "spark.glue.algo": "x"}
+    assert primeira.cache_cleared == 1 and segunda.cache_cleared == 1
+
+
+def test_comandos_intermediarios_nao_sao_trazidos_para_o_driver():
+    spark = FakeSpark()
+    sql = "CREATE TEMP VIEW a AS SELECT 1; SELECT * FROM grande; SELECT 2"
+    run_generated(build_spark_code(sql, Orchestration()), spark)
+    assert spark.last_session.calls.count(("collect",)) == 1        # só o resultado final
 
 
 def test_conf_invalida_vira_aviso_e_nao_interrompe():
@@ -161,7 +201,56 @@ def test_query_viaja_intacta():
     sql = "SELECT 'a''b' AS x,\n       \"y\" AS `z`\nFROM t"
     spark = FakeSpark()
     run_generated(build_spark_code(sql, Orchestration()), spark)
-    assert spark.sql_log == [sql]
+    assert spark.last_session.sql_log == [sql]
+
+
+def test_quebras_de_linha_do_windows_sao_normalizadas():
+    spark = FakeSpark()
+    run_generated(build_spark_code("SELECT 1\r\nFROM t", Orchestration()), spark)
+    assert spark.last_session.sql_log == ["SELECT 1\nFROM t"]
+
+
+# --------------------------------------------------------------------------- código legível e limite do Glue
+def test_codigo_gerado_e_legivel():
+    sql = "SELECT cliente,\n       SUM(valor) AS total\nFROM vendas\nGROUP BY cliente"
+    orch = Orchestration(inputs=[InputSource("vendas", "catalog", "db.vendas", filter="dt = '2026-10-29'")])
+    code = build_spark_code(sql, orch)
+    assert sql in code                                 # a query aparece como foi escrita
+    assert "'filter': \"dt = '2026-10-29'\"" in code
+    assert "b64decode" not in code.split("def _emit")[0]
+
+
+@pytest.mark.parametrize("texto", [
+    "simples", "", "it's", "termina com aspas'", "barra no fim\\", "três " + "'" * 3 + "aspas",
+    "linha\r\nwindows", "barra \\' no meio", '"duplas"', "acentuação çã", "tab\there", "nulo\x00",
+])
+def test_py_literal_ida_e_volta(texto):
+    assert eval(py_literal(texto)) == texto
+
+
+def test_py_literal_textos_aleatorios():
+    rnd = random.Random(42)
+    alfabeto = ["'", '"', "\\", "\n", "a", " ", "\r", "`", "{", "}"]
+    for _ in range(3000):
+        texto = "".join(rnd.choice(alfabeto) for _ in range(rnd.randint(0, 12)))
+        assert eval(py_literal(texto)) == texto, repr(texto)
+
+
+def test_query_grande_vai_comprimida_e_continua_funcionando():
+    linha = "  COALESCE(t.coluna_exemplo, 'x') AS coluna_exemplo_{},\n"
+    sql = "SELECT\n" + "".join(linha.format(i) for i in range(1500)) + "  1 AS fim\nFROM t"
+    assert len(sql) > GLUE_CODE_LIMIT
+    code = build_spark_code(sql, Orchestration())
+    assert len(code) <= GLUE_CODE_LIMIT and "_zlib.decompress" in code
+    spark = FakeSpark()
+    assert run_generated(code, spark)["ok"] is True
+    assert spark.last_session.sql_log == [sql]
+
+
+def test_query_grande_demais_mesmo_comprimida(monkeypatch):
+    monkeypatch.setattr(code_builder, "GLUE_CODE_LIMIT", 2000)
+    with pytest.raises(ValueError, match="grande demais"):
+        build_spark_code("SELECT " + ", ".join(f"c{i}" for i in range(3000)) + " FROM t", Orchestration())
 
 
 # --------------------------------------------------------------------------- parse_result
@@ -176,6 +265,11 @@ def test_parse_result_pega_a_ultima_marcacao():
 
 def test_parse_result_marcacao_no_meio_da_linha():
     assert parse_result("prefixo " + _linha({"ok": True})) == {"ok": True}
+
+
+def test_parse_result_comprimido():
+    linha = RESULT_MARKER + base64.b64encode(zlib.compress(json.dumps({"ok": True}).encode())).decode()
+    assert parse_result("log\n" + linha) == {"ok": True}
 
 
 @pytest.mark.parametrize("saida", ["", "sem marcação", RESULT_MARKER + "@@@não-é-base64", RESULT_MARKER + "e30"])

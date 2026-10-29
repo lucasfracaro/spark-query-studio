@@ -167,3 +167,92 @@ def test_boto_session_por_modo(monkeypatch):
     assert chamadas[0] == {"profile_name": "dev", "region_name": "us-east-1"}
     assert chamadas[1]["aws_access_key_id"] == "AK" and chamadas[1]["aws_session_token"] is None
     assert chamadas[2] == chamadas[3] == {"region_name": "us-east-1"}
+
+
+# --------------------------------------------------------------------------- interrupções e sessões órfãs
+class _Interrompido(BaseException):
+    """Imita o que o Streamlit faz ao reiniciar o script no meio de uma espera."""
+
+
+def test_id_da_sessao_e_entregue_antes_da_espera():
+    class Glue(FakeGlueClient):
+        def get_session(self, Id):
+            raise _Interrompido()
+
+    guardado = []
+    eng = GlueSessionEngine(_conta(), InstanceConfig(), glue_client=Glue())
+    with pytest.raises(_Interrompido):
+        eng.start(on_created=guardado.append)
+    assert guardado == [eng.session_id] and guardado[0].startswith("sqs-")
+
+
+def test_ensure_session_reaproveita_sessao_pronta():
+    glue = FakeGlueClient(session_states=["READY"])
+    eng = _engine_pronto(glue)
+    assert eng.ensure_session() == "sqs-1"
+    assert glue.created == []
+
+
+def test_ensure_session_espera_sessao_que_ainda_esta_subindo():
+    glue = FakeGlueClient(session_states=["PROVISIONING", "PROVISIONING", "READY"])
+    eng = _engine_pronto(glue)
+    status = []
+    assert eng.ensure_session(status.append) == "sqs-1"
+    assert glue.created == []                              # não criou outra
+    assert any("ainda está iniciando" in s for s in status)
+
+
+@pytest.mark.parametrize("estado", ["TIMEOUT", "STOPPED", None])
+def test_ensure_session_cria_outra_se_a_anterior_acabou(estado):
+    glue = FakeGlueClient(session_states=[estado, "READY"])
+    eng = _engine_pronto(glue)
+    criadas = []
+    sid = eng.ensure_session(on_created=criadas.append)
+    assert sid != "sqs-1" and criadas == [sid] and len(glue.created) == 1
+
+
+def test_run_informa_o_id_do_statement():
+    glue = FakeGlueClient(output=_saida({"ok": True}))
+    enviados = []
+    _engine_pronto(glue).run("x", on_submitted=enviados.append)
+    assert enviados == [1]
+
+
+def test_cancela_statement_que_ficou_rodando():
+    glue = FakeGlueClient(statement_states=["RUNNING", "CANCELLING", "CANCELLED"])
+    assert _engine_pronto(glue).cancel_statement(7) is True
+    assert glue.cancelled == [7]
+
+
+@pytest.mark.parametrize("estado", ["AVAILABLE", "ERROR", "CANCELLED"])
+def test_nao_cancela_statement_que_ja_terminou(estado):
+    glue = FakeGlueClient(statement_states=[estado])
+    assert _engine_pronto(glue).cancel_statement(7) is False
+    assert glue.cancelled == []
+
+
+def test_stop_mostra_erro_de_permissao():
+    class Glue(FakeGlueClient):
+        def stop_session(self, Id):
+            raise PermissionError("AccessDenied")
+    eng = _engine_pronto(Glue())
+    with pytest.raises(PermissionError):
+        eng.stop()
+    assert eng.session_id == "sqs-1"                       # continua sabendo da sessão
+
+
+def test_stop_ignora_sessao_que_ja_nao_existe():
+    from fakes import EntityNotFoundException
+
+    class Glue(FakeGlueClient):
+        def stop_session(self, Id):
+            raise EntityNotFoundException(Id)
+    eng = _engine_pronto(Glue())
+    eng.stop()
+    assert eng.session_id is None
+
+
+def test_spark_ui_nao_e_ligado_sem_caminho_de_logs():
+    glue = FakeGlueClient(session_states=["READY"])
+    GlueSessionEngine(_conta(), InstanceConfig(), glue_client=glue).start()
+    assert "--enable-spark-ui" not in glue.created[0]["DefaultArguments"]

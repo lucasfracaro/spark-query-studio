@@ -234,3 +234,43 @@ def test_resultado_passa_na_conferencia_da_orquestracao():
     r = import_athena_query(q, lookup)
     check = check_query_against_orchestration(r.spark_sql, r.orchestration.inputs)
     assert check.ok and not check.warnings
+
+
+# --------------------------------------------------------------------------- comandos de escrita
+def test_insert_select_vira_so_o_select():
+    q = """
+    WITH ontem AS (SELECT * FROM db_vendas.tb_vendas WHERE dt = '2026-10-28')
+    INSERT INTO db_cad.resumo SELECT id_cliente, SUM(valor) AS total FROM ontem GROUP BY 1
+    """
+    r = import_athena_query(q, lookup)
+    assert [(i.alias, i.source) for i in r.orchestration.inputs] == [("tb_vendas", "db_vendas.tb_vendas")]
+    sql = r.spark_sql.upper()
+    assert "INSERT" not in sql and "RESUMO" not in sql
+    assert sql.lstrip().startswith("WITH ONTEM AS")
+    assert any("gravaria em `db_cad.resumo`" in n.text for n in r.notes)
+
+
+def test_create_table_as_select_vira_so_o_select():
+    q = "CREATE TABLE db_cad.nova WITH (format = 'PARQUET') AS SELECT * FROM db_vendas.tb_vendas WHERE dt = '1'"
+    r = import_athena_query(q, lookup)
+    assert [i.source for i in r.orchestration.inputs] == ["db_vendas.tb_vendas"]
+    assert _filtros(r) == {"tb_vendas": "dt = '1'"}
+    assert "CREATE" not in r.spark_sql.upper()
+
+
+def test_insert_values_e_mantido_com_aviso_e_destino_fora_da_orquestracao():
+    r = import_athena_query("INSERT INTO db_cad.produtos VALUES (1, 'x')", lookup)
+    assert r.orchestration.inputs == []
+    assert "INSERT INTO" in r.spark_sql.upper()
+    assert "somente leitura" in _avisos(r)
+
+
+def test_hint_nao_vira_entrada():
+    r = import_athena_query("SELECT /*+ BROADCAST(c) */ * FROM db_vendas.tb_vendas v JOIN db_cad.clientes c ON 1=1", lookup)
+    assert sorted(i.alias for i in r.orchestration.inputs) == ["clientes", "tb_vendas"]
+
+
+@pytest.mark.parametrize("q", ["SELECT 'string sem fechar FROM db.t", "SELECT * FROM (", "SELEC * FRM t"])
+def test_query_com_erro_de_sintaxe_vira_mensagem(q):
+    with pytest.raises(ValueError, match="Não consegui ler"):
+        import_athena_query(q, lookup)

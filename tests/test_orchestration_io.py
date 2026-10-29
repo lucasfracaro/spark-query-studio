@@ -61,3 +61,9 @@ def test_erros_de_formato(texto, trecho):
 def test_campos_extras_sao_ignorados():
     o = from_json('{"entradas": [{"alias": "v", "source": "db.v", "comentario": "x"}], "outro": 1}')
     assert o.inputs[0].alias == "v"
+
+
+def test_tipo_e_formato_vazios_usam_o_padrao():
+    o = from_json('{"entradas": [{"alias": "v", "source": "db.v", "kind": "", "fmt": " "},'
+                  ' {"alias": "a", "kind": "s3", "source": "s3://b/p/", "fmt": "CSV"}]}')
+    assert [(i.kind, i.fmt) for i in o.inputs] == [("catalog", "parquet"), ("s3", "csv")]

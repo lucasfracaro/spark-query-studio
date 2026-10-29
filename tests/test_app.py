@@ -142,3 +142,53 @@ def test_limpar(app):
     _botao(app, "Limpar").click().run()
     assert app.text_area[0].value == ""
 
+
+
+def test_janela_de_orquestracao_ve_edicoes_ainda_nao_aplicadas(app, monkeypatch):
+    # Simula uma edição na tabela de entradas que ainda não foi "aplicada" em lugar nenhum:
+    # a janela precisa mostrar (e salvar) a versão editada, não a anterior.
+    import streamlit as st
+    original = st.data_editor
+
+    def editor_editado(data, *args, key=None, **kwargs):
+        out = original(data, *args, key=key, **kwargs)
+        if key and key.startswith("inputs_editor"):
+            out = out.copy()
+            out.loc[0, "alias"] = "alias_editado"
+        return out
+
+    monkeypatch.setattr(st, "data_editor", editor_editado)
+    _botao(app, "Abrir orquestração").click().run()
+    assert not app.exception, app.exception
+    janela = next(t for t in app.text_area if t.label == "JSON da orquestração")
+    assert '"alias_editado"' in janela.value
+
+
+def test_modo_somente_leitura_bloqueia_comando_que_grava(app, monkeypatch):
+    chamadas = _motor_que_registra(monkeypatch, {"ok": True, "columns": [], "rows": [], "log": []})
+    app.session_state["engine_kind"] = "local"
+    app.text_area[0].set_value("INSERT INTO db.destino SELECT * FROM minha_view").run()
+    assert any("somente leitura" in c.value for c in app.caption)
+    _botao(app, "Executar").click().run()
+    assert not app.exception
+    assert any("grava ou altera dados" in e.value for e in app.error)
+    assert chamadas == []
+
+
+def test_liberar_escrita_permite_executar(app, monkeypatch):
+    chamadas = _motor_que_registra(monkeypatch, {"ok": True, "columns": [], "rows": [], "log": []})
+    app.session_state["engine_kind"] = "local"
+    next(c for c in app.checkbox if "gravam ou alteram" in c.label).check().run()
+    app.text_area[0].set_value("INSERT INTO db.destino SELECT * FROM minha_view").run()
+    _botao(app, "Executar").click().run()
+    assert len(chamadas) == 1
+
+
+def test_perfil_aws_inexistente_nao_derruba_a_tela(app):
+    from engines import AwsAccount
+    app.session_state["account"] = AwsAccount(region="sa-east-1", auth_mode="profile",
+                                              profile="perfil_que_nao_existe_sqs")
+    app.session_state["engine_kind"] = "glue"
+    app.run()
+    assert not app.exception, app.exception
+    assert any("Configurar conta AWS" in e.value for e in app.error)

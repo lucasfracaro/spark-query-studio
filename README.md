@@ -33,10 +33,12 @@ O navegador abre em `http://localhost:8501`.
    - `catalog` + `database.tabela` → lê do Glue Data Catalog;
    - `s3` + `s3://bucket/caminho/` + formato + opções (`header=true;sep=;`).
    Também dá para aplicar um filtro antes de criar a view, ligar cache, definir configs `spark.*`, escolher um database padrão e o limite de linhas. Em **📝 Abrir orquestração** ela pode ser editada como arquivo, salva na máquina ou carregada de um arquivo (veja abaixo).
-4. **Passo 2 – Query**: escreva no editor ou importe um `.sql`/`.txt`. O conteúdo vai para o editor, onde pode ser alterado. Vários comandos separados por `;` são executados em ordem, e o resultado exibido é o do último.
+4. **Passo 2 – Query**: escreva no editor ou importe um `.sql`/`.txt`. O conteúdo vai para o editor, onde pode ser alterado. Vários comandos separados por `;` são executados em ordem, e o resultado exibido é o do último. Comentários e hints do Spark (`/*+ BROADCAST(t) */`) chegam ao Spark exatamente como foram escritos.
 5. **Conferência da orquestração**: antes de enviar ao cluster, a query é lida e cada base usada em `FROM`/`JOIN` é comparada com as entradas da orquestração. Se faltar alguma, a execução é bloqueada com uma mensagem como *"A base `db.produtos` é usada na query (linha 3), mas não está na orquestração"*. O aviso já aparece embaixo do editor enquanto você digita. CTEs (`WITH`), views criadas na própria query, subqueries e funções como `range()` não são cobradas. Se o Spark ainda assim não encontrar uma tabela, o erro dele é traduzido para a mesma mensagem. A conferência pode ser desligada em **Opções**.
-6. **▶️ Executar**: na primeira vez a sessão Glue é criada (~30–90 s). As execuções seguintes reaproveitam a mesma sessão e levam segundos.
-7. **Passo 3 – Resultado**: mostra as N primeiras linhas, o schema e o log. **Exportar CSV** baixa o arquivo para o seu PC; o separador `;` com UTF-8 BOM abre direto no Excel em português.
+6. **🔒 Modo somente leitura** (ligado por padrão): comandos que gravam ou alteram dados ou o catálogo (`INSERT`, `CREATE TABLE`, `DROP`, `ALTER`, `MERGE`, `DELETE`, `MSCK REPAIR`…) são bloqueados antes de ir para o cluster, com o número e a linha do comando. Consultas e comandos que só afetam a sessão (`CREATE TEMP VIEW`, `CACHE TABLE`, `SET`, `USE`) rodam normalmente. A role do Glue costuma ter permissão de escrita, então um comando esquecido na query gravaria de verdade; para executar mesmo assim, ligue **Permitir comandos que gravam** em **Opções**.
+7. **▶️ Executar**: na primeira vez a sessão Glue é criada (~30–90 s). As execuções seguintes reaproveitam a mesma sessão e levam segundos. Cada execução roda numa **sessão Spark nova** dentro dessa sessão do Glue: configurações Spark, `USE database` e views de execuções anteriores não passam para a próxima, como num job novo.
+   - Se você mexer na tela enquanto a sessão sobe ou a query roda, o Streamlit reinicia a tela, mas a ferramenta continua sabendo da sessão: a próxima execução espera a mesma sessão ficar pronta (em vez de criar outra, que também seria cobrada) e cancela a query que tinha ficado rodando.
+8. **Passo 3 – Resultado**: mostra as N primeiras linhas, o schema e o log. **Exportar CSV** baixa o arquivo para o seu PC; o separador `;` com UTF-8 BOM abre direto no Excel em português.
 
 ### 📥 Importar query do Athena
 
@@ -45,8 +47,9 @@ Cole (ou abra) uma query escrita para o Athena e clique em **Gerar orquestraçã
 1. encontra as bases usadas, ignorando as CTEs;
 2. consulta o **Glue Data Catalog** para saber quais colunas são de partição. Sem acesso ao Glue, supõe pelo nome (`dt`, `anomes`…) e avisa;
 3. em cada CTE ou subquery, separa o `WHERE` e o `ON` do join pelos `AND` e leva para a orquestração as condições que usam **só colunas de partição** daquela base. Se a mesma base é lida com filtros diferentes, eles são combinados com `OR`;
-4. traduz a query para Spark SQL com o [sqlglot](https://github.com/tobymao/sqlglot) (`date_add('day', 1, d)` → `date_add(d, 1)`, `%Y-%m-%d` → `yyyy-MM-dd`, `approx_distinct` → `approx_count_distinct`…) e troca `db.tabela` pelo alias da orquestração;
-5. mostra um relatório do que precisa de revisão: filtros dinâmicos (`dt = (SELECT max(dt) ...)`), `OR` misturando partição com outras colunas, funções sem tradução, bases particionadas lidas sem filtro.
+4. `INSERT ... SELECT` e `CREATE TABLE ... AS SELECT` viram só o `SELECT`: você vê o que seria gravado, sem gravar, e a tabela de destino não entra na orquestração;
+5. traduz a query para Spark SQL com o [sqlglot](https://github.com/tobymao/sqlglot) (`date_add('day', 1, d)` → `date_add(d, 1)`, `%Y-%m-%d` → `yyyy-MM-dd`, `approx_distinct` → `approx_count_distinct`…) e troca `db.tabela` pelo alias da orquestração;
+6. mostra um relatório do que precisa de revisão: filtros dinâmicos (`dt = (SELECT max(dt) ...)`), `OR` misturando partição com outras colunas, funções sem tradução, bases particionadas lidas sem filtro.
 
 Os filtros são **copiados**, não movidos: a query continua com as condições originais, então o resultado não muda. O filtro na orquestração só faz o Spark ler menos partições.
 
@@ -75,7 +78,16 @@ A aba **Metadados**, ao lado dos dados, monta o dicionário de dados a partir do
 
 Dá para baixar o dicionário em CSV ou JSON e gerar o **DDL `CREATE EXTERNAL TABLE`** do Athena (Parquet, ORC, CSV ou JSON), com as colunas de partição escolhidas indo para `PARTITIONED BY` e as descrições virando `COMMENT`.
 
-Use **Ver código PySpark gerado** para conferir exatamente o que vai rodar no cluster.
+### Código gerado
+
+**Ver código PySpark gerado** mostra exatamente o que vai rodar no cluster, com a query como foi escrita e a orquestração em texto normal: dá para copiar e rodar num notebook do Glue. A API do Glue aceita no máximo 68 mil caracteres de código por comando; se a query passar disso, ela vai comprimida (zlib) dentro do código, o que permite queries várias vezes maiores.
+
+## Segurança
+
+- O app só aceita conexões **deste computador** (`server.address = "localhost"` em `.streamlit/config.toml` e nos scripts de inicialização). Sem isso, o Streamlit aceitaria conexões de qualquer máquina da rede. Se ele for aberto de outro jeito e estiver exposto, a barra lateral avisa.
+- A telemetria do Streamlit está desligada (`gatherUsageStats = false`).
+- As chaves de acesso digitadas ficam só na memória; o arquivo de configuração nunca guarda segredos.
+- O modo somente leitura vem ligado (veja acima).
 
 ## Permissões na AWS
 
@@ -87,6 +99,8 @@ Troque `SEU-BUCKET` e `SUA-CONTA` pelos valores reais.
 ## Custos
 
 Uma Interactive Session é cobrada por DPU-hora enquanto estiver ativa (a barra lateral mostra os DPUs). Ela se encerra sozinha depois do *idle timeout*. Use **⏹️ Encerrar sessão** quando terminar.
+
+O Spark UI não vem ligado: em sessões interativas ele só funciona com um caminho de logs no S3 e um Spark History Server. Para ligar, use em **Argumentos extras do job** `--enable-spark-ui` = `true` e `--spark-event-logs-path` = `s3://seu-bucket/sparkui/`.
 
 ## Modo Spark local
 
