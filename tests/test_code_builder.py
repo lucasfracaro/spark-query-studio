@@ -281,7 +281,7 @@ def glue_context(monkeypatch):
     return FakeGlueContext.instancias
 
 
-def test_glue_context_le_o_catalogo_com_push_down_predicate(glue_context):
+def test_glue_context_usa_a_leitura_nativa_com_push_down_predicate(glue_context):
     spark, ns = FakeSpark(), {}
     orch = Orchestration(inputs=[InputSource("vendas", "catalog", "db.vendas", filter="dt >= '2026-10-01'"),
                                  InputSource("itens", "catalog", "itens"),
@@ -290,12 +290,27 @@ def test_glue_context_le_o_catalogo_com_push_down_predicate(glue_context):
     res = run_generated(build_spark_code("SELECT * FROM vendas", orch, reader="glue_context"), spark, ns)
     assert res["ok"], res
     [gc] = glue_context
-    assert gc.reads == [("db", "vendas", "dt >= '2026-10-01'"), ("analytics", "itens", "")]
+    assert gc.native_reads == [("db", "vendas", "dt >= '2026-10-01'", {"useSparkDataSource": True}),
+                               ("analytics", "itens", "", {"useSparkDataSource": True})]
+    assert gc.reads == []                                          # o DynamicFrame não foi preciso
     s = spark.last_session
     vendas = s.views["vendas"]
-    assert vendas.spark is s                                       # trazido para a sessão da execução
-    assert vendas.plan == ("rdd", "glue", "db", "vendas", "dt >= '2026-10-01'", ("where", "dt >= '2026-10-01'"))
+    assert vendas.spark is s                                       # usado na sessão da execução...
+    assert vendas.plan[:2] == ("global", "Relation")               # ...pela view global, com o mesmo plano
+    assert vendas.plan[-1] == ("where", "dt >= '2026-10-01'")
     assert s.views["arquivo"].plan[0] == "load"                    # S3 direto continua igual
+    assert any("leitura nativa do Spark" in linha for linha in res["log"])
+
+
+def test_glue_context_sem_leitura_nativa_usa_o_dynamic_frame(glue_context):
+    spark, ns = FakeSpark(), {}
+    _rodar(spark, ns, "SELECT 1", InputSource("x", "catalog", "db.x"), reader="glue_context")   # cria o GlueContext
+    glue_context[0].nativa_falha = True
+    res = _rodar(spark, ns, "SELECT 1", InputSource("v", "catalog", "db.v", filter="dt = '1'"), reader="glue_context")
+    assert res["ok"], res
+    assert glue_context[0].reads == [("db", "v", "dt = '1'")]
+    assert any("DynamicFrame" in linha for linha in res["log"])
+    assert any("a leitura nativa não funcionou para v" in linha for linha in res["log"])
 
 
 def test_glue_context_filtro_fora_das_particoes_para_em_vez_de_ler_tudo(glue_context):
@@ -307,7 +322,7 @@ def test_glue_context_filtro_fora_das_particoes_para_em_vez_de_ler_tudo(glue_con
                  reader="glue_context")
     assert res["ok"] is False
     assert "só colunas de partição" in res["error"] and "valor > 10" in res["error"]
-    assert glue_context[0].reads == [("db", "v", "")]          # não leu a tabela inteira por conta própria
+    assert glue_context[0].reads == []                             # não leu a tabela inteira por conta própria
 
 
 def test_glue_context_criado_uma_vez_e_cache_sem_reler(glue_context):
@@ -315,10 +330,13 @@ def test_glue_context_criado_uma_vez_e_cache_sem_reler(glue_context):
     entrada = InputSource("v", "catalog", "db.v", filter="dt = '1'", cache=True)
     _rodar(spark, ns, "SELECT 1", entrada, reader="glue_context")
     r2 = _rodar(spark, ns, "SELECT 2", entrada, reader="glue_context")
-    assert len(glue_context) == 1 and len(glue_context[0].reads) == 1
+    assert len(glue_context) == 1 and len(glue_context[0].native_reads) == 1
     assert any("cache reaproveitado" in linha for linha in r2["log"])
+    chave = next(iter(ns["_sqs_cache"]))
+    assert "sqs_" + chave[2:] in spark.global_views
     _rodar(spark, ns, "SELECT 3", InputSource("v", "catalog", "db.v", filter="dt = '1'"), reader="glue_context")
-    assert spark.uncached and len(glue_context[0].reads) == 2     # sem cache: liberou e leu de novo
+    assert spark.uncached and len(glue_context[0].native_reads) == 2      # sem cache: liberou e leu de novo
+    assert "sqs_" + chave[2:] not in spark.global_views or chave not in ns["_sqs_cache"]
 
 
 def test_leitor_desconhecido():

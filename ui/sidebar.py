@@ -94,7 +94,9 @@ def _instancia():
     inst.lake_formation = st.checkbox("Ler as tabelas pelo Lake Formation", inst.lake_formation,
                                       help=lake_formation_help(inst.glue_version))
     dpu = GLUE_WORKER_TYPES[inst.worker_type].dpu * inst.num_workers
-    st.caption(f"≈ **{dpu:g} DPU** enquanto a sessão estiver ativa.")
+    st.caption(f"≈ **{dpu:g} DPU** enquanto a sessão estiver ativa."
+               + (" Com 2 workers, só 1 processa os dados (o outro coordena): para tabelas grandes, use mais."
+                  if inst.num_workers <= 2 else ""))
     with st.expander("Argumentos extras do job"):
         st.caption("Ex: `--datalake-formats` = `iceberg`, `--additional-python-modules` = `pyarrow==14`")
         if "args_base" not in ss:

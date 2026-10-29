@@ -90,14 +90,18 @@ A sessão do Glue é a parte cara: leva de 30 a 90 s para subir e cobra enquanto
 Quando as tabelas estão num data lake de **outra conta** e o acesso é controlado pelo **Lake Formation**, o Athena lê os dados com as credenciais que o Lake Formation fornece. O Spark no Glue, por padrão, lê os arquivos direto do S3 com a role da sessão, e o S3 da outra conta recusa (*Access Denied*). Ligue **Ler as tabelas pelo Lake Formation** (ou `lake_formation = true` no arquivo):
 
 - **Glue 5.0, 5.1 e 6.0**: a sessão é criada com as configurações de [*Full Table Access*](https://docs.aws.amazon.com/glue/latest/dg/security-access-control-fta.html) e o Spark lê as tabelas normalmente, com as credenciais do Lake Formation.
-- **Glue 4.0**: o Lake Formation só vale para leituras feitas pelo GlueContext. As entradas `catalog` passam a ser lidas com `glueContext.create_dynamic_frame.from_catalog`, com o filtro da orquestração indo como `push_down_predicate`, como num job do Glue. A query precisa usar os **aliases** da orquestração (usar `db.tabela` direto é bloqueado antes de rodar, com a mensagem dizendo qual alias usar).
+- **Glue 4.0**: o Lake Formation só vale para leituras feitas pelo GlueContext. As entradas `catalog` passam a ser lidas por ele, com o filtro da orquestração indo como `push_down_predicate`:
+  1. primeiro pela **leitura nativa do Spark** ([`create_data_frame.from_catalog` com `useSparkDataSource`](https://docs.aws.amazon.com/glue/latest/dg/aws-glue-api-crawler-pyspark-extensions-glue-context.html)), que respeita as permissões do Lake Formation e lê só as colunas que a query usa;
+  2. se ela não funcionar na sua conta, pelo **DynamicFrame** (`create_dynamic_frame.from_catalog`), como num job do Glue. Ele lê todas as colunas das partições escolhidas e é bem mais lento.
+
+  O log da execução diz qual das duas foi usada e quanto tempo a leitura levou para ser preparada. A query precisa usar os **aliases** da orquestração (usar `db.tabela` direto é bloqueado antes de rodar, com a mensagem dizendo qual alias usar).
 
 Pré-requisitos (quem administra a conta precisa conferir):
 - a **role da sessão** precisa de SELECT nas tabelas no Lake Formation e de `lakeformation:GetDataAccess` no IAM (já está no `iam_glue_role_policy.json`). No Athena vale o seu usuário; na sessão do Glue vale a role configurada. Se os jobs de produção já leem essas tabelas, usar a role deles é o caminho mais curto;
 - no Glue 5 ou mais novo, o administrador do Lake Formation precisa permitir *full table access* para engines externas.
 
 Cuidados com a leitura pelo GlueContext (Glue 4.0):
-- ela lê **todas as colunas** das partições escolhidas e lista as partições do catálogo antes de filtrar, então é mais lenta que a leitura normal do Spark. Use filtros de partição pequenos (ex.: `dt = '2026-10-28'`) e, para tabelas grandes, mais workers;
+- quando cai no DynamicFrame, ela lê **todas as colunas** das partições escolhidas e lista as partições do catálogo antes de filtrar, então é bem mais lenta que a leitura normal do Spark. Use filtros de partição pequenos (ex.: `dt = '2026-10-28'`) e, para tabelas grandes, mais workers (com 2 workers só um deles processa os dados);
 - marque **Cache** nessas entradas: a leitura lenta acontece uma vez só por sessão e as queries seguintes usam os dados em memória;
 - o filtro da entrada deve usar **só colunas de partição**. Se ele não servir para escolher partições, a execução para com uma mensagem dizendo isso, em vez de ler a tabela inteira; as outras condições vão no `WHERE` da query.
 

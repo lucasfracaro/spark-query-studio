@@ -179,25 +179,40 @@ def test_cache_table_da_query_vale_entre_execucoes(engine, tmp_path):
 
 # --------------------------------------------------------------------------- Glue 4.0 + Lake Formation
 class _GlueContextLocal:
-    """Imita o awsglue: o DataFrame nasce na sessão principal, não na sessão da execução."""
+    """Imita o awsglue: o DataFrame nasce na sessão principal, não na sessão da execução.
+    create_data_frame é a leitura nativa (useSparkDataSource); create_dynamic_frame, o DynamicFrame (RDD)."""
     tabelas: dict = {}
     leituras: list = []
+    nativa_falha = False
 
     def __init__(self, sc):
         from pyspark.sql import SparkSession
-        self._spark = SparkSession.builder.getOrCreate()
-        self.create_dynamic_frame = self
+        spark = SparkSession.builder.getOrCreate()
 
-    def from_catalog(self, database, table_name, push_down_predicate=""):
-        _GlueContextLocal.leituras.append((database, table_name, push_down_predicate))
-        df = (self._spark.read.option("header", "true").option("sep", ";").option("inferSchema", "true")
-              .csv(_GlueContextLocal.tabelas[f"{database}.{table_name}"]))
-        df = df.where(push_down_predicate) if push_down_predicate else df
+        def ler(database, table_name, push_down_predicate):
+            df = (spark.read.option("header", "true").option("sep", ";").option("inferSchema", "true")
+                  .csv(_GlueContextLocal.tabelas[f"{database}.{table_name}"]))
+            return df.where(push_down_predicate) if push_down_predicate else df
 
-        class _Dyf:
-            def toDF(self):
-                return df
-        return _Dyf()
+        class _Nativo:
+            def from_catalog(self, database, table_name, push_down_predicate="", additional_options=None):
+                if _GlueContextLocal.nativa_falha:
+                    raise RuntimeError("useSparkDataSource is not supported")
+                _GlueContextLocal.leituras.append(("nativa", database, table_name, push_down_predicate))
+                return ler(database, table_name, push_down_predicate)
+
+        class _Dinamico:
+            def from_catalog(self, database, table_name, push_down_predicate=""):
+                _GlueContextLocal.leituras.append(("dynamic", database, table_name, push_down_predicate))
+                df = ler(database, table_name, push_down_predicate)
+                rdd_df = spark.createDataFrame(df.rdd, df.schema)       # como o DynamicFrame: baseado em RDD
+
+                class _Dyf:
+                    def toDF(self):
+                        return rdd_df
+                return _Dyf()
+
+        self.create_data_frame, self.create_dynamic_frame = _Nativo(), _Dinamico()
 
 
 @pytest.fixture
@@ -210,21 +225,36 @@ def awsglue_local(monkeypatch):
     monkeypatch.setitem(sys.modules, "awsglue", pacote)
     monkeypatch.setitem(sys.modules, "awsglue.context", modulo)
     _GlueContextLocal.leituras.clear()
+    monkeypatch.setattr(_GlueContextLocal, "nativa_falha", False)
     LocalSparkEngine._namespace.pop("_sqs_gc", None)
     return _GlueContextLocal
 
 
-def test_glue_context_traz_os_dados_para_a_sessao_da_execucao(engine, tmp_path, awsglue_local):
+def _vendas_glue(engine, tmp_path, awsglue_local, cache=True):
     arq = tmp_path / "vendas.csv"
     _vendas_csv(arq, [10, 20, 30])
     awsglue_local.tabelas["db.vendas"] = str(arq)
-    entrada = InputSource("vendas", "catalog", "db.vendas", filter="id >= 2", cache=True)
-    code = build_spark_code("SELECT SUM(valor) AS total FROM vendas", Orchestration(inputs=[entrada]),
+    entrada = InputSource("vendas", "catalog", "db.vendas", filter="id >= 2", cache=cache)
+    return build_spark_code("SELECT SUM(valor) AS total FROM vendas", Orchestration(inputs=[entrada]),
                             reader="glue_context")
+
+
+def test_glue_context_leitura_nativa_na_sessao_da_execucao(engine, tmp_path, awsglue_local):
+    code = _vendas_glue(engine, tmp_path, awsglue_local)
     r1 = engine.run(code)
     assert r1["ok"], r1
     assert r1["rows"] == [[50]]
-    assert awsglue_local.leituras == [("db", "vendas", "id >= 2")]
+    assert awsglue_local.leituras == [("nativa", "db", "vendas", "id >= 2")]
+    assert any("leitura nativa do Spark" in linha for linha in r1["log"])
     r2 = engine.run(code)
     assert r2["rows"] == [[50]] and len(awsglue_local.leituras) == 1      # cache: não leu de novo
     assert any("cache reaproveitado" in linha for linha in r2["log"])
+
+
+def test_glue_context_sem_leitura_nativa_usa_o_dynamic_frame(engine, tmp_path, awsglue_local, monkeypatch):
+    monkeypatch.setattr(_GlueContextLocal, "nativa_falha", True)
+    r = engine.run(_vendas_glue(engine, tmp_path, awsglue_local, cache=False))
+    assert r["ok"], r
+    assert r["rows"] == [[50]]
+    assert awsglue_local.leituras == [("dynamic", "db", "vendas", "id >= 2")]
+    assert any("DynamicFrame" in linha for linha in r["log"])

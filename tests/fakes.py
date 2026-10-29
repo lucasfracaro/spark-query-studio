@@ -46,6 +46,18 @@ class _FakeJdf:
     def schema(self):
         return self.df.columns
 
+    def queryExecution(self):            # .analyzed().toString(): o "plano" em texto
+        plano = str(self.df.plan)
+
+        class _Analisado:
+            def toString(self):
+                return plano
+
+        class _QE:
+            def analyzed(self):
+                return _Analisado()
+        return _QE()
+
 
 class FakeDataFrame:
     """plan identifica o que o DataFrame lê (como o plano lógico do Spark): é a chave do cache, que,
@@ -69,6 +81,9 @@ class FakeDataFrame:
 
     def createOrReplaceTempView(self, alias):
         self.spark.views[alias] = self
+
+    def createOrReplaceGlobalTempView(self, nome):
+        self.spark.global_views[nome] = self
 
     def collect(self):
         if self.spark is not None:
@@ -133,6 +148,9 @@ class _Catalog:
         self.spark.shared_cache.clear()
         self.spark.cache_cleared += 1
 
+    def dropGlobalTempView(self, nome):
+        return self.spark.global_views.pop(nome, None) is not None
+
 
 class _JvmSession:
     def __init__(self, spark):
@@ -141,6 +159,9 @@ class _JvmSession:
     def createDataFrame(self, rdd, schema):
         assert rdd[0] == "rdd"
         return _FakeJdf(rdd[1])
+
+
+_COMPARTILHADOS = ("shared_cache", "cached", "uncached", "cache_cleared", "global_views")
 
 
 class FakeSpark:
@@ -157,9 +178,10 @@ class FakeSpark:
         self.views, self.conf_values = {}, {}
         self.sessions: list[FakeSpark] = []   # sessões criadas com newSession()
         self.root = parent.root if parent is not None else self
-        if parent is None:                    # como no Spark, o cache é compartilhado pelas sessões
+        if parent is None:                    # como no Spark, o cache e as views globais valem para todas as sessões
             self.shared_cache, self.cached, self.uncached = set(), [], []
             self.cache_cleared = 0
+            self.global_views = {}
         self.conf = _Conf(self)
         self.catalog = _Catalog(self)
         self._jsparkSession = _JvmSession(self)
@@ -167,12 +189,12 @@ class FakeSpark:
 
     # cache e contadores ficam na sessão principal
     def __getattr__(self, nome):
-        if nome in ("shared_cache", "cached", "uncached", "cache_cleared"):
+        if nome in _COMPARTILHADOS:
             return getattr(self.root, nome)
         raise AttributeError(nome)
 
     def __setattr__(self, nome, valor):
-        if nome in ("shared_cache", "cached", "uncached", "cache_cleared") and self.__dict__.get("root") not in (None, self):
+        if nome in _COMPARTILHADOS and self.__dict__.get("root") not in (None, self):
             setattr(self.root, nome, valor)
         else:
             object.__setattr__(self, nome, valor)
@@ -197,6 +219,9 @@ class FakeSpark:
 
     def table(self, name):
         self.calls.append(("table", name))
+        if name.startswith("global_temp."):
+            origem = self.global_views[name.split(".", 1)[1]]
+            return FakeDataFrame(origem.rows, origem.columns, self, ("global",) + origem.plan)
         return self.default_df(("table", name.lower()))
 
     def sql(self, query):
@@ -209,27 +234,44 @@ class FakeSpark:
 
 
 class FakeGlueContext:
-    """awsglue.context.GlueContext mínimo: create_dynamic_frame.from_catalog lê na sessão principal."""
+    """awsglue.context.GlueContext mínimo. As leituras acontecem na sessão principal, como no Glue.
+
+    create_data_frame.from_catalog (leitura nativa, useSparkDataSource) e create_dynamic_frame.from_catalog
+    (DynamicFrame). nativa_falha simula um Glue em que a leitura nativa não funciona."""
     instancias: list[FakeGlueContext] = []
 
     def __init__(self, spark_context):
         self.spark = spark_context[1]
-        self.reads = []
-        self.create_dynamic_frame = self
+        self.reads, self.native_reads = [], []
         self.falhar_com_filtro = False
+        self.nativa_falha = False
+        contexto = self
+
+        class _Dinamico:
+            def from_catalog(self, database, table_name, push_down_predicate=""):
+                contexto._conferir_filtro(push_down_predicate)
+                contexto.reads.append((database, table_name, push_down_predicate))
+                df = contexto.spark.default_df(("LogicalRDD", "glue", database, table_name, push_down_predicate))
+
+                class _Dyf:
+                    def toDF(self):
+                        return df
+                return _Dyf()
+
+        class _Nativo:
+            def from_catalog(self, database, table_name, push_down_predicate="", additional_options=None):
+                if contexto.nativa_falha:
+                    raise RuntimeError("useSparkDataSource is not supported for this table")
+                contexto._conferir_filtro(push_down_predicate)
+                contexto.native_reads.append((database, table_name, push_down_predicate, dict(additional_options or {})))
+                return contexto.spark.default_df(("Relation", "glue", database, table_name, push_down_predicate))
+
+        self.create_dynamic_frame, self.create_data_frame = _Dinamico(), _Nativo()
         FakeGlueContext.instancias.append(self)
 
-    def from_catalog(self, database, table_name, push_down_predicate=""):
-        if push_down_predicate and self.falhar_com_filtro:
+    def _conferir_filtro(self, filtro):
+        if filtro and self.falhar_com_filtro:
             raise RuntimeError("cannot resolve column used in push_down_predicate")
-        self.reads.append((database, table_name, push_down_predicate))
-        plano = ("glue", database, table_name, push_down_predicate)
-        df = self.spark.default_df(plano)
-
-        class _Dyf:
-            def toDF(self):
-                return df
-        return _Dyf()
 
 
 def run_generated(code: str, spark: FakeSpark, namespace: dict | None = None) -> dict:

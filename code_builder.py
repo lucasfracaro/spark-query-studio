@@ -8,9 +8,10 @@ Gera o código PySpark que será executado no motor (Glue Interactive Session ou
   atual e views de execuções anteriores não passam para a próxima, como num job novo.
 - O cache continua entre as execuções: entradas marcadas com "cache" (e CACHE TABLE da própria
   query) não são relidas do S3 enquanto a definição não mudar. O que sai da orquestração é liberado.
-- reader="glue_context" (Glue 4.0 com Lake Formation): as entradas do catálogo são lidas com
-  glueContext.create_dynamic_frame.from_catalog, como num job do Glue, porque no Glue 4.0 só essa
-  leitura usa as permissões do Lake Formation (dados no S3 de outra conta).
+- reader="glue_context" (Glue 4.0 com Lake Formation): as entradas do catálogo são lidas pelo GlueContext,
+  porque no Glue 4.0 só essa leitura usa as permissões do Lake Formation (dados no S3 de outra conta).
+  Primeiro a leitura nativa do Spark (create_data_frame.from_catalog com useSparkDataSource, que lê só as
+  colunas usadas); se ela não funcionar, o DynamicFrame (create_dynamic_frame.from_catalog), mais lento.
 - O resultado volta como uma linha marcada com RESULT_MARKER, com o JSON comprimido em base64.
 """
 from __future__ import annotations
@@ -249,39 +250,59 @@ try:
     for _chave in [_c for _c in _cache if _c not in _p["keep_cached"]]:
         try:
             _cache[_chave][0].unpersist()
+            spark.catalog.dropGlobalTempView("sqs_" + _chave[2:])
         except Exception:
             pass
         _log.append("cache liberado: " + _cache.pop(_chave)[2])
 
     def _ler_pelo_glue_context(_src, _filtro, _alias):
-        # Glue 4.0 com Lake Formation: só a leitura pelo GlueContext usa as permissões do Lake Formation,
-        # como nos jobs do Glue. O filtro vai como push_down_predicate: só as partições pedidas são lidas.
-        # Se o filtro não servir para escolher partições, a execução para: ler a tabela inteira sem
-        # avisar pode levar horas.
+        # Glue 4.0 com Lake Formation: só as leituras pelo GlueContext usam as permissões do Lake Formation.
+        # 1º) leitura nativa do Spark (useSparkDataSource): lê só as colunas que a query usa e filtra dentro
+        #     dos arquivos. 2º) se ela não funcionar, DynamicFrame, como nos jobs do Glue (lê todas as
+        #     colunas das partições escolhidas: bem mais lento). O filtro vai como push_down_predicate; se
+        #     ele não servir para escolher partições, a execução para em vez de ler a tabela inteira.
         _gc = globals().get("_sqs_gc")
         if _gc is None:
             from awsglue.context import GlueContext
             _gc = globals()["_sqs_gc"] = GlueContext(spark.sparkContext)
         _db, _tabela = _src.split(".", 1) if "." in _src else ((_p["db"] or "default"), _src)
-        _t = _time.time()
+        _t, _nativa_falhou = _time.time(), ""
         try:
-            _d = _gc.create_dynamic_frame.from_catalog(database=_db, table_name=_tabela,
-                                                       push_down_predicate=_filtro).toDF()
+            _d = _gc.create_data_frame.from_catalog(database=_db, table_name=_tabela, push_down_predicate=_filtro,
+                                                    additional_options={"useSparkDataSource": True})
+            _d.limit(1).collect()              # a leitura é preguiçosa: confere agora o acesso aos arquivos
         except Exception as _e:
-            if not _filtro:
-                raise
-            raise RuntimeError(
-                "O filtro da entrada " + _alias + " (" + _filtro + ") não pôde ser usado para escolher as "
-                "partições de " + _src + ". Na leitura pelo GlueContext, o filtro da orquestração deve usar só "
-                "colunas de partição; as outras condições vão na query. Erro do Glue: "
-                + (str(_e).strip().splitlines() or [""])[0][:300]) from _e
-        _log.append("leitura de " + _alias + " pelo GlueContext preparada em " + str(round(_time.time() - _t, 1))
-                    + "s" + (" (partições: " + _filtro + ")" if _filtro else " (SEM filtro: a tabela inteira)"))
+            _d, _nativa_falhou = None, (str(_e).strip().splitlines() or [""])[0][:200]
+        if _d is None:
+            try:
+                _d = _gc.create_dynamic_frame.from_catalog(database=_db, table_name=_tabela,
+                                                           push_down_predicate=_filtro).toDF()
+            except Exception as _e:
+                if not _filtro:
+                    raise
+                raise RuntimeError(
+                    "O filtro da entrada " + _alias + " (" + _filtro + ") não pôde ser usado para escolher as "
+                    "partições de " + _src + ". Na leitura pelo GlueContext, o filtro da orquestração deve usar "
+                    "só colunas de partição; as outras condições vão na query. Erro do Glue: "
+                    + (str(_e).strip().splitlines() or [""])[0][:300]) from _e
+        try:
+            _rdd = "LogicalRDD" in _d._jdf.queryExecution().analyzed().toString()
+        except Exception:
+            _rdd = _nativa_falhou != ""
+        _como = ("DynamicFrame: lê todas as colunas, mais lento" if _rdd
+                 else "leitura nativa do Spark: só as colunas usadas")
+        _log.append("leitura de " + _alias + " pelo GlueContext (" + _como + ") preparada em "
+                    + str(round(_time.time() - _t, 1)) + "s"
+                    + (" (partições: " + _filtro + ")" if _filtro else " (SEM filtro: a tabela inteira)"))
+        if _nativa_falhou:
+            _log.append("a leitura nativa não funcionou para " + _alias + " (" + _nativa_falhou + ")")
         return _d.where(_filtro) if _filtro else _d
 
-    def _para_esta_sessao(_d):
-        # o GlueContext cria o DataFrame na sessão principal; a query roda na sessão desta execução
-        return type(_d)(_s._jsparkSession.createDataFrame(_d._jdf.rdd(), _d._jdf.schema()), _s)
+    def _para_esta_sessao(_d, _nome):
+        # o GlueContext cria o DataFrame em outra sessão do Spark; uma view global deixa a sessão desta
+        # execução usar o mesmo plano, sem perder a leitura só das colunas e partições necessárias
+        _d.createOrReplaceGlobalTempView(_nome)
+        return _s.table(_s.conf.get("spark.sql.globalTempDatabase", "global_temp") + "." + _nome)
 
     for _inp in _p["inputs"]:
         _alias, _src = _inp["alias"].strip(), _inp["source"].strip()
@@ -295,7 +316,7 @@ try:
                 if _cachear:
                     _base.cache()
                     _cache[_chave] = [_base, _time.strftime("%H:%M:%S"), _alias]
-            _df = _para_esta_sessao(_base)
+            _df = _para_esta_sessao(_base, "sqs_" + _chave[2:])
         else:
             if _inp["kind"] == "catalog":
                 _df = _s.table(_src)
