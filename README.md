@@ -90,7 +90,7 @@ A sessão do Glue é a parte cara: leva de 30 a 90 s para subir e cobra enquanto
 Quando as tabelas estão num data lake de **outra conta** e o acesso é controlado pelo **Lake Formation**, o Athena lê os dados com as credenciais que o Lake Formation fornece. O Spark no Glue, por padrão, lê os arquivos direto do S3 com a role da sessão, e o S3 da outra conta recusa (*Access Denied*). Ligue **Ler as tabelas pelo Lake Formation** (ou `lake_formation = true` no arquivo):
 
 - **Glue 5.0, 5.1 e 6.0**: a sessão é criada com as configurações de [*Full Table Access*](https://docs.aws.amazon.com/glue/latest/dg/security-access-control-fta.html) e o Spark lê as tabelas normalmente, com as credenciais do Lake Formation.
-- **Glue 4.0**: o Lake Formation só vale para leituras feitas pelo GlueContext. As entradas `catalog` passam a ser lidas por ele, com o filtro da orquestração indo como `push_down_predicate`:
+- **Glue 4.0**: o Lake Formation só vale para leituras feitas pelo GlueContext. As entradas `catalog` passam a ser lidas por ele, com a parte de partição do filtro da orquestração indo como `push_down_predicate`:
   1. primeiro pela **leitura nativa do Spark** ([`create_data_frame.from_catalog` com `useSparkDataSource`](https://docs.aws.amazon.com/glue/latest/dg/aws-glue-api-crawler-pyspark-extensions-glue-context.html)), que respeita as permissões do Lake Formation e lê só as colunas que a query usa;
   2. se ela não funcionar na sua conta, pelo **DynamicFrame** (`create_dynamic_frame.from_catalog`), como num job do Glue. Ele lê todas as colunas das partições escolhidas e é bem mais lento.
 
@@ -103,13 +103,13 @@ Pré-requisitos (quem administra a conta precisa conferir):
 Cuidados com a leitura pelo GlueContext (Glue 4.0):
 - quando cai no DynamicFrame, ela lê **todas as colunas** das partições escolhidas e lista as partições do catálogo antes de filtrar, então é bem mais lenta que a leitura normal do Spark. Use filtros de partição pequenos (ex.: `dt = '2026-10-28'`) e, para tabelas grandes, mais workers (com 2 workers só um deles processa os dados);
 - marque **Cache** nessas entradas: a leitura lenta acontece uma vez só por sessão e as queries seguintes usam os dados em memória;
-- o filtro da entrada deve usar **só colunas de partição**. Se ele não servir para escolher partições, a execução para com uma mensagem dizendo isso, em vez de ler a tabela inteira; as outras condições vão no `WHERE` da query.
+- o filtro da entrada pode ter qualquer coluna. O `push_down_predicate` só aceita colunas de partição, então a ferramenta confere no catálogo quais são as colunas de partição da tabela e manda para a leitura só a parte do filtro (os trechos separados por `AND`) que usa apenas elas; o resto é aplicado logo depois da leitura, e o resultado é o mesmo. O log mostra as duas partes. Se nenhuma parte do filtro for de partição, a tabela inteira é lida, e o log avisa.
 
 ### 📥 Importar query do Athena
 
 Cole (ou abra) uma query escrita para o Athena e clique em **Gerar orquestração**. A ferramenta:
 
-1. encontra as bases usadas, ignorando as CTEs;
+1. encontra as bases usadas. CTEs (e views criadas na própria query) não viram entrada da orquestração, porque não vêm do catálogo: os filtros de partição de dentro delas vão para a base de origem. Um filtro de partição aplicado fora da CTE, na query de cima, não é levado: o relatório avisa que todas as partições serão lidas, e dá para colocar o filtro na orquestração à mão;
 2. consulta o **Glue Data Catalog** para saber quais colunas são de partição. Sem acesso ao Glue, supõe pelo nome (`dt`, `anomes`…) e avisa;
 3. em cada CTE ou subquery, separa o `WHERE` e o `ON` do join pelos `AND` e leva para a orquestração as condições que usam **só colunas de partição** daquela base. Se a mesma base é lida com filtros diferentes, eles são combinados com `OR`;
 4. `INSERT ... SELECT` e `CREATE TABLE ... AS SELECT` viram só o `SELECT`: você vê o que seria gravado, sem gravar, e a tabela de destino não entra na orquestração;

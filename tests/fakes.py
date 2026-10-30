@@ -151,6 +151,15 @@ class _Catalog:
     def dropGlobalTempView(self, nome):
         return self.spark.global_views.pop(nome, None) is not None
 
+    def listColumns(self, table, db=None):
+        """Colunas da tabela no catálogo; as de partição vêm de spark.partition_columns."""
+        from types import SimpleNamespace
+        chave = f"{db}.{table}" if db else table
+        if chave not in self.spark.partition_columns:
+            raise RuntimeError(f"[TABLE_OR_VIEW_NOT_FOUND] {chave}")
+        colunas = [("id", False), ("valor", False)] + [(c, True) for c in self.spark.partition_columns[chave]]
+        return [SimpleNamespace(name=n, isPartition=part) for n, part in colunas]
+
 
 class _JvmSession:
     def __init__(self, spark):
@@ -161,7 +170,7 @@ class _JvmSession:
         return _FakeJdf(rdd[1])
 
 
-_COMPARTILHADOS = ("shared_cache", "cached", "uncached", "cache_cleared", "global_views")
+_COMPARTILHADOS = ("shared_cache", "cached", "uncached", "cache_cleared", "global_views", "partition_columns")
 
 
 class FakeSpark:
@@ -182,6 +191,7 @@ class FakeSpark:
             self.shared_cache, self.cached, self.uncached = set(), [], []
             self.cache_cleared = 0
             self.global_views = {}
+            self.partition_columns = {}       # {"db.tabela": ["dt", ...]}: o que listColumns devolve
         self.conf = _Conf(self)
         self.catalog = _Catalog(self)
         self._jsparkSession = _JvmSession(self)

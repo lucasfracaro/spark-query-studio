@@ -255,20 +255,32 @@ try:
             pass
         _log.append("cache liberado: " + _cache.pop(_chave)[2])
 
-    def _ler_pelo_glue_context(_src, _filtro, _alias):
+    def _ler_pelo_glue_context(_src, _filtro, _partes, _alias):
         # Glue 4.0 com Lake Formation: só as leituras pelo GlueContext usam as permissões do Lake Formation.
         # 1º) leitura nativa do Spark (useSparkDataSource): lê só as colunas que a query usa e filtra dentro
         #     dos arquivos. 2º) se ela não funcionar, DynamicFrame, como nos jobs do Glue (lê todas as
-        #     colunas das partições escolhidas: bem mais lento). O filtro vai como push_down_predicate; se
-        #     ele não servir para escolher partições, a execução para em vez de ler a tabela inteira.
+        #     colunas das partições escolhidas: bem mais lento).
+        # O push_down_predicate só aceita colunas de partição: as partições da tabela são conferidas no
+        # catálogo e só a parte do filtro que usa apenas elas vai para a leitura; o filtro inteiro é aplicado
+        # depois, então o resultado é o mesmo.
         _gc = globals().get("_sqs_gc")
         if _gc is None:
             from awsglue.context import GlueContext
             _gc = globals()["_sqs_gc"] = GlueContext(spark.sparkContext)
         _db, _tabela = _src.split(".", 1) if "." in _src else ((_p["db"] or "default"), _src)
-        _t, _nativa_falhou = _time.time(), ""
+        _t, _nativa_falhou, _depois = _time.time(), "", []
+        _push = _filtro
+        if _filtro and _partes and all(_x["cols"] is not None for _x in _partes):
+            try:
+                _part = {_c.name.lower() for _c in spark.catalog.listColumns(_tabela, _db) if _c.isPartition}
+            except Exception:
+                _part = None
+            if _part is not None:
+                _usar = [_x["sql"] for _x in _partes if _x["cols"] and set(_x["cols"]) <= _part]
+                _depois = [_x["sql"] for _x in _partes if not (_x["cols"] and set(_x["cols"]) <= _part)]
+                _push = _usar[0] if len(_usar) == 1 else " AND ".join("(" + _x + ")" for _x in _usar)
         try:
-            _d = _gc.create_data_frame.from_catalog(database=_db, table_name=_tabela, push_down_predicate=_filtro,
+            _d = _gc.create_data_frame.from_catalog(database=_db, table_name=_tabela, push_down_predicate=_push,
                                                     additional_options={"useSparkDataSource": True})
             _d.limit(1).collect()              # a leitura é preguiçosa: confere agora o acesso aos arquivos
         except Exception as _e:
@@ -276,14 +288,14 @@ try:
         if _d is None:
             try:
                 _d = _gc.create_dynamic_frame.from_catalog(database=_db, table_name=_tabela,
-                                                           push_down_predicate=_filtro).toDF()
+                                                           push_down_predicate=_push).toDF()
             except Exception as _e:
-                if not _filtro:
+                if not _push:
                     raise
                 raise RuntimeError(
-                    "O filtro da entrada " + _alias + " (" + _filtro + ") não pôde ser usado para escolher as "
-                    "partições de " + _src + ". Na leitura pelo GlueContext, o filtro da orquestração deve usar "
-                    "só colunas de partição; as outras condições vão na query. Erro do Glue: "
+                    "O filtro da entrada " + _alias + " (" + _push + ") não pôde ser usado para escolher as "
+                    "partições de " + _src + ". Na leitura pelo GlueContext, a parte do filtro que vai para a "
+                    "leitura deve usar só colunas de partição; as outras condições vão na query. Erro do Glue: "
                     + (str(_e).strip().splitlines() or [""])[0][:300]) from _e
         try:
             _rdd = "LogicalRDD" in _d._jdf.queryExecution().analyzed().toString()
@@ -291,9 +303,14 @@ try:
             _rdd = _nativa_falhou != ""
         _como = ("DynamicFrame: lê todas as colunas, mais lento" if _rdd
                  else "leitura nativa do Spark: só as colunas usadas")
+        if _push:
+            _onde = " (partições: " + _push + ")"
+        else:
+            _onde = " (SEM filtro de partição: a tabela inteira)"
+        if _depois:
+            _onde += " (aplicado depois da leitura: " + " AND ".join(_depois) + ")"
         _log.append("leitura de " + _alias + " pelo GlueContext (" + _como + ") preparada em "
-                    + str(round(_time.time() - _t, 1)) + "s"
-                    + (" (partições: " + _filtro + ")" if _filtro else " (SEM filtro: a tabela inteira)"))
+                    + str(round(_time.time() - _t, 1)) + "s" + _onde)
         if _nativa_falhou:
             _log.append("a leitura nativa não funcionou para " + _alias + " (" + _nativa_falhou + ")")
         return _d.where(_filtro) if _filtro else _d
@@ -312,7 +329,7 @@ try:
             if _cachear and _chave in _cache:
                 _base, _reaproveitado = _cache[_chave][0], True
             else:
-                _base = _ler_pelo_glue_context(_src, _filtro, _alias)
+                _base = _ler_pelo_glue_context(_src, _filtro, _inp.get("filter_parts") or [], _alias)
                 if _cachear:
                     _base.cache()
                     _cache[_chave] = [_base, _time.strftime("%H:%M:%S"), _alias]
@@ -428,6 +445,37 @@ def sql_cache_targets(statements: list[str]) -> list[dict]:
     return alvos
 
 
+def filter_parts(texto: str) -> list[dict]:
+    """Separa o filtro de uma entrada pelos AND de primeiro nível: [{"sql": trecho, "cols": colunas}].
+
+    Na leitura pelo GlueContext, só os trechos cujas colunas são todas de partição vão para o
+    push_down_predicate (a lista de partições é conferida no catálogo, na hora). cols=None quando não
+    dá para analisar o trecho: aí o filtro inteiro é tentado como está.
+    """
+    texto = (texto or "").strip()
+    if not texto:
+        return []
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        from sql_refs import quiet_sqlglot
+        with quiet_sqlglot():
+            arvore = sqlglot.parse_one(texto, read="spark")
+    except Exception:
+        return [{"sql": texto, "cols": None}]
+    partes = list(arvore.flatten()) if isinstance(arvore, exp.And) else [arvore]   # flatten tira os parênteses
+    saida = []
+    for parte in partes:
+        while isinstance(parte, exp.Paren):
+            parte = parte.this
+        analisavel = parte.find(exp.Select) is None
+        cols = sorted({c.name.lower() for c in parte.find_all(exp.Column)}) if analisavel else None
+        trecho = parte.sql(dialect="spark")
+        saida.append({"sql": f"({trecho})" if isinstance(parte, exp.Or) else trecho, "cols": cols})
+    return saida
+
+
 def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reader: str = "spark") -> str:
     """Monta o script PySpark que cria as entradas, roda a query e imprime o resultado.
 
@@ -444,6 +492,10 @@ def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reade
     db = orch.default_database.strip()
     inputs = [dict(asdict(i), options=parse_options(i.options), key=input_cache_key(i, db, reader))
               for i in orch.inputs if i.is_valid()]
+    if reader == "glue_context":
+        for i in inputs:
+            if i["kind"] == "catalog" and i["filter"].strip():
+                i["filter_parts"] = filter_parts(i["filter"])
     caches_sql = sql_cache_targets(statements)
     payload = {
         "inputs": inputs,

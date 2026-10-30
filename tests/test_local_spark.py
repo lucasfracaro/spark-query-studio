@@ -190,8 +190,12 @@ class _GlueContextLocal:
         spark = SparkSession.builder.getOrCreate()
 
         def ler(database, table_name, push_down_predicate):
-            df = (spark.read.option("header", "true").option("sep", ";").option("inferSchema", "true")
-                  .csv(_GlueContextLocal.tabelas[f"{database}.{table_name}"]))
+            nome = f"{database}.{table_name}"
+            if nome in _GlueContextLocal.tabelas:
+                df = (spark.read.option("header", "true").option("sep", ";").option("inferSchema", "true")
+                      .csv(_GlueContextLocal.tabelas[nome]))
+            else:
+                df = spark.table(nome)                  # tabela de verdade no catálogo local
             return df.where(push_down_predicate) if push_down_predicate else df
 
         class _Nativo:
@@ -258,3 +262,21 @@ def test_glue_context_sem_leitura_nativa_usa_o_dynamic_frame(engine, tmp_path, a
     assert r["rows"] == [[50]]
     assert awsglue_local.leituras == [("dynamic", "db", "vendas", "id >= 2")]
     assert any("DynamicFrame" in linha for linha in r["log"])
+
+
+def test_glue_context_separa_o_filtro_pelas_particoes_do_catalogo(engine, tmp_path, awsglue_local):
+    pytest.importorskip("sqlglot")
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
+    spark.sql(f"CREATE DATABASE IF NOT EXISTS db_sqs LOCATION '{(tmp_path / 'db').as_posix()}'")
+    (spark.createDataFrame([(1, 10, "2026-10-01"), (2, 20, "2026-10-02"), (3, 30, "2026-10-02")], ["id", "valor", "dt"])
+     .write.mode("overwrite").partitionBy("dt").option("path", (tmp_path / "vendas").as_posix())
+     .saveAsTable("db_sqs.vendas"))
+    entrada = InputSource("vendas", "catalog", "db_sqs.vendas", filter="dt = '2026-10-02' AND valor > 20")
+    r = engine.run(build_spark_code("SELECT SUM(valor) AS total FROM vendas", Orchestration(inputs=[entrada]),
+                                    reader="glue_context"))
+    assert r["ok"], r
+    assert r["rows"] == [[30]]
+    # só a parte de partição foi para a leitura; a outra foi aplicada depois
+    assert awsglue_local.leituras == [("nativa", "db_sqs", "vendas", "dt = '2026-10-02'")]
+    assert any("aplicado depois da leitura: valor > 20" in linha for linha in r["log"])

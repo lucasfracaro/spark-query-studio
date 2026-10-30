@@ -52,9 +52,9 @@ def lake_formation_help(versao: str) -> str:
         texto = ("No Glue 4.0, o Lake Formation só vale nas leituras pelo GlueContext. As entradas `catalog` são "
                  "lidas primeiro pela leitura nativa do Spark (`create_data_frame.from_catalog` com "
                  "`useSparkDataSource`), que lê só as colunas usadas; se ela não funcionar, pelo DynamicFrame "
-                 "(`create_dynamic_frame.from_catalog`), como nos jobs do Glue, que é bem mais lento. O filtro vai "
-                 "como `push_down_predicate` e a query precisa usar os aliases da orquestração. Marque **Cache** "
-                 "nessas entradas.")
+                 "(`create_dynamic_frame.from_catalog`), como nos jobs do Glue, que é bem mais lento. A parte do "
+                 "filtro que usa só colunas de partição vai como `push_down_predicate` (o resto é aplicado depois "
+                 "da leitura) e a query precisa usar os aliases da orquestração. Marque **Cache** nessas entradas.")
     return (texto + " A role da sessão precisa de SELECT nas tabelas no Lake Formation e de "
             "`lakeformation:GetDataAccess` no IAM. Vale para sessões novas.")
 

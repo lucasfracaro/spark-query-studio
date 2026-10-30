@@ -13,6 +13,7 @@ from code_builder import (
     Orchestration,
     build_clear_cache_code,
     build_spark_code,
+    filter_parts,
     input_cache_key,
     parse_options,
     parse_result,
@@ -337,6 +338,47 @@ def test_glue_context_criado_uma_vez_e_cache_sem_reler(glue_context):
     _rodar(spark, ns, "SELECT 3", InputSource("v", "catalog", "db.v", filter="dt = '1'"), reader="glue_context")
     assert spark.uncached and len(glue_context[0].native_reads) == 2      # sem cache: liberou e leu de novo
     assert "sqs_" + chave[2:] not in spark.global_views or chave not in ns["_sqs_cache"]
+
+
+@pytest.mark.parametrize("filtro, esperado", [
+    ("dt = '1' AND valor > 10", [("dt = '1'", ["dt"]), ("valor > 10", ["valor"])]),
+    ("(dt = '1' OR dt = '2') AND anomes >= 202601", [("(dt = '1' OR dt = '2')", ["dt"]),
+                                                     ("anomes >= 202601", ["anomes"])]),
+    ("v.dt BETWEEN '2026-10-01' AND '2026-10-28'", [("v.dt BETWEEN '2026-10-01' AND '2026-10-28'", ["dt"])]),
+    ("dt = (SELECT max(dt) FROM t)", [("dt = (SELECT MAX(dt) FROM t)", None)]),
+    ("", []),
+])
+def test_filtro_separado_pelos_and(filtro, esperado):
+    pytest.importorskip("sqlglot")
+    assert [(p["sql"], p["cols"]) for p in filter_parts(filtro)] == esperado
+
+
+def test_filtro_que_nao_da_para_ler_fica_inteiro():
+    assert filter_parts("dt = = '1'") == [{"sql": "dt = = '1'", "cols": None}]
+
+
+def test_glue_context_manda_para_a_leitura_so_a_parte_de_particao(glue_context):
+    pytest.importorskip("sqlglot")
+    spark, ns = FakeSpark(), {}
+    spark.partition_columns["db.v"] = ["dt"]
+    res = _rodar(spark, ns, "SELECT 1", InputSource("v", "catalog", "db.v", filter="dt = '1' AND valor > 10"),
+                 reader="glue_context")
+    assert res["ok"], res
+    assert glue_context[0].native_reads[0][2] == "dt = '1'"                # só a partição vai para a leitura
+    assert any("aplicado depois da leitura: valor > 10" in linha for linha in res["log"])
+    assert spark.last_session.views["v"].plan[-1] == ("where", "dt = '1' AND valor > 10")   # o filtro inteiro vale
+
+
+def test_glue_context_filtro_sem_particao_le_tudo_e_filtra_depois(glue_context):
+    pytest.importorskip("sqlglot")
+    spark, ns = FakeSpark(), {}
+    spark.partition_columns["db.v"] = ["dt"]
+    res = _rodar(spark, ns, "SELECT 1", InputSource("v", "catalog", "db.v", filter="valor > 10 OR dt = '1'"),
+                 reader="glue_context")
+    assert res["ok"], res
+    assert glue_context[0].native_reads[0][2] == ""                        # OR com coluna comum: não escolhe partição
+    assert any("SEM filtro de partição" in linha for linha in res["log"])
+    assert spark.last_session.views["v"].plan[-1] == ("where", "valor > 10 OR dt = '1'")
 
 
 def test_leitor_desconhecido():
