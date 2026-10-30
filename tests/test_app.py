@@ -543,25 +543,64 @@ def test_aviso_do_log_aparece_no_resultado(app, monkeypatch):
 
 
 # --------------------------------------------------------------------------- resultado completo
-def test_preparar_e_baixar_o_csv_completo(app, monkeypatch):
+def _capturar_downloads(monkeypatch):
+    """Guarda o que cada botão de download recebe (bytes ou a função que gera o arquivo no clique)."""
+    from streamlit.delta_generator import DeltaGenerator
+    original = DeltaGenerator.download_button
+    capturados = {}
+
+    def captura(self, label, data, *a, **k):
+        capturados[label] = data
+        return original(self, label, data, *a, **k)
+
+    monkeypatch.setattr(DeltaGenerator, "download_button", captura)
+    return capturados
+
+
+def test_tela_mostra_o_total_e_o_csv_leva_todas_as_linhas(app, monkeypatch):
     import ui.results
-    _motor_falso(monkeypatch, {"ok": True, "elapsed": 0.1, "log": [],
-                               "columns": [{"name": "id", "type": "int"}], "rows": [[1], [2]]})
+    _motor_falso(monkeypatch, {"ok": True, "elapsed": 0.1, "log": [], "columns": [{"name": "id", "type": "int"}],
+                               "rows": [[1], [2]], "total_rows": 1234, "result_key": "abc123"})
     pedidos = []
 
-    def completo(run, sql, orch, reader, formato, on_status=None, **k):
-        pedidos.append((sql, orch.default_database, reader, formato))
-        return "﻿id\n1\n2\n3\n".encode(), {"rows": 3, "truncated": False, "bytes": 30, "chunks": 1}
+    def completo(run, sql, orch, reader, formato, on_status=None, result_key=None, **k):
+        pedidos.append((sql, reader, formato, result_key))
+        return "\ufeffid\n1\n2\n3\n".encode(), {"rows": 1234, "truncated": False, "rerun": False}
 
     monkeypatch.setattr(ui.results, "fetch_full_result", completo)
+    capturados = _capturar_downloads(monkeypatch)
     app.session_state["engine_kind"] = "local"
     app.text_area[0].set_value("SELECT id FROM minha_view").run()
     _botao(app, "Executar").click().run()
     assert not app.exception, app.exception
-    assert not any("Baixar CSV completo" in b.label for b in app.get("download_button"))
-    _botao(app, "Preparar CSV com todas as linhas").click().run()
+
+    assert any(m.label == "Linhas no resultado" and m.value == "1.234" for m in app.metric)
+    assert any("as primeiras 2 de 1.234 linhas" in c.value for c in app.caption)
+    gerar = capturados["⬇️ Exportar CSV (1.234 linhas)"]
+    assert callable(gerar) and pedidos == []                        # nada é gerado antes do clique
+    assert gerar().startswith("\ufeffid".encode())                  # o clique gera o arquivo inteiro
+    assert pedidos == [("SELECT id FROM minha_view", "spark", "excel_br", "abc123")]
+
+
+def test_csv_sai_da_tela_quando_ela_ja_tem_tudo(app, monkeypatch):
+    _motor_falso(monkeypatch, {"ok": True, "elapsed": 0.1, "log": [], "columns": [{"name": "id", "type": "int"}],
+                               "rows": [[1], [2]], "total_rows": 2, "result_key": "abc123"})
+    capturados = _capturar_downloads(monkeypatch)
+    app.session_state["engine_kind"] = "local"
+    _botao(app, "Executar").click().run()
     assert not app.exception, app.exception
-    assert pedidos == [("SELECT id FROM minha_view", "workspace_db", "spark", "excel_br")]   # a mesma execução
-    assert any("Baixar CSV completo (3 linhas" in b.label for b in app.get("download_button"))
-    _botao(app, "Executar").click().run()                    # resultado novo: o arquivo antigo some
-    assert not any("Baixar CSV completo" in b.label for b in app.get("download_button"))
+    assert capturados["⬇️ Exportar CSV (2 linhas)"] == "\ufeffid\n1\n2\n".encode()
+    assert not any("as primeiras" in c.value for c in app.caption)
+
+
+def test_sem_contar_as_linhas_a_tela_volta_a_mostrar_as_exibidas(app, monkeypatch):
+    chamadas = _motor_falso(monkeypatch, {"ok": True, "elapsed": 0.1, "log": [], "rows": [[1]] * 100,
+                                          "columns": [{"name": "id", "type": "int"}]})
+    capturados = _capturar_downloads(monkeypatch)
+    app.session_state["engine_kind"] = "local"
+    next(c for c in app.checkbox if c.label == "Contar todas as linhas do resultado").uncheck().run()
+    _botao(app, "Executar").click().run()
+    assert not app.exception, app.exception
+    assert "'count': False" in chamadas[-1]
+    assert any(m.label == "Linhas exibidas" and m.value == "100" for m in app.metric)
+    assert callable(capturados["⬇️ Exportar CSV (todas as linhas)"])   # chegou no limite: pode haver mais

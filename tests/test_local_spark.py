@@ -301,3 +301,18 @@ def test_database_padrao_que_nao_existe_so_avisa(engine):
     res = _run(engine, "SELECT 1 AS um", default_database="nao_existe_aqui")
     assert res["ok"], res
     assert any(linha.startswith("AVISO: o database padrão nao_existe_aqui") for linha in res["log"])
+
+
+def test_total_de_linhas_e_csv_do_resultado_guardado(engine):
+    from export import fetch_full_result
+    sql = "SELECT id % 7 AS grupo, count(*) AS n FROM range(10000) GROUP BY id % 7 ORDER BY grupo"
+    orch = Orchestration(limit=3)
+    res = engine.run(build_spark_code(sql, orch, count=True))
+    assert res["ok"], res
+    assert res["total_rows"] == 7 and len(res["rows"]) == 3
+    assert any("guardado em memória" in linha for linha in res["log"])      # agregação: fica em memória
+    dados, info = fetch_full_result(lambda codigo, on_status: engine.run(codigo), sql, orch,
+                                    result_key=res["result_key"], chunk_bytes=64)
+    assert info["rerun"] is False and info["rows"] == 7                    # sem rodar a query de novo
+    linhas = dados.decode("utf-8-sig").splitlines()
+    assert linhas[0] == "grupo;n" and linhas[1:3] == ["0;1429", "1;1429"] and len(linhas) == 8

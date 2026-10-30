@@ -8,9 +8,8 @@ import streamlit as st
 
 import metadata
 from code_builder import EXPORT_MAX_ROWS
-from export import FORMATS, ExportError, fetch_full_result, rows_to_csv_bytes
+from export import FORMATS, fetch_full_result, rows_to_csv_bytes
 from session_hub import HUB
-from sizing import fmt_bytes
 from spark_errors import summarize
 from sql_refs import missing_from_spark_error
 from ui import style
@@ -45,76 +44,83 @@ def render(engine=None):
             st.code("\n".join(res["log"]), language="text")
 
 
+def _n(numero: int) -> str:
+    return f"{numero:,}".replace(",", ".")
+
+
 def _dados(res: dict, engine=None):
     uniq = unique_names([c["name"] for c in res["columns"]])
     df = pd.DataFrame(res["rows"], columns=uniq)
+    total = res.get("total_rows")
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("Linhas exibidas", f"{len(df):,}".replace(",", "."))
+    if total is None:
+        m1.metric("Linhas exibidas", _n(len(df)))
+    else:
+        m1.metric("Linhas no resultado", _n(total))
     m2.metric("Colunas", len(df.columns))
     m3.metric("Tempo", f"{res.get('total', res.get('elapsed', 0))} s")
 
     t_dados, t_meta = st.tabs(["📋 Dados", "🧾 Metadados"])
     with t_dados:
+        if total is not None and total > len(df):
+            st.caption(f"Na tela, as primeiras {_n(len(df))} de {_n(total)} linhas (**Linhas exibidas**, em ⚙️ "
+                       "Opções). O CSV leva todas.")
         st.dataframe(df, width="stretch", height=min(38 + 35 * len(df), 560), hide_index=True)
-        c1, c2, c3 = st.columns([1.4, 1, 1.1], vertical_alignment="bottom")
+        c1, c2 = st.columns([1.4, 1.6], vertical_alignment="bottom")
         formato = c1.selectbox("Formato do CSV", list(FORMATS), format_func=FORMATS.get,
                                help="Excel em português espera ; como separador e vírgula nos decimais.")
-        tipos = [c.get("type", "") for c in res["columns"]]
-        c2.download_button("⬇️ CSV das linhas exibidas", rows_to_csv_bytes(uniq, res["rows"], tipos, formato),
-                           f"resultado_{time.strftime('%Y%m%d_%H%M%S')}.csv", "text/csv", type="primary",
-                           width="stretch",
-                           help="As linhas que estão na tela (o número vem de Linhas exibidas, na aba ⚙️ Opções).")
-        if c3.button("📦 Preparar CSV com todas as linhas", width="stretch", disabled=not res.get("origem"),
-                     help="Roda a query de novo na sessão e traz todas as linhas (até "
-                          f"{EXPORT_MAX_ROWS + 1:,}".replace(",", ".") + " com o cabeçalho, o máximo do Excel), em "
-                          "partes, pela própria sessão. A tela continua igual."):
-            _preparar_completo(engine, res, formato)
-        _baixar_completo()
+        _botao_csv(c2, res, uniq, formato, engine)
     with t_meta:
         render_metadata(res, uniq)
 
 
-def _preparar_completo(engine, res: dict, formato: str):
-    ss = st.session_state
-    ss.full_export = None
-    origem = res["origem"]
-    if engine is None:
-        st.error(f"A conexão com a AWS não está pronta ({ss.engine_error}). Revise em **⚙️ Configuração**.")
-        return
-    t0 = time.time()
-    with st.status("Preparando o CSV completo…", expanded=False) as box:
-        def rodar(codigo, on_status):
-            return HUB.run(engine, codigo, on_status, fingerprint=fingerprint())
-        try:
-            dados, info = fetch_full_result(rodar, origem["sql"], origem["orch"], origem["reader"], formato,
-                                            on_status=lambda m: box.update(label=m))
-        except (ExportError, ValueError) as e:
-            box.update(label="Não deu para preparar o CSV completo", state="error")
-            st.error(str(e))
-            return
-        except Exception as e:
-            box.update(label="Não deu para preparar o CSV completo", state="error")
-            st.error(f"{type(e).__name__}: {e}")
-            return
-        segundos = round(time.time() - t0, 1)
-        box.update(label=f"CSV completo pronto em {segundos}s", state="complete")
-    ss.full_export = {"data": dados, "rows": info["rows"], "truncated": info["truncated"], "format": formato,
-                      "result_version": ss.result_version, "name": f"resultado_completo_{time.strftime('%Y%m%d_%H%M%S')}.csv"}
+def _completo_na_tela(res: dict) -> bool:
+    """As linhas da tela já são o resultado inteiro?"""
+    total, na_tela = res.get("total_rows"), len(res["rows"])
+    if total is not None:
+        return total <= na_tela
+    origem = res.get("origem")
+    return bool(origem) and na_tela < int(origem["orch"].limit)      # nem chegou no limite da tela
 
 
-def _baixar_completo():
-    ss = st.session_state
-    pronto = ss.get("full_export")
-    if not pronto or pronto["result_version"] != ss.result_version:
+def _botao_csv(onde, res: dict, nomes: list[str], formato: str, engine):
+    """Exportar CSV, sempre com todas as linhas. Se elas já estão na tela, o arquivo sai delas na hora; senão, ele
+    é gerado na sessão quando o botão é clicado (do resultado que ficou guardado, sem rodar a query de novo)."""
+    tipos = [c.get("type", "") for c in res["columns"]]
+    total, origem = res.get("total_rows"), res.get("origem")
+    nome = f"resultado_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    if _completo_na_tela(res) or engine is None or not origem:
+        rotulo = (f"⬇️ Exportar CSV ({_n(len(res['rows']))} linhas)" if _completo_na_tela(res)
+                  else "⬇️ Exportar CSV (linhas exibidas)")
+        onde.download_button(rotulo, rows_to_csv_bytes(nomes, res["rows"], tipos, formato), nome, "text/csv",
+                             type="primary", width="stretch")
         return
-    linhas = f"{pronto['rows']:,}".replace(",", ".")
-    st.download_button(f"⬇️ Baixar CSV completo ({linhas} linhas, {fmt_bytes(len(pronto['data']))}, "
-                       f"{FORMATS[pronto['format']].split(' (')[0]})", pronto["data"], pronto["name"], "text/csv",
-                       type="primary", key="baixar_completo", on_click="ignore")
-    if pronto["truncated"]:
-        st.warning(f"O resultado tem mais linhas que isso: o arquivo tem as primeiras {linhas}, o máximo que o Excel "
-                   "abre. Para ter tudo, divida a query (por data, por exemplo) e exporte cada parte.")
+    if total is None:
+        rotulo = "⬇️ Exportar CSV (todas as linhas)"
+    elif total > EXPORT_MAX_ROWS:
+        rotulo = f"⬇️ Exportar CSV (primeiras {_n(EXPORT_MAX_ROWS)} de {_n(total)} linhas)"
+    else:
+        rotulo = f"⬇️ Exportar CSV ({_n(total)} linhas)"
+    onde.download_button(
+        rotulo, csv_generator(engine, origem, res.get("result_key"), formato, fingerprint()), nome, "text/csv",
+        type="primary", width="stretch", on_click="ignore",
+        help="O arquivo é gerado quando você clica, com todas as linhas: ele sai do resultado que ficou na sessão "
+             "(ou a query roda de novo, se a sessão foi recriada) e vem em partes pela própria sessão.")
+    if total is not None and total > EXPORT_MAX_ROWS:
+        st.caption(f"O Excel abre no máximo {_n(EXPORT_MAX_ROWS + 1)} linhas (com o cabeçalho): o CSV leva as "
+                   "primeiras. Para ter tudo, divida a query (por data, por exemplo) e exporte cada parte.")
+
+
+def csv_generator(engine, origem: dict, result_key: str | None, formato: str, fp: str | None):
+    """A função que o botão chama no clique. O Streamlit a roda numa thread separada, sem acesso à tela: tudo o
+    que ela usa vem daqui."""
+    def gerar() -> bytes:
+        dados, _info = fetch_full_result(
+            lambda codigo, on_status: HUB.run(engine, codigo, on_status, fingerprint=fp),
+            origem["sql"], origem["orch"], origem["reader"], formato, result_key=result_key)
+        return dados
+    return gerar
 
 
 def _erro(res: dict):

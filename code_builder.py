@@ -200,6 +200,15 @@ def _payload_compressed(statements: list[str], payload: dict) -> str:
             '_statements = _p.pop("statements")\n')
 
 
+_VALOR_FUNCTION = r"""
+def _valor(_x):
+    if _x is None or isinstance(_x, (int, float, bool, str)):
+        return _x
+    if isinstance(_x, _Decimal):
+        return format(_x, "f")              # "1.50" (e zero com casas decimais não vira "0E-10")
+    return str(_x)
+""".strip()
+
 _TEMPLATE = r"""
 import base64 as _b64, json as _json, time as _time, traceback as _tb, zlib as _zlib
 from decimal import Decimal as _Decimal
@@ -214,12 +223,7 @@ def _emit(obj):
     print(_p["marker"] + _b64.b64encode(_zlib.compress(_raw, 6)).decode("ascii"))
 
 
-def _valor(_x):
-    if _x is None or isinstance(_x, (int, float, bool, str)):
-        return _x
-    if isinstance(_x, _Decimal):
-        return format(_x, "f")              # "1.50" (e zero com casas decimais não vira "0E-10")
-    return str(_x)
+#__VALOR__
 
 #__EXPORT__
 
@@ -257,6 +261,15 @@ try:
             _log.append("AVISO: o database padrão " + _p["db"] + " não foi usado ("
                         + (str(_e).strip().splitlines() or [""])[0][:200] + "). A query segue sem ele: "
                         "escreva as tabelas como database.tabela.")
+
+    # O resultado da execução anterior (guardado para o CSV completo) sai da memória antes desta rodar
+    if not _p.get("export"):
+        _anterior = globals().pop("_sqs_resultado", None)
+        if _anterior is not None and _anterior[3]:
+            try:
+                _anterior[1].unpersist()
+            except Exception:
+                pass
 
     # Cache entre execuções: o que foi marcado com "cache" continua em memória na sessão e não é relido
     # do S3 enquanto a definição não mudar. O que saiu da orquestração (ou da query) é liberado.
@@ -402,8 +415,29 @@ try:
         _out = {"ok": True, "columns": _cols, "export": _exportar(_df, _cols, _p["export"]),
                 "elapsed": round(_time.time() - _t0, 2), "log": _log}
     else:
+        # Total de linhas: a query roda inteira. Se ela agrega, junta, ordena ou usa janela, o resultado fica em
+        # memória (não é calculado duas vezes, e o CSV completo sai dele); uma leitura simples não é guardada
+        # (ela pode ser uma tabela enorme e é barata de reler).
+        _total, _guardado = None, False
+        if _p["count"]:
+            try:
+                _plano = _df._jdf.queryExecution().analyzed().toString()
+            except Exception:
+                _plano = ""
+            if any(_n in _plano for _n in ("Aggregate", "Join", "Sort", "Window", "Distinct", "Deduplicate",
+                                           "Union", "Expand", "Generate")):
+                _df = _df.cache()
+                _guardado = True
+            if not _p["profile"]:              # com as estatísticas ligadas, o total sai delas (uma passada só)
+                _t_total = _time.time()
+                _total = _df.count()
+                _log.append("total: %d linhas (contadas em %.1fs%s)" % (
+                    _total, _time.time() - _t_total, "; resultado guardado em memória para o CSV completo"
+                    if _guardado else ""))
+        globals()["_sqs_resultado"] = (_p["result_key"], _df, _cols, _guardado)
         _rows = [[_valor(_x) for _x in _row] for _row in _df.limit(_p["limit"]).collect()]
-        _out = {"ok": True, "columns": _cols, "rows": _rows, "elapsed": round(_time.time() - _t0, 2), "log": _log}
+        _out = {"ok": True, "columns": _cols, "rows": _rows, "total_rows": _total, "result_key": _p["result_key"],
+                "elapsed": round(_time.time() - _t0, 2), "log": _log}
 
     if _p["profile"] and _fields:
         # estatísticas no resultado COMPLETO (uma agregação só, colunas renomeadas por posição)
@@ -424,6 +458,8 @@ try:
              "min": _valor(_a.get("mn%d" % _i)), "max": _valor(_a.get("mx%d" % _i))}
             for _i in range(len(_fields))]}
         _log.append("estatísticas calculadas em " + str(_a["__n"]) + " linhas")
+        if _p["count"]:
+            _out["total_rows"] = _a["__n"]
 
     _emit(_out)
 except Exception as _e:
@@ -495,7 +531,7 @@ def filter_parts(texto: str) -> list[dict]:
 
 
 def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reader: str = "spark",
-                     export: dict | None = None) -> str:
+                     export: dict | None = None, count: bool = False) -> str:
     """Monta o script PySpark que cria as entradas, roda a query e imprime o resultado.
 
     O código mostrado na tela é exatamente o que roda. Se a versão legível passar do limite do
@@ -526,13 +562,19 @@ def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reade
         "keep_cached": [i["key"] for i in inputs if i["cache"]] + [c["key"] for c in caches_sql],
         "sql_caches": caches_sql,
         "marker": RESULT_MARKER,
+        "count": bool(count),
     }
-    template = _TEMPLATE.replace("#__EXPORT__\n", "")
+    # identifica o resultado guardado na sessão: a mesma query com a mesma orquestração tem a mesma chave
+    payload["result_key"] = hashlib.sha1(json.dumps([statements, payload], sort_keys=True, default=str)
+                                         .encode("utf-8")).hexdigest()[:12]
+    template = _TEMPLATE.replace("#__VALOR__", _VALOR_FUNCTION).replace("#__EXPORT__\n", "")
     if export:
         # resultado completo: export = {"format", "sep", "max_rows", "chunk"}; sem estatísticas
         payload["export"] = dict(export)
         payload["profile"] = False
-        template = _TEMPLATE.replace("#__EXPORT__\n", _EXPORT_FUNCTION.lstrip("\n") + "\n\n")
+        payload["count"] = False
+        template = (_TEMPLATE.replace("#__VALOR__", _VALOR_FUNCTION)
+                    .replace("#__EXPORT__\n", _EXPORT_FUNCTION.lstrip("\n") + "\n\n"))
     code = template.replace("#__PAYLOAD__", _payload_readable(statements, payload))
     if len(code) > GLUE_CODE_LIMIT:
         code = template.replace("#__PAYLOAD__", _payload_compressed(statements, payload))
@@ -546,13 +588,14 @@ def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reade
 # partição por partição) e depois voltam em partes (build_export_chunk_code). Mesmo formato do CSV da tela.
 _EXPORT_FUNCTION = r"""
 def _exportar(_df, _cols, _cfg):
-    import csv as _csv, glob as _glob, gzip as _gzip, math as _math, os as _os, tempfile as _tf
+    import csv as _csv, glob as _glob, gzip as _gzip, math as _math, os as _os, tempfile as _tf, uuid as _uuid
     for _velho in _glob.glob(_os.path.join(_tf.gettempdir(), "sqs_export_*.csv.gz")):
         try:
-            _os.remove(_velho)
+            if _time.time() - _os.path.getmtime(_velho) > 3600:     # sobra de exportação interrompida
+                _os.remove(_velho)
         except OSError:
             pass
-    _arq = _os.path.join(_tf.gettempdir(), "sqs_export_%d.csv.gz" % int(_time.time() * 1000))
+    _arq = _os.path.join(_tf.gettempdir(), "sqs_export_%s.csv.gz" % _uuid.uuid4().hex)
     _virgula = _cfg["format"] == "excel_br"
     _decimais = [_c["type"].split("(")[0].strip().lower() in ("decimal", "double", "float", "real") for _c in _cols]
 
@@ -591,21 +634,60 @@ def _exportar(_df, _cols, _cfg):
 """
 
 _EXPORT_CHUNK = r"""
-import base64 as _b64, json as _json, zlib as _zlib
+import base64 as _b64, json as _json, os as _os, zlib as _zlib
 try:
     with open(#__PATH__, "rb") as _f:
         _f.seek(#__START__)
         _out = {"ok": True, "chunk": _b64.b64encode(_f.read(#__SIZE__)).decode("ascii")}
+    if #__LAST__:
+        _os.remove(#__PATH__)                # última parte: o arquivo sai do disco do driver
 except Exception as _e:
     _out = {"ok": False, "error": type(_e).__name__ + ": " + str(_e)}
 print(#__MARKER__ + _b64.b64encode(_zlib.compress(_json.dumps(_out).encode("utf-8"), 1)).decode("ascii"))
 """.strip()
 
 
-def build_export_chunk_code(path: str, index: int, size: int = EXPORT_CHUNK_BYTES) -> str:
-    """Código que devolve a parte `index` do arquivo do resultado completo (em base64, no formato de sempre)."""
+_EXPORT_FROM_RESULT = r"""
+import base64 as _b64, json as _json, time as _time, traceback as _tb, zlib as _zlib
+from decimal import Decimal as _Decimal
+_log = []
+_p = {"marker": #__MARKER__}
+
+
+def _emit(obj):
+    _raw = _json.dumps(obj, default=str).encode("utf-8")
+    print(_p["marker"] + _b64.b64encode(_zlib.compress(_raw, 6)).decode("ascii"))
+
+
+#__VALOR__
+
+#__EXPORT__
+try:
+    _r = globals().get("_sqs_resultado")
+    if not _r or _r[0] != #__KEY__:
+        _emit({"ok": False, "missing": True, "error": "O resultado não está mais guardado na sessão."})
+    else:
+        _emit({"ok": True, "export": _exportar(_r[1], _r[2], #__CONFIG__), "log": _log})
+except Exception as _e:
+    _emit({"ok": False, "error": type(_e).__name__ + ": " + str(_e), "traceback": _tb.format_exc(), "log": _log})
+""".strip()
+
+
+def build_export_result_code(result_key: str, export: dict) -> str:
+    """Código que gera o CSV completo a partir do resultado guardado na sessão pela última execução (sem rodar a
+    query de novo). Se ele não estiver lá (sessão nova, outra query rodou depois), devolve {"missing": True}."""
+    return (_EXPORT_FROM_RESULT.replace("#__VALOR__", _VALOR_FUNCTION)
+            .replace("#__EXPORT__", _EXPORT_FUNCTION.strip() + "\n\n")
+            .replace("#__MARKER__", json.dumps(RESULT_MARKER)).replace("#__KEY__", json.dumps(result_key))
+            .replace("#__CONFIG__", repr(dict(export))))
+
+
+def build_export_chunk_code(path: str, index: int, size: int = EXPORT_CHUNK_BYTES, last: bool = False) -> str:
+    """Código que devolve a parte `index` do arquivo do resultado completo (em base64, no formato de sempre).
+    Na última parte (last=True), o arquivo é apagado do driver depois de lido."""
     return (_EXPORT_CHUNK.replace("#__PATH__", json.dumps(path)).replace("#__START__", str(int(index) * int(size)))
-            .replace("#__SIZE__", str(int(size))).replace("#__MARKER__", json.dumps(RESULT_MARKER)))
+            .replace("#__SIZE__", str(int(size))).replace("#__LAST__", "True" if last else "False")
+            .replace("#__MARKER__", json.dumps(RESULT_MARKER)))
 
 
 _CLEAR_CACHE = r"""

@@ -214,11 +214,15 @@ def render():
                  "ele não existir ou a role não tiver acesso, a query roda assim mesmo e o log avisa.").strip()
         ss.row_limit = c2.number_input("Linhas exibidas", 1, 10000, int(ss.row_limit),
                                        help="Apenas estas linhas são trazidas para a tela; a query roda inteira "
-                                            "no cluster. Para baixar todas as linhas, use **📦 Preparar CSV com "
-                                            "todas as linhas** no resultado.")
+                                            "no cluster, e o CSV leva todas as linhas.")
         ss.check_refs = st.checkbox(
             "Bloquear a execução se a query usar uma base que não está na orquestração", ss.check_refs,
             help="A conferência é feita antes de enviar ao cluster. Desligue só se ela acusar uma base por engano.")
+        ss.count_rows = st.checkbox(
+            "Contar todas as linhas do resultado", ss.count_rows,
+            help="Mostra o total de linhas (a tela continua com as Linhas exibidas) e deixa o resultado pronto na "
+                 "sessão para o CSV completo. Para contar, a query roda inteira: numa consulta simples a uma tabela "
+                 "enorme (SELECT * sem agregação), desligar deixa a tela mais rápida.")
         ss.profile = st.checkbox(
             "Calcular estatísticas para os metadados (nulos, distintos, mínimo e máximo) no resultado completo",
             ss.profile, help="Roda uma agregação extra sobre o resultado inteiro no cluster: a execução fica "

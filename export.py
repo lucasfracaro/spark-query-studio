@@ -7,8 +7,9 @@ português espera ao abrir o arquivo com dois cliques. Com ponto decimal, o Exce
 
 Dois caminhos, com o mesmo formato:
 - to_csv_bytes: as linhas que já estão na tela;
-- fetch_full_result: o resultado inteiro. A query roda de novo na sessão, todas as linhas vão para um
-  CSV comprimido no driver e o arquivo volta em partes pela própria sessão (sem bucket, sem Athena).
+- fetch_full_result: o resultado inteiro. Ele sai do resultado que a execução deixou guardado na sessão
+  (sem rodar a query de novo) ou, se ele não estiver mais lá, de uma execução nova. Todas as linhas vão
+  para um CSV comprimido no driver e o arquivo volta em partes pela própria sessão (sem bucket, sem Athena).
 """
 from __future__ import annotations
 
@@ -22,7 +23,14 @@ from collections.abc import Callable
 
 import pandas as pd
 
-from code_builder import EXPORT_CHUNK_BYTES, EXPORT_MAX_ROWS, Orchestration, build_export_chunk_code, build_spark_code
+from code_builder import (
+    EXPORT_CHUNK_BYTES,
+    EXPORT_MAX_ROWS,
+    Orchestration,
+    build_export_chunk_code,
+    build_export_result_code,
+    build_spark_code,
+)
 
 FORMATS = {
     "excel_br": "Excel em português (; e vírgula decimal)",
@@ -81,22 +89,34 @@ class ExportError(RuntimeError):
 def fetch_full_result(run: Callable[[str, Callable[[str], None]], dict], sql: str, orch: Orchestration,
                       reader: str = "spark", formato: str = "excel_br",
                       on_status: Callable[[str], None] = lambda m: None,
-                      max_rows: int = EXPORT_MAX_ROWS, chunk_bytes: int = EXPORT_CHUNK_BYTES) -> tuple[bytes, dict]:
-    """O resultado inteiro em CSV (UTF-8 com BOM, como o da tela) e o resumo {rows, truncated, bytes}.
+                      max_rows: int = EXPORT_MAX_ROWS, chunk_bytes: int = EXPORT_CHUNK_BYTES,
+                      result_key: str | None = None) -> tuple[bytes, dict]:
+    """O resultado inteiro em CSV (UTF-8 com BOM, como o da tela) e o resumo {rows, truncated, bytes, rerun}.
 
-    run(código, on_status) executa um comando na sessão e devolve o resultado lido (ex.: session_hub.HUB.run)."""
+    run(código, on_status) executa um comando na sessão e devolve o resultado lido (ex.: session_hub.HUB.run).
+    result_key: a chave do resultado que a execução deixou guardado na sessão (o "result_key" da resposta)."""
     if formato not in _SEPARADOR:
         raise ValueError(f"Formato desconhecido: {formato}")
     config = {"format": formato, "sep": _SEPARADOR[formato], "max_rows": int(max_rows), "chunk": int(chunk_bytes)}
-    on_status("Rodando a query de novo para trazer todas as linhas…")
-    res = run(build_spark_code(sql, orch, reader=reader, export=config), on_status)
-    if not res or not res.get("ok"):
-        raise ExportError((res or {}).get("error") or "A sessão não devolveu o resultado.")
+    res = None
+    if result_key:
+        on_status("Gerando o CSV com o resultado que ficou na sessão…")
+        res = run(build_export_result_code(result_key, config), on_status)
+        if res and res.get("missing"):
+            res = None                      # sessão nova ou outra query rodou depois: roda esta de novo
+        elif not res or not res.get("ok"):
+            raise ExportError((res or {}).get("error") or "A sessão não devolveu o resultado.")
+    rodou_de_novo = res is None
+    if res is None:
+        on_status("Rodando a query de novo para trazer todas as linhas…")
+        res = run(build_spark_code(sql, orch, reader=reader, export=config), on_status)
+        if not res or not res.get("ok"):
+            raise ExportError((res or {}).get("error") or "A sessão não devolveu o resultado.")
     info = res["export"]
     partes = []
     for i in range(info["chunks"]):
         on_status(f"Trazendo o arquivo ({info['rows']:,} linhas): parte {i + 1} de {info['chunks']}…".replace(",", "."))
-        parte = run(build_export_chunk_code(info["file"], i, chunk_bytes), on_status)
+        parte = run(build_export_chunk_code(info["file"], i, chunk_bytes, last=i == info["chunks"] - 1), on_status)
         if not parte or not parte.get("ok"):
             raise ExportError((parte or {}).get("error") or f"A parte {i + 1} do arquivo não voltou.")
         partes.append(base64.b64decode(parte["chunk"]))
@@ -104,4 +124,4 @@ def fetch_full_result(run: Callable[[str, Callable[[str], None]], dict], sql: st
         dados = gzip.decompress(b"".join(partes))
     except (OSError, EOFError) as e:
         raise ExportError(f"O arquivo voltou incompleto ({e}). Tente de novo.") from e
-    return codecs.BOM_UTF8 + dados, info
+    return codecs.BOM_UTF8 + dados, dict(info, rerun=rodou_de_novo)

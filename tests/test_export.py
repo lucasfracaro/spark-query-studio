@@ -105,3 +105,42 @@ def test_resultado_completo_com_erro_na_query_ou_numa_parte():
         return real(codigo, on_status) if resposta is None else resposta
     with pytest.raises(ExportError, match="sumiu"):
         fetch_full_result(run, "SELECT * FROM v", ORCH, chunk_bytes=16)
+
+
+def test_csv_completo_sai_do_resultado_guardado_sem_rodar_a_query_de_novo():
+    from code_builder import build_spark_code
+    spark, ns = FakeSpark(rows=LINHAS, columns=COLUNAS), {}
+    tela = run_generated(build_spark_code("SELECT * FROM v", ORCH, count=True), spark, ns)
+    sessoes = len(spark.sessions)
+    codigos = []
+
+    def run(codigo, on_status):
+        codigos.append(codigo)
+        return run_generated(codigo, spark, ns)
+
+    dados, info = fetch_full_result(run, "SELECT * FROM v", ORCH, result_key=tela["result_key"], chunk_bytes=16)
+    assert info["rows"] == 4 and info["rerun"] is False
+    assert len(spark.sessions) == sessoes                  # nenhuma execução nova da query
+    assert "SELECT * FROM v" not in codigos[0]
+    # o mesmo arquivo que uma execução nova geraria
+    de_novo, info2 = fetch_full_result(_rodar_com(FakeSpark(rows=LINHAS, columns=COLUNAS)), "SELECT * FROM v", ORCH)
+    assert dados == de_novo and info2["rerun"] is True
+
+
+def test_csv_completo_roda_de_novo_quando_o_resultado_guardado_e_de_outra_execucao():
+    from code_builder import build_spark_code
+    spark, ns = FakeSpark(rows=LINHAS, columns=COLUNAS), {}
+    run_generated(build_spark_code("SELECT * FROM v", ORCH, count=True), spark, ns)
+    dados, info = fetch_full_result(lambda c, s: run_generated(c, spark, ns), "SELECT * FROM v", ORCH,
+                                    result_key="outra_chave")
+    assert info["rerun"] is True and info["rows"] == 4
+
+
+def test_arquivo_do_driver_e_apagado_depois_da_ultima_parte():
+    import glob
+    import os
+    import tempfile
+    antes = set(glob.glob(os.path.join(tempfile.gettempdir(), "sqs_export_*.csv.gz")))
+    spark = FakeSpark(rows=LINHAS, columns=COLUNAS)
+    fetch_full_result(_rodar_com(spark), "SELECT * FROM v", ORCH, chunk_bytes=16)
+    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "sqs_export_*.csv.gz"))) == antes

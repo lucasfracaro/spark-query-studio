@@ -40,6 +40,7 @@ def init():
     ss.setdefault("row_limit", DEFAULT_LIMIT)
     ss.setdefault("check_refs", True)
     ss.setdefault("profile", False)
+    ss.setdefault("count_rows", True)        # contar todas as linhas do resultado (e guardar para o CSV)
     ss.setdefault("result_version", 0)
     ss.setdefault("orch_draft", "")
     ss.setdefault("orch_draft_version", 0)

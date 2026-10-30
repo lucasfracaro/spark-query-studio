@@ -48,6 +48,12 @@ class _FakeJdf:
 
     def queryExecution(self):            # .analyzed().toString(): o "plano" em texto
         plano = str(self.df.plan)
+        # como no Spark, o plano diz se há agregação, junção, ordenação... (o código gerado decide o cache por isso)
+        texto = plano.lower()
+        nos = [no for trecho, no in (("group by", "Aggregate"), (" join ", "Join"), ("order by", "Sort"),
+                                     (" over ", "Window"), ("distinct", "Distinct"), ("union", "Union"))
+               if trecho in texto]
+        plano = " ".join(nos + [plano])
 
         class _Analisado:
             def toString(self):
@@ -92,6 +98,11 @@ class FakeDataFrame:
 
     def limit(self, n):
         return FakeDataFrame(self.rows[:n], self.columns, self.spark, self.plan + (("limit", n),))
+
+    def count(self):
+        if self.spark is not None:
+            self.spark.calls.append(("count",))
+        return len(self.rows)
 
     def toLocalIterator(self, prefetchPartitions=False):
         if self.spark is not None:

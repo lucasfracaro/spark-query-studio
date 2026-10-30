@@ -66,7 +66,7 @@ def render(engine):
     with st.expander("Ver código PySpark gerado"):
         try:
             st.caption("É exatamente o código que vai rodar. Dá para copiar e rodar num notebook do Glue.")
-            st.code(build_spark_code(ss.sql, orch, profile=ss.profile, reader=leitor), language="python")
+            st.code(build_spark_code(ss.sql, orch, profile=ss.profile, reader=leitor, count=ss.count_rows), language="python")
         except ValueError as e:
             st.caption(str(e))
 
@@ -100,7 +100,7 @@ def _executar(engine, orch, ref_check, escritas, leitor: str):
     code = None
     if not errors:
         try:
-            code = build_spark_code(ss.sql, orch, profile=ss.profile, reader=leitor)
+            code = build_spark_code(ss.sql, orch, profile=ss.profile, reader=leitor, count=ss.count_rows)
         except ValueError as e:
             errors.append(str(e))
     if engine is None and not errors:

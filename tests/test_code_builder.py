@@ -125,6 +125,40 @@ def test_codigo_de_exportacao_so_quando_pedido():
     assert "def _exportar" in exportar and "'profile': False" in exportar        # sem estatísticas na exportação
 
 
+def test_total_de_linhas_e_resultado_guardado_so_quando_vale_a_pena():
+    orch = Orchestration(inputs=[InputSource("vendas", "catalog", "db.vendas")], limit=2)
+    spark, ns = FakeSpark(), {}
+    simples = run_generated(build_spark_code("SELECT * FROM vendas", orch, count=True), spark, ns)
+    assert simples["total_rows"] == 3 and len(simples["rows"]) == 2 and simples["result_key"]
+    assert ("count",) in spark.last_session.calls and spark.cached == []    # leitura simples: não fica em memória
+    assert ns["_sqs_resultado"][0] == simples["result_key"] and ns["_sqs_resultado"][3] is False
+
+    agregada = run_generated(build_spark_code("SELECT nome, count(*) FROM vendas GROUP BY nome", orch, count=True),
+                             spark, ns)
+    assert agregada["total_rows"] == 3 and len(spark.cached) == 1           # agregação: guardada (não roda 2x)
+    assert any("guardado em memória" in linha for linha in agregada["log"])
+    plano = spark.cached[0]
+
+    run_generated(build_spark_code("SELECT 1", orch, count=True), spark, ns)   # a próxima execução libera
+    assert plano in spark.uncached
+
+    sem_contar = run_generated(build_spark_code("SELECT * FROM vendas", orch), spark, ns)
+    assert sem_contar["total_rows"] is None and ("count",) not in spark.last_session.calls
+
+
+def test_com_estatisticas_o_total_sai_delas_sem_contar_duas_vezes():
+    orch = Orchestration(inputs=[InputSource("vendas", "catalog", "db.vendas")], limit=2)
+    codigo = build_spark_code("SELECT * FROM vendas", orch, profile=True, count=True)
+    assert "_out[\"total_rows\"] = _a[\"__n\"]" in codigo and "if not _p[\"profile\"]" in codigo
+
+
+def test_chave_do_resultado_e_a_mesma_para_a_mesma_execucao():
+    orch = Orchestration(inputs=[InputSource("v", "catalog", "db.v")])
+    um, dois = (run_generated(build_spark_code("SELECT * FROM v", orch, count=True), FakeSpark()) for _ in range(2))
+    outro = run_generated(build_spark_code("SELECT id FROM v", orch, count=True), FakeSpark())
+    assert um["result_key"] == dois["result_key"] != outro["result_key"]
+
+
 def test_database_padrao_invalido_e_vazio():
     assert any("Database padrão `meu db` inválido" in e
                for e in validate_orchestration(_orch(InputSource("v", "catalog", "db.t"), default_database="meu db")))
