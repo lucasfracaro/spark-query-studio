@@ -14,5 +14,6 @@ ignore = [
 "tests/*" = ["B011"]
 
 [lint.isort]
-known-first-party = ["athena_import", "code_builder", "engines", "export", "metadata", "orchestration_io",
-                     "session_hub", "settings_store", "spark_errors", "sql_refs", "ui", "fakes"]
+known-first-party = ["athena_import", "code_builder", "column_errors", "engines", "export", "latest_partition",
+                     "metadata", "orchestration_io", "session_hub", "settings_store", "sizing", "spark_errors",
+                     "sql_refs", "ui", "fakes"]

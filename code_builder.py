@@ -3,7 +3,7 @@ Gera o código PySpark que será executado no motor (Glue Interactive Session ou
 
 - O código é legível: cada comando da query aparece como texto Python normal, então dá para
   copiar e rodar num notebook do Glue. Só quando o código passaria do limite do Glue
-  (68 mil caracteres por comando) a query e as configurações vão comprimidas (zlib + base64).
+  (68 mil bytes por comando) a query e as configurações vão comprimidas (zlib + base64).
 - Cada execução usa uma sessão Spark nova (spark.newSession()): configurações, database
   atual e views de execuções anteriores não passam para a próxima, como num job novo.
 - O cache continua entre as execuções: entradas marcadas com "cache" (e CACHE TABLE da própria
@@ -70,12 +70,18 @@ def split_statements(sql: str) -> list[str]:
 
 def split_statements_with_lines(sql: str) -> list[tuple[int, str]]:
     """Como split_statements, mas devolve também a linha (1, 2, ...) onde cada comando começa."""
-    statements: list[tuple[int, str]] = []
+    return [(linha, texto) for linha, _coluna, texto in split_statements_with_positions(sql)]
+
+
+def split_statements_with_positions(sql: str) -> list[tuple[int, int, str]]:
+    """Como split_statements, com a linha (1, 2, ...) e a coluna (0, 1, ...) onde cada comando começa.
+    A coluna só não é 0 quando o comando começa no meio de uma linha (depois de outro ';')."""
+    statements: list[tuple[int, int, str]] = []
 
     def add(a: int, b: int):
         trecho = sql[a:b]
         inicio = a + (len(trecho) - len(trecho.lstrip()))
-        statements.append((sql.count("\n", 0, inicio) + 1, trecho.strip()))
+        statements.append((sql.count("\n", 0, inicio) + 1, inicio - (sql.rfind("\n", 0, inicio) + 1), trecho.strip()))
 
     start, i, n = 0, 0, len(sql)
     has_code = False
@@ -216,11 +222,32 @@ from decimal import Decimal as _Decimal
 #__PAYLOAD__
 _t0 = _time.time()
 _log = []
+_i_cmd, _entradas = None, []          # o comando que está rodando; as entradas já registradas como views
 
 
 def _emit(obj):
     _raw = _json.dumps(obj, default=str).encode("utf-8")
     print(_p["marker"] + _b64.b64encode(_zlib.compress(_raw, 6)).decode("ascii"))
+
+
+def _colunas_das_entradas():
+    # Para explicar uma coluna não encontrada: as colunas que cada entrada trouxe e as que a role da sessão vê
+    # no catálogo (com o Lake Formation, o catálogo só mostra a cada um as colunas que ele pode ler).
+    _saida = []
+    for _alias, _kind, _src, _como, _dfe in _entradas:
+        _info = {"alias": _alias, "kind": _kind, "source": _src, "read": _como}
+        try:
+            _info["columns"] = [_f.name for _f in _dfe.schema.fields]
+        except Exception:
+            pass
+        if _kind == "catalog":
+            try:
+                _db, _tab = _src.split(".", 1) if "." in _src else (_s.catalog.currentDatabase(), _src)
+                _info["catalog"] = [_c.name for _c in _s.catalog.listColumns(_tab, _db)]
+            except Exception as _e2:
+                _info["catalog_error"] = (str(_e2).strip().splitlines() or [""])[0][:200]
+        _saida.append(_info)
+    return _saida
 
 
 #__VALOR__
@@ -282,7 +309,9 @@ try:
             pass
         _log.append("cache liberado: " + _cache.pop(_chave)[2])
 
-    def _ler_pelo_glue_context(_src, _filtro, _partes, _alias):
+    _modos = globals().setdefault("_sqs_modos", {})      # como cada leitura pelo GlueContext foi feita
+
+    def _ler_pelo_glue_context(_src, _filtro, _partes, _alias, _chave):
         # Glue 4.0 com Lake Formation: só as leituras pelo GlueContext usam as permissões do Lake Formation.
         # 1º) leitura nativa do Spark (useSparkDataSource): lê só as colunas que a query usa e filtra dentro
         #     dos arquivos. 2º) se ela não funcionar, DynamicFrame, como nos jobs do Glue (lê todas as
@@ -330,6 +359,7 @@ try:
             _rdd = _nativa_falhou != ""
         _como = ("DynamicFrame: lê todas as colunas, mais lento" if _rdd
                  else "leitura nativa do Spark: só as colunas usadas")
+        _modos[_chave] = "dynamicframe" if _rdd else "nativa"
         if _push:
             _onde = " (partições: " + _push + ")"
         else:
@@ -356,7 +386,7 @@ try:
             if _cachear and _chave in _cache:
                 _base, _reaproveitado = _cache[_chave][0], True
             else:
-                _base = _ler_pelo_glue_context(_src, _filtro, _inp.get("filter_parts") or [], _alias)
+                _base = _ler_pelo_glue_context(_src, _filtro, _inp.get("filter_parts") or [], _alias, _chave)
                 if _cachear:
                     _base.cache()
                     _cache[_chave] = [_base, _time.strftime("%H:%M:%S"), _alias]
@@ -386,6 +416,13 @@ try:
                 if _chave not in _cache:
                     _cache[_chave] = [_df, _time.strftime("%H:%M:%S") if not _reaproveitado else "antes", _alias]
         _df.createOrReplaceTempView(_alias)
+        if _inp["kind"] != "catalog":
+            _leitura = "s3"
+        elif _p["reader"] == "glue_context":
+            _leitura = _modos.get(_chave, "glue_context")       # "nativa" ou "dynamicframe"
+        else:
+            _leitura = "spark"
+        _entradas.append([_alias, _inp["kind"], _src, _leitura, _df])
         _msg = "view " + _alias + " <- " + _src
         if _cachear:
             _msg += (" (cache reaproveitado: dados lidos " + ("às " if _cache[_chave][1] != "antes" else "")
@@ -397,7 +434,7 @@ try:
 
     # comandos (CREATE VIEW, SET, CACHE...) rodam na hora; um SELECT só roda quando é o último
     _df = None
-    for _cmd in _statements:
+    for _i_cmd, _cmd in enumerate(_statements):
         _df = _s.sql(_cmd)
 
     # CACHE TABLE da própria query: os dados ficam em memória enquanto o comando continuar na query
@@ -463,8 +500,15 @@ try:
 
     _emit(_out)
 except Exception as _e:
-    _emit({"ok": False, "error": type(_e).__name__ + ": " + str(_e), "traceback": _tb.format_exc(),
-           "elapsed": round(_time.time() - _t0, 2), "log": _log})
+    _falha = {"ok": False, "error": type(_e).__name__ + ": " + str(_e), "traceback": _tb.format_exc(),
+              "elapsed": round(_time.time() - _t0, 2), "log": _log, "statement": _i_cmd}
+    if any(_x in str(_e) for _x in ("Column '", "UNRESOLVED_COLUMN", "UNRESOLVED_FIELD", "cannot resolve",
+                                    "No such struct field")):
+        try:
+            _falha["inputs"] = _colunas_das_entradas()   # coluna não encontrada: o que cada entrada tem
+        except Exception:
+            pass
+    _emit(_falha)
 """.strip()
 
 

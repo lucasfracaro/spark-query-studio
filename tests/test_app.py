@@ -162,6 +162,83 @@ def test_erro_do_spark_vem_resumido_com_dica(app, monkeypatch):
     assert any("AccessDeniedException" in c and "S3AUtils" not in c for c in resumo)     # sem a pilha do Java
 
 
+_COLUNAS = [f"col_{i}" for i in range(140)] + ["doc"]
+_ERRO_COLUNA = ("AnalysisException: Column 'doc_str' does not exist. Did you mean one of the following? ["
+                + ", ".join(f"minha_view.{c}" for c in _COLUNAS) + "]; line 3 pos 2;\n'Project ['doc_str]\n")
+_QUERY_COLUNA = "SET x = 1;\nSELECT doc,\n  col_1,\n  doc_str, nome_str\nFROM minha_view"
+
+
+def _resultado_coluna(**extra):
+    return dict({"ok": False, "log": [], "traceback": "Traceback ...", "error": _ERRO_COLUNA, "statement": 1,
+                 "inputs": [{"alias": "minha_view", "kind": "catalog", "source": "meu_database.minha_tabela",
+                             "read": "nativa", "columns": _COLUNAS, "catalog": _COLUNAS}]}, **extra)
+
+
+def test_erro_de_coluna_aponta_a_linha_e_o_motivo(app, monkeypatch):
+    usuario = {"minha_view": {"source": "meu_database.minha_tabela", "columns": _COLUNAS + ["doc_str", "nome_str"]}}
+    _motor_falso(monkeypatch, _resultado_coluna(user_catalog=usuario))
+    app.session_state["engine_kind"] = "local"
+    app.text_area[0].set_value(_QUERY_COLUNA).run()
+    _botao(app, "Executar").click().run()
+    assert not app.exception, app.exception
+    assert [e.value for e in app.error] == ["**A role da sessão não enxerga a coluna `doc_str`**"]
+    assert any("linha 4, coluna 3 (comando 2 de 2)" in m.value for m in app.markdown)
+    trecho = next(c.value for c in app.code if "^" in c.value)
+    assert trecho == "3 |   col_1,\n4 |   doc_str, nome_str\n  |   ^^^^^^^"
+    causa = app.info[0].value
+    assert "Lake Formation" in causa and "`doc_str`, `nome_str`" in causa
+    assert any("`minha_view` (`meu_database.minha_tabela`, 141 colunas)" in c.value for c in app.caption)
+    assert not any("col_139" in c.value for c in app.code if "^" not in c.value and "Traceback" not in c.value)
+
+
+def test_erro_de_coluna_no_glue_confere_o_catalogo_do_seu_usuario(app, monkeypatch):
+    import column_errors
+    import engines
+    import session_hub
+    monkeypatch.setattr(engines.GlueSessionEngine, "session_status", lambda self, *a: "READY")
+    monkeypatch.setattr(session_hub.HUB, "run", lambda engine, code, on_status=None, **k: _resultado_coluna())
+    pedidos = []
+
+    def catalogo(glue, inputs, default_database="", budget_s=8.0):
+        pedidos.append([i.alias for i in inputs])
+        return {"minha_view": {"source": "meu_database.minha_tabela", "columns": _COLUNAS + ["doc_str"]}}
+    monkeypatch.setattr(column_errors, "user_catalog_columns", catalogo)
+    app.session_state["engine_kind"] = "glue"
+    app.run()
+    app.text_area[0].set_value(_QUERY_COLUNA).run()
+    _botao(app, "Executar").click().run()
+    assert not app.exception, app.exception
+    assert pedidos == [["minha_view"]]
+    assert any("A role da sessão não enxerga a coluna `doc_str`" in e.value for e in app.error)
+
+
+def test_erro_de_sintaxe_aponta_a_linha_da_query(app, monkeypatch):
+    # o comando começa no comentário (linha 2 do editor): a linha 4 dele é a linha 5 do editor
+    erro = ("ParseException: \n[PARSE_SYNTAX_ERROR] Syntax error at or near 'FROM'.(line 4, pos 0)\n\n== SQL ==\n"
+            "-- minha query\n\nSELECT a,\nFROM minha_view\n^^^\n")
+    _motor_falso(monkeypatch, {"ok": False, "log": [], "traceback": "", "error": erro, "statement": 0})
+    app.session_state["engine_kind"] = "local"
+    app.text_area[0].set_value("\n-- minha query\n\nSELECT a,\nFROM minha_view").run()
+    _botao(app, "Executar").click().run()
+    assert any("Erro de sintaxe" in e.value for e in app.error)
+    assert any("linha 5, coluna 1" in m.value for m in app.markdown)
+    assert any(c.value == "4 | SELECT a,\n5 | FROM minha_view\n  | ^" for c in app.code)
+    assert not any("== SQL ==" in c.value for c in app.code)       # a linha já aparece com o número do editor
+
+
+def test_marcacao_do_erro_no_editor():
+    from ui.query import _aceita_marcacao
+    from ui.results import error_annotations
+    res = _resultado_coluna(origem={"sql": _QUERY_COLUNA, "orch": None, "engine": "local"})
+    [marca] = error_annotations(res, _QUERY_COLUNA)
+    assert (marca["row"], marca["column"], marca["type"]) == (3, 2, "error")
+    assert marca["text"] == "A coluna doc_str não existe"                 # o detalhe fica no Passo 3
+    assert error_annotations(res, _QUERY_COLUNA + " ") == []          # a query mudou: a marcação sai
+    assert error_annotations(dict(res, ok=True), _QUERY_COLUNA) == []
+    assert _aceita_marcacao(lambda value="", annotations=None, key=None: value)
+    assert not _aceita_marcacao(lambda value="", key=None: value)        # streamlit-ace antigo: não passa o argumento
+
+
 def test_botoes_de_orquestracao_e_athena(app):
     rotulos = [b.label for b in app.button]
     assert any("Importar query do Athena" in r for r in rotulos)

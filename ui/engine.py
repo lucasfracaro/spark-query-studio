@@ -15,6 +15,13 @@ def _aws_client(service: str, region: str, auth_mode: str, profile: str, access_
     return conta.client(service)
 
 
+def aws_client(service: str):
+    """Cliente boto3 da conta configurada (com as suas credenciais, não as da role da sessão), reaproveitado."""
+    acc = st.session_state.account
+    return _aws_client(service, acc.region, acc.auth_mode, acc.profile, acc.access_key, acc.secret_key,
+                       acc.session_token)
+
+
 def make_engine():
     """Cria o motor. Se a configuração AWS estiver inválida (perfil inexistente, região vazia...),
     devolve None e guarda o erro em engine_error, em vez de derrubar a tela."""
@@ -23,10 +30,8 @@ def make_engine():
     if ss.engine_kind == "local":
         return engines.LocalSparkEngine(ss.instance, ss.account)
     acc = ss.account
-    chave = (acc.region, acc.auth_mode, acc.profile, acc.access_key, acc.secret_key, acc.session_token)
     try:
-        return engines.GlueSessionEngine(acc, ss.instance, glue_client=_aws_client("glue", *chave),
-                                         sts_client=_aws_client("sts", *chave))
+        return engines.GlueSessionEngine(acc, ss.instance, glue_client=aws_client("glue"), sts_client=aws_client("sts"))
     except Exception as e:
         ss.engine_error = f"{type(e).__name__}: {e}"
         return None

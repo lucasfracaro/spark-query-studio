@@ -72,7 +72,7 @@ database_padrao = "workspace_db"   # USE de cada execução e database do DDL; "
 5. **Conferência da orquestração**: antes de enviar ao cluster, a query é lida e cada base usada em `FROM`/`JOIN` é comparada com as entradas da orquestração. Se faltar alguma, a execução é bloqueada com uma mensagem como *"A base `db.produtos` é usada na query (linha 3), mas não está na orquestração"*. O aviso já aparece embaixo do editor enquanto você digita. CTEs (`WITH`), views criadas na própria query, subqueries e funções como `range()` não são cobradas. Se o Spark ainda assim não encontrar uma tabela, o erro dele é traduzido para a mesma mensagem. A conferência pode ser desligada em **Opções**.
 6. **🔒 Modo somente leitura** (ligado por padrão): comandos que gravam ou alteram dados ou o catálogo (`INSERT`, `CREATE TABLE`, `DROP`, `ALTER`, `MERGE`, `DELETE`, `MSCK REPAIR`…) são bloqueados antes de ir para o cluster, com o número e a linha do comando. Consultas e comandos que só afetam a sessão (`CREATE TEMP VIEW`, `CACHE TABLE`, `SET`, `USE`) rodam normalmente. A role do Glue costuma ter permissão de escrita, então um comando esquecido na query gravaria de verdade; para executar mesmo assim, ligue **Permitir comandos que gravam** em **Opções**.
 7. **▶️ Executar**: veja [Sessão e velocidade](#sessão-e-velocidade). Durante a execução no Glue aparece **⏹️ Cancelar execução**, que cancela a query no cluster.
-8. **Passo 3 – Resultado**: mostra o **total de linhas do resultado** e, na tela, só as primeiras (**Linhas exibidas**, em ⚙️ Opções: 100 por padrão, até 10 mil), além do schema e do log. **Exportar CSV** leva **todas as linhas**, até 1.048.575 (o máximo que o Excel abre): quando a tela já tem tudo, o arquivo sai dela na hora; senão, ele é gerado no clique, na sessão, a partir do resultado que a execução deixou guardado (sem rodar a query de novo), e volta em partes de 2 MB pela própria API da sessão, sem bucket e sem Athena. Se a sessão foi recriada nesse meio-tempo, a query roda de novo para gerar o arquivo. Para contar o total, a query roda inteira; quando ela agrega, junta, ordena ou usa janela, o resultado fica em memória na sessão, para não ser calculado duas vezes. Uma leitura simples não fica, porque pode ser uma tabela enorme e é barata de reler. Numa consulta simples a uma tabela muito grande (`SELECT *` sem agregação), desligar **Contar todas as linhas do resultado** em ⚙️ Opções deixa a tela mais rápida. O formato padrão é o do **Excel em português** (`;` como separador e vírgula nos decimais, com UTF-8 BOM para os acentos); também há o padrão internacional (`,` e ponto) e tabulação. Quando a query falha, o erro aparece resumido (sem o plano da query e sem a pilha do Java), com um título em português e, quando dá para saber, o que fazer; a mensagem completa fica logo abaixo.
+8. **Passo 3 – Resultado**: mostra o **total de linhas do resultado** e, na tela, só as primeiras (**Linhas exibidas**, em ⚙️ Opções: 100 por padrão, até 10 mil), além do schema e do log. **Exportar CSV** leva **todas as linhas**, até 1.048.575 (o máximo que o Excel abre): quando a tela já tem tudo, o arquivo sai dela na hora; senão, ele é gerado no clique, na sessão, a partir do resultado que a execução deixou guardado (sem rodar a query de novo), e volta em partes de 2 MB pela própria API da sessão, sem bucket e sem Athena. Se a sessão foi recriada nesse meio-tempo, a query roda de novo para gerar o arquivo. Para contar o total, a query roda inteira; quando ela agrega, junta, ordena ou usa janela, o resultado fica em memória na sessão, para não ser calculado duas vezes. Uma leitura simples não fica, porque pode ser uma tabela enorme e é barata de reler. Numa consulta simples a uma tabela muito grande (`SELECT *` sem agregação), desligar **Contar todas as linhas do resultado** em ⚙️ Opções deixa a tela mais rápida. O formato padrão é o do **Excel em português** (`;` como separador e vírgula nos decimais, com UTF-8 BOM para os acentos); também há o padrão internacional (`,` e ponto) e tabulação. Quando a query falha, o erro aparece resumido, com a linha da query onde ele está (veja [Erros](#-erros)).
 
 ## Sessão e velocidade
 
@@ -167,6 +167,16 @@ A aba **Metadados**, ao lado dos dados, monta o dicionário de dados a partir do
 
 Dá para baixar o dicionário em CSV ou JSON e gerar o **DDL `CREATE EXTERNAL TABLE`** do Athena (Parquet, ORC, CSV ou JSON), com as colunas de partição escolhidas indo para `PARTITIONED BY` e as descrições virando `COMMENT`.
 
+### 🩺 Erros
+
+Quando a query falha, a tela mostra o erro resumido (sem o plano da query e sem a pilha do Java), com um título em português, **a linha da query onde ele está**, como no Athena, e, quando dá para saber, o que fazer. A linha é a do editor, mesmo com vários comandos separados por `;` (o Spark conta as linhas dentro de cada comando), e aparece com `^` embaixo do trecho. No editor com destaque de sintaxe, ela também fica marcada até a query mudar. A mensagem completa do Spark continua disponível logo abaixo.
+
+**Coluna não encontrada.** O Spark só diz o nome e lista as colunas que enxerga naquele ponto (no Glue 4.0, todas: numa tabela larga, centenas). No lugar da lista, a tela diz o motivo provável:
+- **a role da sessão não enxerga a coluna**: com o Lake Formation, o catálogo só mostra a cada um as colunas que ele tem permissão de ler. O Athena usa a sua permissão; a sessão, a da role. Depois do erro, a ferramenta compara as colunas que a role vê (conferidas na própria sessão) com as que o seu usuário vê (`glue:GetTable` com as suas credenciais) e lista **todas** as colunas que a query usa e que a role não vê, para pedir a permissão de uma vez, em vez de descobrir uma por execução;
+- **a leitura não trouxe a coluna**: ela está no catálogo, mas a leitura pelo GlueContext monta as colunas pelos arquivos lidos, e os das partições escolhidas não têm essa coluna (comum quando ela foi criada depois);
+- **a coluna é de outra tabela**, o **alias não existe naquele trecho**, a coluna **não chega até ali** (CTE ou subquery que não a seleciona) ou é **um nome criado no próprio SELECT** (usado no `WHERE` ou, no Glue 4.0, no mesmo `SELECT`);
+- **o nome não existe**: com os nomes parecidos.
+
 ### Código gerado
 
 **Ver código PySpark gerado** mostra exatamente o que vai rodar no cluster, com a query como foi escrita e a orquestração em texto normal: dá para copiar e rodar num notebook do Glue. A API do Glue aceita no máximo 68 mil bytes de código por comando (letras acentuadas ocupam 2); se a query passar disso, ela vai comprimida (zlib) dentro do código, o que permite queries várias vezes maiores.
@@ -180,7 +190,7 @@ Dá para baixar o dicionário em CSV ou JSON e gerar o **DDL `CREATE EXTERNAL TA
 
 ## Permissões na AWS
 
-- **Seu usuário/role** (quem roda o app): `iam_user_policy.json` (criar/consultar sessões Glue e `iam:PassRole`; para importar do Athena e estimar a sessão, só leitura: tabelas e partições do catálogo, histórico do Athena e lista dos seus buckets). Sem essas permissões o app funciona do mesmo jeito; a importação supõe as partições pelo nome e a estimativa usa o que conseguir ler.
+- **Seu usuário/role** (quem roda o app): `iam_user_policy.json` (criar/consultar sessões Glue e `iam:PassRole`; para importar do Athena, estimar a sessão e explicar uma coluna não encontrada, só leitura: tabelas e partições do catálogo, histórico do Athena e lista dos seus buckets). Sem essas permissões o app funciona do mesmo jeito; a importação supõe as partições pelo nome e a estimativa usa o que conseguir ler.
 - **Role do Glue** (assumida pela sessão): trust policy com `glue.amazonaws.com` + `iam_glue_role_policy.json` (S3, Glue Catalog e `lakeformation:GetDataAccess`). Se as tabelas usam Lake Formation, conceda também SELECT a essa role no Lake Formation.
 
 Troque `SEU-BUCKET` e `SUA-CONTA` pelos valores reais.
@@ -234,7 +244,8 @@ O GitHub Actions roda tudo a cada push: o verificador de código, os testes unit
 | `latest_partition.py` | `tabela$partitions` e max/min de partição: calculados pela lista de partições do Glue |
 | `orchestration_io.py` | Formato de arquivo da orquestração (JSON) |
 | `sql_refs.py` | Descobre as bases usadas pela query e confere com a orquestração |
-| `spark_errors.py` | Resume os erros do Spark e do Java para a tela |
+| `spark_errors.py` | Resume os erros do Spark e do Java para a tela e acha a linha do erro na query |
+| `column_errors.py` | Coluna não encontrada: o motivo provável (nome, alias, permissão do Lake Formation, arquivos) |
 | `export.py` | Exportação do resultado em CSV (Excel em português, padrão, tabulação) |
 | `metadata.py` | Dicionário de dados, tipos do Athena e DDL |
 | `configuracao.exemplo.toml` | Modelo comentado do arquivo de configuração |

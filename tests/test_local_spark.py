@@ -316,3 +316,50 @@ def test_total_de_linhas_e_csv_do_resultado_guardado(engine):
     assert info["rerun"] is False and info["rows"] == 7                    # sem rodar a query de novo
     linhas = dados.decode("utf-8-sig").splitlines()
     assert linhas[0] == "grupo;n" and linhas[1:3] == ["0;1429", "1;1429"] and len(linhas) == 8
+
+
+# --------------------------------------------------------------------------- erro de coluna e linha da query
+def test_coluna_que_nao_existe_aponta_a_linha_e_os_nomes_parecidos(engine, csv_vendas):
+    import column_errors
+    from spark_errors import locate_error
+    entrada = InputSource("vendas", "s3", str(csv_vendas), "csv", "header=true;sep=;;inferSchema=true")
+    sql = "SET x = 1;\nSELECT id,\n  clinte\nFROM vendas"
+    res = _run(engine, sql, inputs=[entrada])
+    assert res["ok"] is False and res["statement"] == 1, res
+    assert res["inputs"] == [{"alias": "vendas", "kind": "s3", "source": str(csv_vendas), "read": "s3",
+                              "columns": ["id", "cliente", "valor", "dt"]}]
+    local = locate_error(res["error"], sql, res["statement"])
+    assert (local.line, local.column, local.statement) == (3, 2, 2)
+    d = column_errors.diagnose(res["error"], "SELECT id,\n  clinte\nFROM vendas", sql, res["inputs"], None, [entrada])
+    assert d.kind == "nao_existe" and d.similar[0] == "cliente"
+
+
+def test_erro_de_sintaxe_aponta_a_linha(engine):
+    from spark_errors import locate_error
+    sql = "SELECT 1;\n\nSELECT id,\n  ) FROM range(3)"
+    res = _run(engine, sql)
+    assert res["ok"] is False and res["statement"] == 1, res
+    local = locate_error(res["error"], sql, res["statement"])
+    assert (local.line, local.column) == (4, 2), res["error"]
+
+
+def test_glue_context_coluna_do_catalogo_que_a_leitura_nao_trouxe(engine, tmp_path, awsglue_local):
+    from pyspark.sql import SparkSession
+
+    import column_errors
+    spark = SparkSession.builder.getOrCreate()
+    spark.sql(f"CREATE DATABASE IF NOT EXISTS db_diag LOCATION '{(tmp_path / 'db').as_posix()}'")
+    (spark.createDataFrame([(1, "123", "123")], ["id", "doc", "doc_str"])
+     .write.mode("overwrite").option("path", (tmp_path / "clientes").as_posix()).saveAsTable("db_diag.clientes"))
+    arquivo = tmp_path / "clientes.csv"                  # a leitura pelo GlueContext não traz a coluna nova
+    arquivo.write_text("id;doc\n1;123\n", encoding="utf-8")
+    awsglue_local.tabelas["db_diag.clientes"] = str(arquivo)
+    entrada = InputSource("clientes", "catalog", "db_diag.clientes")
+    sql = "SELECT id, doc_str FROM clientes"
+    res = engine.run(build_spark_code(sql, Orchestration(inputs=[entrada]), reader="glue_context"))
+    assert res["ok"] is False, res
+    [info] = res["inputs"]
+    assert info["read"] == "nativa" and info["columns"] == ["id", "doc"]
+    assert info["catalog"] == ["id", "doc", "doc_str"]               # o que a "role" vê no catálogo
+    d = column_errors.diagnose(res["error"], sql, sql, res["inputs"], None, [entrada], glue=True)
+    assert d.kind == "arquivos" and d.title == "A leitura de `clientes` não trouxe a coluna `doc_str`"

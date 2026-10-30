@@ -1,17 +1,20 @@
 """Passo 2: a query (editor, conferências e código gerado) e a execução."""
 from __future__ import annotations
 
+import inspect
 import time
 
 import streamlit as st
 
+import column_errors
 from code_builder import build_spark_code, split_statements, validate_orchestration
 from engines import EngineError
 from session_hub import HUB
 from sql_refs import check_query_against_orchestration, find_write_statements
 from ui import style
 from ui.editor import ace
-from ui.engine import fingerprint, reader
+from ui.engine import aws_client, fingerprint, reader
+from ui.results import error_annotations
 from ui.state import current_orchestration
 
 
@@ -30,8 +33,11 @@ def render(engine):
 
     st_ace = ace()
     if st_ace is not None:
+        # o erro da última execução fica marcado na linha (como no Athena) até a query mudar
+        marcas = error_annotations(ss.result, ss.sql) if _aceita_marcacao(st_ace) else []
         edited = st_ace(value=ss.sql, language="sql", theme="tomorrow_night", font_size=14, height=320,
-                        show_gutter=True, wrap=True, auto_update=True, key=f"ace_{ss.editor_version}")
+                        show_gutter=True, wrap=True, auto_update=True, key=f"ace_{ss.editor_version}",
+                        **({"annotations": marcas} if marcas else {}))
         if edited is not None:
             ss.sql = edited
     else:
@@ -73,6 +79,16 @@ def render(engine):
     _cancelar(engine)
     if run_clicked:
         _executar(engine, orch, ref_check, escritas, leitor)
+        if st_ace is not None and _aceita_marcacao(st_ace) and error_annotations(ss.result, ss.sql):
+            st.rerun()                    # o editor já foi desenhado: de novo, com a linha do erro marcada
+
+
+def _aceita_marcacao(st_ace) -> bool:
+    """A versão instalada do streamlit-ace aceita marcar linhas (annotations)?"""
+    try:
+        return "annotations" in inspect.signature(st_ace).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _cancelar(engine):
@@ -105,9 +121,9 @@ def _executar(engine, orch, ref_check, escritas, leitor: str):
             errors.append(str(e))
     if engine is None and not errors:
         errors.append(f"A conexão com a AWS não está pronta ({ss.engine_error}). Revise em **⚙️ Configuração**.")
-    for aviso in ref_check.warnings:
-        st.warning(aviso)
     if errors:
+        for aviso in ref_check.warnings:
+            st.warning(aviso)
         for e in errors:
             st.error(e)
         return
@@ -122,14 +138,30 @@ def _executar(engine, orch, ref_check, escritas, leitor: str):
             res = HUB.run(engine, code, lambda m: box.update(label=m), fingerprint=fingerprint())
             res["total"] = round(time.time() - t0, 1)
             # o que gerou este resultado: o "baixar todas as linhas" roda exatamente a mesma coisa
-            res["origem"] = {"sql": ss.sql, "orch": orch, "reader": leitor}
+            res["origem"] = {"sql": ss.sql, "orch": orch, "reader": leitor, "engine": ss.engine_kind,
+                             "role": (ss.account.glue_role_arn or "").rsplit("/", 1)[-1]}
+            res["warnings"] = list(ref_check.warnings)
+            if not res.get("ok") and ss.engine_kind == "glue" and column_errors.needs_user_catalog(res):
+                box.update(label="Conferindo as colunas no catálogo…")
+                res["user_catalog"] = _catalogo_do_usuario(orch)
             ss.result = res
             box.update(label=("Concluído" if res.get("ok") else "Erro na query") + f" em {res['total']}s",
                        state="complete" if res.get("ok") else "error")
         except EngineError as e:
             box.update(label="Falha", state="error")
-            ss.result = {"ok": False, "error": str(e), "traceback": "", "log": []}
+            ss.result = {"ok": False, "error": str(e), "traceback": "", "log": [],
+                         "warnings": list(ref_check.warnings)}
         except Exception as e:
             box.update(label="Falha", state="error")
-            ss.result = {"ok": False, "error": f"{type(e).__name__}: {e}", "traceback": "", "log": []}
+            ss.result = {"ok": False, "error": f"{type(e).__name__}: {e}", "traceback": "", "log": [],
+                         "warnings": list(ref_check.warnings)}
     botao_cancelar.empty()
+
+
+def _catalogo_do_usuario(orch) -> dict | None:
+    """Coluna que nenhuma entrada trouxe: as colunas que o seu usuário vê no catálogo (glue:GetTable), para a
+    tela comparar com as que a role da sessão vê. Com o Lake Formation, cada um só vê as que pode ler."""
+    try:
+        return column_errors.user_catalog_columns(aws_client("glue"), orch.inputs, orch.default_database)
+    except Exception:
+        return None

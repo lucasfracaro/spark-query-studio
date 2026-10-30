@@ -14,6 +14,15 @@ def test_coluna_nao_encontrada_sem_o_plano():
     assert "`valr` cannot be resolved" in r.detail and "SubqueryAlias" not in r.detail
 
 
+def test_coluna_do_spark_3_3_com_centenas_de_sugestoes_vira_lista_curta():
+    lista = ", ".join(f"t.c{i}" for i in range(140))
+    r = summarize(f"AnalysisException: Column 'x' does not exist. Did you mean one of the following? [{lista}]; "
+                  "line 1 pos 7;\n'Project ['x]\n")
+    assert r.title == "Coluna não encontrada"
+    assert "[t.c0, t.c1, t.c2, t.c3, t.c4, t.c5, t.c6, t.c7, … mais 132]; line 1 pos 7;" in r.detail
+    assert "t.c8," not in r.detail
+
+
 def test_erro_de_sintaxe_mostra_o_trecho():
     erro = ("ParseException: \n[PARSE_SYNTAX_ERROR] Syntax error at or near 'FRM'.(line 1, pos 9)\n\n"
             "== SQL ==\nSELECT * FRM t\n---------^^^\n")

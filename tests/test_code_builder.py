@@ -467,6 +467,35 @@ def test_erro_na_query_volta_como_resultado():
     assert res["ok"] is False
     assert "TABLE_OR_VIEW_NOT_FOUND" in res["error"]
     assert "Traceback" in res["traceback"]
+    assert res["statement"] == 0 and "inputs" not in res           # não é erro de coluna: sem o diagnóstico
+
+
+_COLUNA_33 = ("Column 'doc_str' does not exist. Did you mean one of the following? [clientes.id, clientes.doc]; "
+              "line 2 pos 2;")
+
+
+def test_erro_de_coluna_traz_o_comando_e_as_colunas_de_cada_entrada(glue_context):
+    spark = FakeSpark(columns=[("id", "int"), ("doc", "string")], fail_on="doc_str", fail_message=_COLUNA_33)
+    spark.catalog_columns["db.clientes"] = ["id", "doc"]                  # o que a role vê no catálogo
+    orch = Orchestration(inputs=[InputSource("clientes", "catalog", "db.clientes"),
+                                 InputSource("arquivo", "s3", "s3://b/p/")])
+    sql = "CREATE TEMP VIEW x AS SELECT 1;\nSELECT id,\n  doc_str FROM clientes"
+    res = run_generated(build_spark_code(sql, orch, reader="glue_context"), spark)
+    assert res["ok"] is False and res["statement"] == 1                 # o 2º comando
+    clientes, arquivo = res["inputs"]
+    assert clientes == {"alias": "clientes", "kind": "catalog", "source": "db.clientes", "read": "nativa",
+                        "columns": ["id", "doc"], "catalog": ["id", "doc"]}
+    assert arquivo["read"] == "s3" and "catalog" not in arquivo and arquivo["columns"] == ["id", "doc"]
+
+
+def test_erro_de_coluna_com_leitura_pelo_dynamic_frame_e_catalogo_inacessivel(glue_context):
+    spark, ns = FakeSpark(fail_on="nada", fail_message=_COLUNA_33), {}
+    _rodar(spark, ns, "SELECT 1", InputSource("x", "catalog", "db.x"), reader="glue_context")   # cria o GlueContext
+    glue_context[0].nativa_falha = True
+    res = _rodar(spark, ns, "SELECT nada FROM v", InputSource("v", "catalog", "tabela_v"), reader="glue_context")
+    [v] = res["inputs"]
+    assert v["read"] == "dynamicframe" and v["source"] == "tabela_v"
+    assert "TABLE_OR_VIEW_NOT_FOUND" in v["catalog_error"] and "default.tabela_v" in v["catalog_error"]
 
 
 def test_tipos_nao_json_viram_texto():

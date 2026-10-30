@@ -168,13 +168,19 @@ class _Catalog:
         return self.spark.global_views.pop(nome, None) is not None
 
     def listColumns(self, table, db=None):
-        """Colunas da tabela no catálogo; as de partição vêm de spark.partition_columns."""
+        """Colunas da tabela no catálogo; as de partição vêm de spark.partition_columns (e todas, se a tabela
+        estiver em spark.catalog_columns: o que a role da sessão vê no catálogo)."""
         from types import SimpleNamespace
         chave = f"{db}.{table}" if db else table
+        if chave in self.spark.catalog_columns:
+            return [SimpleNamespace(name=n, isPartition=False) for n in self.spark.catalog_columns[chave]]
         if chave not in self.spark.partition_columns:
             raise RuntimeError(f"[TABLE_OR_VIEW_NOT_FOUND] {chave}")
         colunas = [("id", False), ("valor", False)] + [(c, True) for c in self.spark.partition_columns[chave]]
         return [SimpleNamespace(name=n, isPartition=part) for n, part in colunas]
+
+    def currentDatabase(self):
+        return self.spark.current_db
 
 
 class _JvmSession:
@@ -186,16 +192,20 @@ class _JvmSession:
         return _FakeJdf(rdd[1])
 
 
-_COMPARTILHADOS = ("shared_cache", "cached", "uncached", "cache_cleared", "global_views", "partition_columns")
+_COMPARTILHADOS = ("shared_cache", "cached", "uncached", "cache_cleared", "global_views", "partition_columns",
+                   "catalog_columns")
 
 
 class FakeSpark:
     """Imita o pedaço da API do SparkSession que o código gerado usa."""
 
-    def __init__(self, rows=None, columns=None, fail_on=None, bad_conf=(), settings=None, parent=None):
+    def __init__(self, rows=None, columns=None, fail_on=None, bad_conf=(), settings=None, parent=None,
+                 fail_message=None):
         self.rows = rows if rows is not None else [(1, "a", None), (2, "b", 3.5), (3, "c", 1.0)]
         self.columns = columns or [("id", "int"), ("nome", "string"), ("valor", "double")]
         self.fail_on = fail_on            # texto que, se aparecer na query, gera erro
+        self.fail_message = fail_message  # a mensagem desse erro (padrão: tabela não encontrada)
+        self.current_db = "default"
         self.bad_conf = set(bad_conf)
         # configurações "iniciais" da sessão (o que o comando SET devolve)
         self.settings = dict(settings if settings is not None else {"spark.sql.catalogImplementation": "hive"})
@@ -208,6 +218,7 @@ class FakeSpark:
             self.cache_cleared = 0
             self.global_views = {}
             self.partition_columns = {}       # {"db.tabela": ["dt", ...]}: o que listColumns devolve
+            self.catalog_columns = {}         # {"db.tabela": [todas as colunas]}: idem, com as colunas todas
         self.conf = _Conf(self)
         self.catalog = _Catalog(self)
         self._jsparkSession = _JvmSession(self)
@@ -228,7 +239,7 @@ class FakeSpark:
     def newSession(self):
         """Sessão nova: começa sem views, sem configurações alteradas e no database padrão."""
         child = FakeSpark(rows=self.rows, columns=self.columns, fail_on=self.fail_on,
-                          bad_conf=self.bad_conf, settings={}, parent=self)
+                          bad_conf=self.bad_conf, settings={}, parent=self, fail_message=self.fail_message)
         self.sessions.append(child)
         return child
 
@@ -254,8 +265,10 @@ class FakeSpark:
         self.sql_log.append(query)
         if query.strip().upper() == "SET":
             return FakeDataFrame(list(self.settings.items()), [("key", "string"), ("value", "string")], self)
+        if query.strip().upper().startswith("USE "):
+            self.current_db = query.strip()[4:].strip().strip("`")
         if self.fail_on and self.fail_on in query:
-            raise RuntimeError(f"[TABLE_OR_VIEW_NOT_FOUND] {self.fail_on}")
+            raise RuntimeError(self.fail_message or f"[TABLE_OR_VIEW_NOT_FOUND] {self.fail_on}")
         return self.default_df(("sql", query))
 
 

@@ -6,11 +6,12 @@ import time
 import pandas as pd
 import streamlit as st
 
+import column_errors
 import metadata
-from code_builder import EXPORT_MAX_ROWS
+from code_builder import EXPORT_MAX_ROWS, split_statements
 from export import FORMATS, fetch_full_result, rows_to_csv_bytes
 from session_hub import HUB
-from spark_errors import summarize
+from spark_errors import QueryLocation, locate_error, summarize
 from sql_refs import missing_from_spark_error
 from ui import style
 from ui.engine import fingerprint
@@ -32,6 +33,8 @@ def render(engine=None):
         return
     style.step(3)
     st.subheader("Resultado")
+    for aviso in res.get("warnings") or []:      # da conferência da query com a orquestração
+        st.warning(aviso)
     for linha in res.get("log") or []:
         if linha.startswith("AVISO:"):          # ex.: database padrão que não existe, configuração não aplicada
             st.caption("⚠️ " + linha[len("AVISO:"):].strip())
@@ -123,10 +126,73 @@ def csv_generator(engine, origem: dict, result_key: str | None, formato: str, fp
     return gerar
 
 
+def error_location(res: dict) -> QueryLocation | None:
+    """A linha do editor onde está o erro (a da query que rodou), se o Spark disse a posição."""
+    origem = res.get("origem") or {}
+    return locate_error(res.get("error") or "", origem.get("sql") or "", res.get("statement"))
+
+
+def column_diagnosis(res: dict) -> column_errors.ColumnDiagnosis | None:
+    """Coluna não encontrada: o motivo provável (calculado uma vez e guardado no resultado)."""
+    if "_coluna" not in res:
+        origem = res.get("origem") or {}
+        sql = (origem.get("sql") or "").replace("\r\n", "\n")
+        comandos = split_statements(sql)
+        i = res.get("statement")
+        if isinstance(i, int) and 0 <= i < len(comandos):
+            comando = comandos[i]
+        else:
+            comando = comandos[0] if len(comandos) == 1 else ""
+        orch = origem.get("orch")
+        try:
+            res["_coluna"] = column_errors.diagnose(
+                res.get("error") or "", comando, sql, res.get("inputs"), res.get("user_catalog"),
+                orch.inputs if orch is not None else [], role=origem.get("role") or "",
+                glue=origem.get("engine") == "glue")
+        except Exception:                 # o diagnóstico é um extra: se falhar, fica o resumo de sempre
+            res["_coluna"] = None
+    return res["_coluna"]
+
+
+def error_headline(res: dict) -> str:
+    """O título do erro, numa linha (também vai na marcação do editor)."""
+    diag = column_diagnosis(res)
+    if diag is not None:
+        return diag.title.replace("`", "")
+    return summarize(res.get("error") or "", res.get("traceback", "")).title
+
+
+def error_annotations(res: dict | None, sql: str) -> list[dict]:
+    """Marcação do erro no editor (como no Athena), enquanto a query for a mesma que rodou."""
+    if not res or res.get("ok") or (res.get("origem") or {}).get("sql") != sql:
+        return []
+    local = error_location(res)
+    if local is None:
+        return []
+    return [{"row": local.line - 1, "column": local.column, "type": "error", "text": error_headline(res)}]
+
+
+def _onde(local: QueryLocation | None, marca: str | None = None):
+    if local is None:
+        return
+    st.markdown(f"📍 **Na query: {local.describe()}**")
+    st.code(local.snippet(marca), language="text")
+
+
 def _erro(res: dict):
     erro = res.get("error", "") or "Erro desconhecido"
-    faltando = missing_from_spark_error(erro)
-    if faltando:
+    local = error_location(res)
+    diag = column_diagnosis(res)
+    faltando = None if diag is not None else missing_from_spark_error(erro)
+    if diag is not None:
+        st.error(f"**{diag.title}**")
+        _onde(local, diag.mark)
+        st.info(diag.cause)
+        if diag.similar:
+            st.caption("Nomes parecidos: " + ", ".join(f"`{n}`" for n in diag.similar))
+        if diag.scope:
+            st.caption(diag.scope)
+    elif faltando:
         tipo, nome = faltando
         if tipo == "tabela":
             st.error(f"A base `{nome}` não foi encontrada pelo Spark. Ela precisa estar na orquestração: "
@@ -134,14 +200,19 @@ def _erro(res: dict):
         else:
             st.error(f"O banco `{nome}` não foi encontrado pelo Spark. Confira o nome na orquestração "
                      f"(Passo 1 › Entradas de dados) e o database padrão.")
+        _onde(local)
     else:
         resumo = summarize(erro, res.get("traceback", ""))
         st.error(f"**{resumo.title}**")
+        _onde(local)
         if resumo.hint:
             st.info(resumo.hint)
-        if resumo.detail and resumo.detail.strip() != resumo.title:
-            st.code(resumo.detail, language="text")
-    if res.get("traceback") or len(erro) > 300 or faltando:
+        detalhe = resumo.detail
+        if detalhe and local is not None and "== SQL" in detalhe:   # a linha já aparece acima, com o número
+            detalhe = detalhe.split("== SQL")[0].rstrip()
+        if detalhe and detalhe.strip() != resumo.title:
+            st.code(detalhe, language="text")
+    if res.get("traceback") or len(erro) > 300 or faltando or diag is not None:
         with st.expander("Mensagem completa do Spark"):
             st.code(erro + ("\n\n" + res["traceback"] if res.get("traceback") else ""), language="text")
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from code_builder import split_statements_with_positions
+
 
 @dataclass
 class ErrorSummary:
@@ -33,6 +35,8 @@ _LF_NEGADO = ("Falta permissão no Lake Formation para a role da sessão: ela pr
 _CLASSES = {
     "UNRESOLVED_COLUMN": ("Coluna não encontrada", "Confira o nome e de qual tabela ou alias ela vem. "
                           "O Spark sugere nomes parecidos no detalhe abaixo."),
+    "MISSING_COLUMN": ("Coluna não encontrada", "Confira o nome e de qual tabela ou alias ela vem. "
+                       "O Spark sugere nomes parecidos no detalhe abaixo."),
     "UNRESOLVED_ROUTINE": ("Função não encontrada", "Algumas funções do Athena têm outro nome no Spark "
                            "(a importação do Athena traduz a maioria)."),
     "PARSE_SYNTAX_ERROR": ("Erro de sintaxe no SQL", "Confira o trecho marcado com ^ abaixo. O Spark SQL difere do "
@@ -77,12 +81,16 @@ _PADROES = [
     (_tem(r"No module named '?awsglue"),
      "GlueContext indisponível", "A leitura pelo Lake Formation no Glue 4.0 usa o GlueContext, que só existe "
                                   "no Glue. No Spark local, desligue essa opção."),
+    (_tem(r"Column '[^'\n]+' does not exist|given input columns: \["),
+     "Coluna não encontrada", "Confira o nome e de qual tabela ou alias ela vem."),
     (_tem(r"Path does not exist|FileNotFoundException"),
      "Arquivo ou caminho não encontrado", "Confira o caminho. Se os arquivos foram trocados durante a leitura "
                                           "(ex.: um ETL regravou a tabela), rode de novo."),
 ]
 
 _JAVA_STACK = re.compile(r"^\s*(at |\.\.\. \d+ more)")
+_SUGESTOES = re.compile(r"(Did you mean one of the following\? \[|given input columns: \[)([^\]\n]*)\]")
+_MAX_SUGESTOES = 8
 _PLAN_LINE = re.compile(r"^\s*('|\+-|:-|:\s+[+:]-|\|)")
 _CLASS_RE = re.compile(r"\[([A-Z][A-Z0-9_]+)(?:\.[A-Z0-9_]+)*\]")
 
@@ -111,6 +119,14 @@ def _bloco_sql(texto: str) -> str | None:
     return "\n".join(bloco).strip() or None
 
 
+def _encurta_sugestoes(m: re.Match) -> str:
+    """No Spark 3.3 (Glue 4.0) a lista de "nomes parecidos" traz todas as colunas visíveis: centenas."""
+    itens = m.group(2).split(", ")
+    if len(itens) <= _MAX_SUGESTOES:
+        return m.group(0)
+    return f"{m.group(1)}{', '.join(itens[:_MAX_SUGESTOES])}, … mais {len(itens) - _MAX_SUGESTOES}]"
+
+
 def summarize(error: str, traceback: str = "") -> ErrorSummary:
     error = (error or "").strip()
     tudo = f"{error}\n{traceback or ''}"
@@ -121,7 +137,7 @@ def summarize(error: str, traceback: str = "") -> ErrorSummary:
         principal = error.split("\n: ", 1)[1]
     causas = re.findall(r"^Caused by: (.+)$", tudo, re.M)
 
-    linhas = _sem_pilha_e_plano(principal)
+    linhas = [_SUGESTOES.sub(_encurta_sugestoes, linha) for linha in _sem_pilha_e_plano(principal)]
     detalhe = "\n".join(linhas[:12]) if linhas else error
     sql = _bloco_sql(tudo)
     if sql and sql not in detalhe:
@@ -145,3 +161,100 @@ def summarize(error: str, traceback: str = "") -> ErrorSummary:
     primeira = re.sub(r"^(\w+\.)*(\w+(Exception|Error)): ", "", primeira)
     titulo = primeira if len(primeira) <= 160 else primeira[:157] + "…"
     return ErrorSummary(titulo or "Erro na execução", detalhe, None, classe)
+
+
+# --------------------------------------------------------------------------------------------
+# Onde está o erro na query
+# --------------------------------------------------------------------------------------------
+# O Spark diz a linha e a posição dentro do comando que ele recebeu (a query é dividida nos ';'):
+# (expressão, quanto subtrair da posição para ela começar do 0)
+_POSICOES = (
+    (re.compile(r"== SQL ?\(line (\d+), position (\d+)\) =="), 1),    # erro durante a execução (Spark 3.4+)
+    (re.compile(r"\(line (\d+), pos (\d+)\)"), 0),                     # erro de sintaxe
+    (re.compile(r"\bline (\d+) pos (\d+)\b"), 0),                      # erro de análise (coluna, tabela...)
+)
+_LARGURA = 110                    # trecho mostrado de uma linha muito longa
+
+
+def error_position(error: str) -> tuple[int, int] | None:
+    """(linha, posição) do erro dentro do comando: linha a partir de 1, posição a partir de 0."""
+    for regex, base in _POSICOES:
+        m = regex.search(error or "")
+        if m:
+            return int(m.group(1)), max(0, int(m.group(2)) - base)
+    return None
+
+
+@dataclass
+class QueryLocation:
+    line: int                     # linha no editor (1, 2, ...)
+    column: int                   # posição na linha do editor (0, 1, ...)
+    statement: int                # comando (1, 2, ...)
+    statements: int               # quantos comandos a query tem
+    text: str                     # a linha do editor
+    previous: str | None = None   # a linha de cima (contexto)
+
+    def describe(self) -> str:
+        texto = f"linha {self.line}, coluna {self.column + 1}"
+        return texto + (f" (comando {self.statement} de {self.statements})" if self.statements > 1 else "")
+
+    def snippet(self, mark: str | None = None) -> str:
+        """A linha do erro (e a de cima), numeradas, com ^ embaixo do trecho. mark: o nome que o Spark não
+        encontrou, para sublinhar o nome inteiro (com o alias) em vez de um caractere só."""
+        largura_num = len(str(self.line))
+        linha, coluna = self.text.expandtabs(4), len(self.text[:self.column].expandtabs(4))
+        tamanho = _tamanho_da_marca(self.text, self.column, mark)
+        corte = 0
+        if len(linha) > _LARGURA:                       # query numa linha só: mostra o pedaço em volta do erro
+            corte = max(0, min(coluna - _LARGURA // 3, len(linha) - _LARGURA))
+            linha = ("…" if corte else "") + linha[corte:corte + _LARGURA] + ("…" if corte + _LARGURA < len(linha)
+                                                                              else "")
+            coluna = coluna - corte + (1 if corte else 0)
+        saida = []
+        if self.previous is not None and self.previous.strip() and not corte:
+            saida.append(f"{self.line - 1:>{largura_num}} | {self.previous.expandtabs(4).rstrip()}")
+        saida.append(f"{self.line:>{largura_num}} | {linha.rstrip()}")
+        saida.append(f"{'':>{largura_num}} | {' ' * coluna}{'^' * tamanho}")
+        return "\n".join(saida)
+
+
+def _tamanho_da_marca(linha: str, coluna: int, mark: str | None) -> int:
+    """Quantos ^: o tamanho do nome escrito naquela posição (com ou sem crases e espaços em volta do ponto)."""
+    if not mark:
+        return 1
+    partes = [re.escape(p) for p in mark.split(".") if p]
+    if not partes:
+        return 1
+    padrao = r"\s*\.\s*".join(r"`?" + p + r"`?" for p in partes)
+    m = re.compile(padrao, re.I).match(linha, coluna)
+    return max(1, m.end() - m.start()) if m else 1
+
+
+def locate(sql: str, statement_index: int | None, line: int, column: int) -> QueryLocation | None:
+    """Converte (comando, linha e posição dentro do comando) na linha e coluna do editor.
+    statement_index: o comando que falhou, a partir de 0 (None se não se sabe: só dá com um comando)."""
+    sql = (sql or "").replace("\r\n", "\n")
+    comandos = split_statements_with_positions(sql)
+    if statement_index is None and len(comandos) == 1:
+        statement_index = 0
+    if statement_index is None or not 0 <= statement_index < len(comandos):
+        return None
+    linha0, coluna0, texto = comandos[statement_index]
+    if not 1 <= line <= texto.count("\n") + 1:
+        return None
+    linhas = sql.split("\n")
+    numero = linha0 + line - 1
+    if numero > len(linhas):
+        return None
+    coluna = column + (coluna0 if line == 1 else 0)
+    texto_linha = linhas[numero - 1]
+    return QueryLocation(numero, min(coluna, len(texto_linha)), statement_index + 1, len(comandos), texto_linha,
+                         linhas[numero - 2] if numero >= 2 else None)
+
+
+def locate_error(error: str, sql: str, statement_index: int | None) -> QueryLocation | None:
+    """A linha do editor onde está o erro, se o Spark disse a posição."""
+    posicao = error_position(error)
+    if posicao is None or not sql:
+        return None
+    return locate(sql, statement_index, *posicao)
