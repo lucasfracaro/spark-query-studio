@@ -505,3 +505,63 @@ def test_barra_lateral_sugere_a_ultima_estimativa(novo_app):
     inst = at.session_state["instance"]
     assert (inst.worker_type, inst.num_workers) == ("G.2X", 9)
     assert not any("**G.2X × 9**" in c.value for c in at.sidebar.caption)     # já está em uso
+
+
+# --------------------------------------------------------------------------- database padrão
+def _campo_db(at):
+    return next(t for t in at.text_input if t.label == "Database padrão (USE)")
+
+
+def test_database_padrao_vem_preenchido_e_pode_ficar_vazio(config_file, novo_app):
+    at = novo_app()
+    assert _campo_db(at).value == "workspace_db" and at.session_state["default_db"] == "workspace_db"
+    config_file.write_text('[instancia]\ndatabase_padrao = ""\n', encoding="utf-8")
+    at = novo_app()
+    assert _campo_db(at).value == "" and at.session_state["default_db"] == ""
+
+
+def test_database_padrao_da_configuracao_vale_a_nao_ser_que_tenha_sido_trocado(janela):
+    at = janela("config")
+    _campo_db(at).set_value("analytics_db").run()
+    _botao(at, "Aplicar").click().run()
+    assert at.session_state["default_db"] == "analytics_db"            # seguiu a configuração
+    at.session_state["default_db"] = "meu_db"                          # trocado na orquestração
+    at.run()
+    _campo_db(at).set_value("outro_db").run()
+    _botao(at, "Aplicar").click().run()
+    assert at.session_state["default_db"] == "meu_db"                   # a escolha da orquestração fica
+
+
+def test_aviso_do_log_aparece_no_resultado(app, monkeypatch):
+    aviso = "AVISO: o database padrão workspace_db não foi usado (Database not found). A query segue sem ele."
+    _motor_falso(monkeypatch, {"ok": True, "elapsed": 0.1, "log": ["USE x", aviso],
+                               "columns": [{"name": "id", "type": "int"}], "rows": [[1]]})
+    app.session_state["engine_kind"] = "local"
+    _botao(app, "Executar").click().run()
+    assert not app.exception, app.exception
+    assert any(c.value.startswith("⚠️ o database padrão workspace_db não foi usado") for c in app.caption)
+
+
+# --------------------------------------------------------------------------- resultado completo
+def test_preparar_e_baixar_o_csv_completo(app, monkeypatch):
+    import ui.results
+    _motor_falso(monkeypatch, {"ok": True, "elapsed": 0.1, "log": [],
+                               "columns": [{"name": "id", "type": "int"}], "rows": [[1], [2]]})
+    pedidos = []
+
+    def completo(run, sql, orch, reader, formato, on_status=None, **k):
+        pedidos.append((sql, orch.default_database, reader, formato))
+        return "﻿id\n1\n2\n3\n".encode(), {"rows": 3, "truncated": False, "bytes": 30, "chunks": 1}
+
+    monkeypatch.setattr(ui.results, "fetch_full_result", completo)
+    app.session_state["engine_kind"] = "local"
+    app.text_area[0].set_value("SELECT id FROM minha_view").run()
+    _botao(app, "Executar").click().run()
+    assert not app.exception, app.exception
+    assert not any("Baixar CSV completo" in b.label for b in app.get("download_button"))
+    _botao(app, "Preparar CSV com todas as linhas").click().run()
+    assert not app.exception, app.exception
+    assert pedidos == [("SELECT id FROM minha_view", "workspace_db", "spark", "excel_br")]   # a mesma execução
+    assert any("Baixar CSV completo (3 linhas" in b.label for b in app.get("download_button"))
+    _botao(app, "Executar").click().run()                    # resultado novo: o arquivo antigo some
+    assert not any("Baixar CSV completo" in b.label for b in app.get("download_button"))

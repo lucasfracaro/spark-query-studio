@@ -81,6 +81,8 @@ GLUE_VERSIONS = {
     "4.0": "Spark 3.3 · Python 3.10",
 }
 DEFAULT_GLUE_VERSION = "5.0"
+# Database das tabelas escritas sem database (USE) e do DDL. Pode ser trocado (ou deixado vazio) na tela.
+DEFAULT_DATABASE = "workspace_db"
 GLUE_VERSION_NOTES = {
     "6.0": ("O Glue 6.0 usa Spark 4.1 com o modo ANSI ligado: overflow, divisão por zero e cast inválido "
             "viram erro em vez de NULL. Se a produção roda Glue 5.x, teste com 5.x."),
@@ -182,6 +184,7 @@ class InstanceConfig:
     tags: dict[str, str] = field(default_factory=dict)
     start_on_open: bool = False      # iniciar a sessão em segundo plano assim que o app abre
     lake_formation: bool = False     # ler as tabelas do catálogo com as permissões do Lake Formation
+    default_database: str = DEFAULT_DATABASE   # USE de cada execução; vazio = nenhum (não muda a sessão)
 
     def signature(self) -> str:
         """Resumo da configuração que define a sessão, para mostrar na tela. O Lake Formation só entra

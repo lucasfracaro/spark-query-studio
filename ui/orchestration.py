@@ -90,8 +90,9 @@ def athena_body():
     inicial = up.getvalue().decode("utf-8", errors="replace") if up is not None else ""
     sql_athena = st.text_area("Query do Athena", inicial, height=260, key=f"athena_sql_{up.file_id if up else 0}")
     c1, c2 = st.columns(2)
-    db_padrao = c1.text_input("Database padrão", ss.default_db,
-                              help="Usado para tabelas escritas sem database na query.")
+    db_padrao = c1.text_input("Database padrão", ss.default_db, placeholder="opcional",
+                              help="Usado para tabelas escritas sem database na query e como USE na execução. Vem "
+                                   "da configuração (⚙️) e pode ficar vazio.")
     usar_glue = c2.checkbox("Consultar o Glue para saber as colunas de partição", ss.engine_kind == "glue",
                             help="Sem o Glue, as colunas de partição são supostas pelo nome (dt, anomes...).")
     estimar = c2.checkbox("Estimar o tamanho da sessão (workers e tipo de worker)", ss.engine_kind == "glue",
@@ -207,10 +208,14 @@ def render():
 
     with t_opt:
         c1, c2 = st.columns(2)
-        ss.default_db = c1.text_input("Database padrão (USE)", ss.default_db, placeholder="opcional")
+        ss.default_db = c1.text_input(
+            "Database padrão (USE)", ss.default_db, placeholder="opcional",
+            help="Usado nas tabelas escritas sem database e no DDL. Vem da configuração (⚙️) e pode ficar vazio. Se "
+                 "ele não existir ou a role não tiver acesso, a query roda assim mesmo e o log avisa.").strip()
         ss.row_limit = c2.number_input("Linhas exibidas", 1, 10000, int(ss.row_limit),
                                        help="Apenas estas linhas são trazidas para a tela; a query roda inteira "
-                                            "no cluster.")
+                                            "no cluster. Para baixar todas as linhas, use **📦 Preparar CSV com "
+                                            "todas as linhas** no resultado.")
         ss.check_refs = st.checkbox(
             "Bloquear a execução se a query usar uma base que não está na orquestração", ss.check_refs,
             help="A conferência é feita antes de enviar ao cluster. Desligue só se ela acusar uma base por engano.")

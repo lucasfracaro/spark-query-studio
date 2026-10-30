@@ -116,6 +116,31 @@ def test_catalog_sem_database():
     assert validate_orchestration(_orch(InputSource("v", "catalog", "tabela"), default_database="db")) == []
 
 
+def test_codigo_de_exportacao_so_quando_pedido():
+    orch = Orchestration(inputs=[InputSource("v", "catalog", "db.v")])
+    normal = build_spark_code("SELECT * FROM v", orch, profile=True)
+    assert "def _exportar" not in normal and "#__EXPORT__" not in normal
+    exportar = build_spark_code("SELECT * FROM v", orch, profile=True,
+                                export={"format": "excel_br", "sep": ";", "max_rows": 10, "chunk": 100})
+    assert "def _exportar" in exportar and "'profile': False" in exportar        # sem estatísticas na exportação
+
+
+def test_database_padrao_invalido_e_vazio():
+    assert any("Database padrão `meu db` inválido" in e
+               for e in validate_orchestration(_orch(InputSource("v", "catalog", "db.t"), default_database="meu db")))
+    assert validate_orchestration(_orch(InputSource("v", "catalog", "db.t"), default_database="")) == []
+
+
+def test_database_padrao_que_nao_existe_nao_impede_a_query():
+    orch = Orchestration(inputs=[InputSource("vendas", "catalog", "db.vendas")], default_database="workspace_db")
+    spark = FakeSpark(fail_on="workspace_db")                   # o USE falha (database não existe / sem acesso)
+    res = run_generated(build_spark_code("SELECT * FROM vendas", orch), spark)
+    assert res["ok"] is True and res["rows"]
+    assert spark.last_session.sql_log == ["USE `workspace_db`", "SELECT * FROM vendas"]
+    aviso = next(linha for linha in res["log"] if linha.startswith("AVISO:"))
+    assert "workspace_db não foi usado" in aviso and "database.tabela" in aviso
+
+
 @pytest.mark.parametrize("limit", [0, 10001])
 def test_limite_fora_da_faixa(limit):
     assert validate_orchestration(_orch(limit=limit))
@@ -155,7 +180,7 @@ def test_execucao_completa():
     assert res["rows"] == [[1, "a", None], [2, "b", 3.5]]           # limite aplicado
     s = spark.last_session                                          # tudo roda numa sessão nova
     assert s.conf_values == {"spark.sql.catalogImplementation": "hive", "spark.sql.shuffle.partitions": "10"}
-    assert s.sql_log == ["USE analytics", "SET x=1", "SELECT * FROM vendas"]
+    assert s.sql_log == ["USE `analytics`", "SET x=1", "SELECT * FROM vendas"]
     assert set(s.views) == {"vendas", "clientes"}
     assert ("where", "dt >= '2026-01-01'") in s.calls
     assert ("load", "csv", "s3://b/clientes/", {"header": "true", "sep": ";"}) in s.calls

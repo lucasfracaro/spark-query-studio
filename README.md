@@ -44,12 +44,14 @@ versao_glue = "4.0"
 minutos_sem_uso = 30
 lake_formation = true          # ler tabelas de outra conta, como o Athena (veja abaixo)
 iniciar_ao_abrir = false
+database_padrao = "workspace_db"   # USE de cada execução e database do DDL; "" = nenhum
 ```
 
 - **⚙️ Configuração** (barra lateral) mostra o que foi lido do arquivo e deixa corrigir pelo formulário ou pelo texto do arquivo. **Aplicar** usa os valores enquanto o app estiver aberto; **Salvar no arquivo** grava para as próximas vezes. Sem o arquivo, a primeira gravação cria o `configuracao.toml`.
 - Se o arquivo tiver um problema (erro de digitação, região inválida, chave com nome errado, perfil que não existe no computador), o app abre mesmo assim, usa o valor padrão onde havia erro e mostra no topo o que corrigir, com um botão que abre a configuração.
 - Para usar um arquivo em outro lugar: `SQS_CONFIG=/caminho/minha_config.toml ./run.sh`.
 - Chaves de acesso (`access_key`/`secret_key`) só vão para o arquivo se você marcar **Guardar as chaves no arquivo**. Nesse caso o arquivo fica legível só pelo seu usuário. Prefira um perfil do AWS CLI.
+- **Database padrão** (`database_padrao`, padrão `workspace_db`): vem preenchido na orquestração (aba **⚙️ Opções**), na importação do Athena e no DDL, e pode ser trocado em cada orquestração ou deixado vazio. Ele vira um `USE` no começo de cada execução e vale para as tabelas escritas sem database. Escrever `database.tabela` na query continua funcionando sempre. Se o database não existir ou a role não tiver acesso a ele, a query roda assim mesmo e o resultado mostra um aviso.
 
 ## Fluxo
 
@@ -70,7 +72,7 @@ iniciar_ao_abrir = false
 5. **Conferência da orquestração**: antes de enviar ao cluster, a query é lida e cada base usada em `FROM`/`JOIN` é comparada com as entradas da orquestração. Se faltar alguma, a execução é bloqueada com uma mensagem como *"A base `db.produtos` é usada na query (linha 3), mas não está na orquestração"*. O aviso já aparece embaixo do editor enquanto você digita. CTEs (`WITH`), views criadas na própria query, subqueries e funções como `range()` não são cobradas. Se o Spark ainda assim não encontrar uma tabela, o erro dele é traduzido para a mesma mensagem. A conferência pode ser desligada em **Opções**.
 6. **🔒 Modo somente leitura** (ligado por padrão): comandos que gravam ou alteram dados ou o catálogo (`INSERT`, `CREATE TABLE`, `DROP`, `ALTER`, `MERGE`, `DELETE`, `MSCK REPAIR`…) são bloqueados antes de ir para o cluster, com o número e a linha do comando. Consultas e comandos que só afetam a sessão (`CREATE TEMP VIEW`, `CACHE TABLE`, `SET`, `USE`) rodam normalmente. A role do Glue costuma ter permissão de escrita, então um comando esquecido na query gravaria de verdade; para executar mesmo assim, ligue **Permitir comandos que gravam** em **Opções**.
 7. **▶️ Executar**: veja [Sessão e velocidade](#sessão-e-velocidade). Durante a execução no Glue aparece **⏹️ Cancelar execução**, que cancela a query no cluster.
-8. **Passo 3 – Resultado**: mostra as N primeiras linhas, o schema e o log. **Exportar CSV** baixa o arquivo para o seu PC. O formato padrão é o do **Excel em português** (`;` como separador e vírgula nos decimais, com UTF-8 BOM para os acentos); também há o padrão internacional (`,` e ponto) e tabulação. Quando a query falha, o erro aparece resumido (sem o plano da query e sem a pilha do Java), com um título em português e, quando dá para saber, o que fazer; a mensagem completa fica logo abaixo.
+8. **Passo 3 – Resultado**: mostra as N primeiras linhas (**Linhas exibidas**, em ⚙️ Opções: 100 por padrão, até 10 mil), o schema e o log. **CSV das linhas exibidas** baixa essas linhas. **📦 Preparar CSV com todas as linhas** roda a mesma query de novo na sessão e traz o resultado inteiro, até 1.048.575 linhas (o máximo do Excel): as linhas vão para um CSV comprimido no driver da sessão e voltam em partes de 2 MB pela própria API da sessão, sem bucket e sem Athena. As execuções normais continuam trazendo só as linhas exibidas, então não ficam mais lentas. O formato padrão é o do **Excel em português** (`;` como separador e vírgula nos decimais, com UTF-8 BOM para os acentos); também há o padrão internacional (`,` e ponto) e tabulação, e os dois CSVs saem no mesmo formato. Quando a query falha, o erro aparece resumido (sem o plano da query e sem a pilha do Java), com um título em português e, quando dá para saber, o que fazer; a mensagem completa fica logo abaixo.
 
 ## Sessão e velocidade
 
@@ -236,7 +238,7 @@ O GitHub Actions roda tudo a cada push: o verificador de código, os testes unit
 
 ## Próximos passos possíveis
 
-- Exportar o resultado **completo** para `s3://` (`df.write.csv(...)`) além das 100 linhas.
+- Gravar resultados maiores que o limite do Excel direto num bucket da própria conta (`df.write.parquet(...)`).
 - Adicionar EMR Serverless como terceiro motor (mesma interface em `engines.py`).
 - Histórico de queries executadas.
 

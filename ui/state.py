@@ -34,7 +34,9 @@ def init():
     ss.setdefault("orch_version", 0)   # muda a key dos editores ao importar
     ss.inputs_df = ss.inputs_base
     ss.conf_df = ss.conf_base
-    ss.setdefault("default_db", "")
+    # database padrão: vem da configuração e pode ser trocado na orquestração (vazio = nenhum)
+    ss.setdefault("config_default_db", ss.instance.default_database)
+    ss.setdefault("default_db", ss.config_default_db)
     ss.setdefault("row_limit", DEFAULT_LIMIT)
     ss.setdefault("check_refs", True)
     ss.setdefault("profile", False)
@@ -100,3 +102,8 @@ def apply_config(lc: settings_store.LoadedConfig | None = None, account=None, in
     if instance is not None:
         ss.instance = instance
         ss.pop("args_base", None)          # o editor de argumentos extras é recriado
+        # o database padrão da tela segue o da configuração, a não ser que tenha sido trocado na orquestração
+        anterior = ss.get("config_default_db", "")
+        if ss.get("default_db", anterior) == anterior:
+            ss.default_db = instance.default_database
+        ss.config_default_db = instance.default_database

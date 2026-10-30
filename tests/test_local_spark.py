@@ -280,3 +280,24 @@ def test_glue_context_separa_o_filtro_pelas_particoes_do_catalogo(engine, tmp_pa
     # só a parte de partição foi para a leitura; a outra foi aplicada depois
     assert awsglue_local.leituras == [("nativa", "db_sqs", "vendas", "dt = '2026-10-02'")]
     assert any("aplicado depois da leitura: valor > 20" in linha for linha in r["log"])
+
+
+def test_resultado_completo_traz_todas_as_linhas(engine):
+    from export import fetch_full_result, rows_to_csv_bytes
+    sql = "SELECT id, CAST(id / 2 AS DECIMAL(10,1)) AS metade, IF(id % 3 = 0, NULL, 'x;' || id) AS t FROM range(5000)"
+    orch = Orchestration(limit=10)
+    tela = engine.run(build_spark_code(sql, orch))
+    assert tela["ok"] and len(tela["rows"]) == 10
+    dados, info = fetch_full_result(lambda codigo, on_status: engine.run(codigo), sql, orch, chunk_bytes=4096)
+    assert info["rows"] == 5000 and not info["truncated"] and info["chunks"] > 1
+    linhas = dados.decode("utf-8-sig").splitlines()
+    assert len(linhas) == 5001 and linhas[0] == "id;metade;t"
+    # as primeiras linhas são as mesmas do CSV da tela, no mesmo formato
+    inicio = rows_to_csv_bytes(["id", "metade", "t"], tela["rows"], [c["type"] for c in tela["columns"]])
+    assert dados.startswith(inicio)
+
+
+def test_database_padrao_que_nao_existe_so_avisa(engine):
+    res = _run(engine, "SELECT 1 AS um", default_database="nao_existe_aqui")
+    assert res["ok"], res
+    assert any(linha.startswith("AVISO: o database padrão nao_existe_aqui") for linha in res["log"])

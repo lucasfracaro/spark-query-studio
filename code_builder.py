@@ -28,6 +28,8 @@ from dataclasses import asdict, dataclass, field
 RESULT_MARKER = "__SQS_RESULT__"
 DEFAULT_LIMIT = 100
 GLUE_CODE_LIMIT = 68_000   # tamanho máximo do campo Code do RunStatement (API do Glue)
+EXPORT_MAX_ROWS = 1_048_575          # resultado completo: o máximo que o Excel abre (1.048.576 com o cabeçalho)
+EXPORT_CHUNK_BYTES = 2 * 1024 * 1024  # o arquivo do resultado completo volta em partes deste tamanho
 READERS = ("spark", "glue_context")
 
 
@@ -146,6 +148,7 @@ def parse_options(texto: str) -> dict[str, str]:
 
 
 _ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+DATABASE_RE = re.compile(r"^[A-Za-z0-9_]+$")          # nomes de database do Glue/Athena
 
 
 def validate_orchestration(orch: Orchestration) -> list[str]:
@@ -163,6 +166,9 @@ def validate_orchestration(orch: Orchestration) -> list[str]:
             errors.append(f"Entrada '{inp.alias}': caminho deve começar com s3:// (ou ser um caminho local).")
         if inp.kind == "catalog" and "." not in inp.source and not orch.default_database:
             errors.append(f"Entrada '{inp.alias}': use 'database.tabela' ou defina um database padrão.")
+    db = (orch.default_database or "").strip()
+    if db and not DATABASE_RE.match(db):
+        errors.append(f"Database padrão `{db}` inválido: use só letras, números e _ (ou deixe vazio).")
     if not (1 <= int(orch.limit) <= 10000):
         errors.append("Limite de linhas deve estar entre 1 e 10000.")
     return errors
@@ -215,6 +221,7 @@ def _valor(_x):
         return format(_x, "f")              # "1.50" (e zero com casas decimais não vira "0E-10")
     return str(_x)
 
+#__EXPORT__
 
 try:
     try:
@@ -240,9 +247,16 @@ try:
         except Exception as _e:
             _log.append("AVISO: conf " + _k + " não aplicada (" + str(_e).splitlines()[0] + ")")
 
+    # O database padrão é uma conveniência: se ele não existir (ou a role não tiver acesso), a query roda
+    # assim mesmo no database atual, e as tabelas escritas como database.tabela funcionam normalmente.
     if _p["db"]:
-        _s.sql("USE " + _p["db"])
-        _log.append("USE " + _p["db"])
+        try:
+            _s.sql("USE `" + _p["db"] + "`")
+            _log.append("USE " + _p["db"])
+        except Exception as _e:
+            _log.append("AVISO: o database padrão " + _p["db"] + " não foi usado ("
+                        + (str(_e).strip().splitlines() or [""])[0][:200] + "). A query segue sem ele: "
+                        "escreva as tabelas como database.tabela.")
 
     # Cache entre execuções: o que foi marcado com "cache" continua em memória na sessão e não é relido
     # do S3 enquanto a definição não mudar. O que saiu da orquestração (ou da query) é liberado.
@@ -384,8 +398,12 @@ try:
     _fields = _df.schema.fields
     _cols = [{"name": _f.name, "type": _f.dataType.simpleString(), "nullable": bool(getattr(_f, "nullable", True))}
              for _f in _fields]
-    _rows = [[_valor(_x) for _x in _row] for _row in _df.limit(_p["limit"]).collect()]
-    _out = {"ok": True, "columns": _cols, "rows": _rows, "elapsed": round(_time.time() - _t0, 2), "log": _log}
+    if _p.get("export"):
+        _out = {"ok": True, "columns": _cols, "export": _exportar(_df, _cols, _p["export"]),
+                "elapsed": round(_time.time() - _t0, 2), "log": _log}
+    else:
+        _rows = [[_valor(_x) for _x in _row] for _row in _df.limit(_p["limit"]).collect()]
+        _out = {"ok": True, "columns": _cols, "rows": _rows, "elapsed": round(_time.time() - _t0, 2), "log": _log}
 
     if _p["profile"] and _fields:
         # estatísticas no resultado COMPLETO (uma agregação só, colunas renomeadas por posição)
@@ -476,7 +494,8 @@ def filter_parts(texto: str) -> list[dict]:
     return saida
 
 
-def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reader: str = "spark") -> str:
+def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reader: str = "spark",
+                     export: dict | None = None) -> str:
     """Monta o script PySpark que cria as entradas, roda a query e imprime o resultado.
 
     O código mostrado na tela é exatamente o que roda. Se a versão legível passar do limite do
@@ -508,13 +527,85 @@ def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reade
         "sql_caches": caches_sql,
         "marker": RESULT_MARKER,
     }
-    code = _TEMPLATE.replace("#__PAYLOAD__", _payload_readable(statements, payload))
+    template = _TEMPLATE.replace("#__EXPORT__\n", "")
+    if export:
+        # resultado completo: export = {"format", "sep", "max_rows", "chunk"}; sem estatísticas
+        payload["export"] = dict(export)
+        payload["profile"] = False
+        template = _TEMPLATE.replace("#__EXPORT__\n", _EXPORT_FUNCTION.lstrip("\n") + "\n\n")
+    code = template.replace("#__PAYLOAD__", _payload_readable(statements, payload))
     if len(code) > GLUE_CODE_LIMIT:
-        code = _TEMPLATE.replace("#__PAYLOAD__", _payload_compressed(statements, payload))
+        code = template.replace("#__PAYLOAD__", _payload_compressed(statements, payload))
     if len(code) > GLUE_CODE_LIMIT:
         raise ValueError(f"A query é grande demais para o Glue: mesmo comprimido, o código tem "
                          f"{len(code):,} caracteres e o limite é {GLUE_CODE_LIMIT:,}.".replace(",", "."))
     return code
+
+
+# Resultado completo: todas as linhas vão para um CSV comprimido no driver da sessão (lidas aos poucos,
+# partição por partição) e depois voltam em partes (build_export_chunk_code). Mesmo formato do CSV da tela.
+_EXPORT_FUNCTION = r"""
+def _exportar(_df, _cols, _cfg):
+    import csv as _csv, glob as _glob, gzip as _gzip, math as _math, os as _os, tempfile as _tf
+    for _velho in _glob.glob(_os.path.join(_tf.gettempdir(), "sqs_export_*.csv.gz")):
+        try:
+            _os.remove(_velho)
+        except OSError:
+            pass
+    _arq = _os.path.join(_tf.gettempdir(), "sqs_export_%d.csv.gz" % int(_time.time() * 1000))
+    _virgula = _cfg["format"] == "excel_br"
+    _decimais = [_c["type"].split("(")[0].strip().lower() in ("decimal", "double", "float", "real") for _c in _cols]
+
+    def _celula(_v, _decimal):
+        _v = _valor(_v)
+        if _v is None:
+            return ""
+        if isinstance(_v, bool):
+            return "True" if _v else "False"
+        if isinstance(_v, float):
+            if _math.isnan(_v):
+                return ""
+            if _math.isinf(_v):
+                return ("Infinito" if _v > 0 else "-Infinito") if _virgula else ("inf" if _v > 0 else "-inf")
+            _texto = repr(_v)
+            if _virgula and ("e" in _texto or "E" in _texto):
+                _texto = ("%.20f" % _v).rstrip("0").rstrip(".")
+        else:
+            _texto = str(_v)
+        return _texto.replace(".", ",") if (_virgula and _decimal) else _texto
+
+    _n, _cortado = 0, False
+    with _gzip.open(_arq, "wt", encoding="utf-8", newline="") as _f:
+        _w = _csv.writer(_f, delimiter=_cfg["sep"], lineterminator="\n")
+        _w.writerow([_c["name"] for _c in _cols])
+        for _row in _df.toLocalIterator():
+            if _n >= _cfg["max_rows"]:
+                _cortado = True
+                break
+            _w.writerow([_celula(_v, _d) for _v, _d in zip(_row, _decimais)])
+            _n += 1
+    _tam = _os.path.getsize(_arq)
+    _log.append("resultado completo: %d linhas em %s (%d bytes comprimidos)" % (_n, _arq, _tam))
+    return {"file": _arq, "rows": _n, "truncated": _cortado, "bytes": _tam,
+            "chunks": max(1, -(-_tam // _cfg["chunk"]))}
+"""
+
+_EXPORT_CHUNK = r"""
+import base64 as _b64, json as _json, zlib as _zlib
+try:
+    with open(#__PATH__, "rb") as _f:
+        _f.seek(#__START__)
+        _out = {"ok": True, "chunk": _b64.b64encode(_f.read(#__SIZE__)).decode("ascii")}
+except Exception as _e:
+    _out = {"ok": False, "error": type(_e).__name__ + ": " + str(_e)}
+print(#__MARKER__ + _b64.b64encode(_zlib.compress(_json.dumps(_out).encode("utf-8"), 1)).decode("ascii"))
+""".strip()
+
+
+def build_export_chunk_code(path: str, index: int, size: int = EXPORT_CHUNK_BYTES) -> str:
+    """Código que devolve a parte `index` do arquivo do resultado completo (em base64, no formato de sempre)."""
+    return (_EXPORT_CHUNK.replace("#__PATH__", json.dumps(path)).replace("#__START__", str(int(index) * int(size)))
+            .replace("#__SIZE__", str(int(size))).replace("#__MARKER__", json.dumps(RESULT_MARKER)))
 
 
 _CLEAR_CACHE = r"""

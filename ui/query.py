@@ -121,6 +121,8 @@ def _executar(engine, orch, ref_check, escritas, leitor: str):
         try:
             res = HUB.run(engine, code, lambda m: box.update(label=m), fingerprint=fingerprint())
             res["total"] = round(time.time() - t0, 1)
+            # o que gerou este resultado: o "baixar todas as linhas" roda exatamente a mesma coisa
+            res["origem"] = {"sql": ss.sql, "orch": orch, "reader": leitor}
             ss.result = res
             box.update(label=("Concluído" if res.get("ok") else "Erro na query") + f" em {res['total']}s",
                        state="complete" if res.get("ok") else "error")

@@ -24,6 +24,7 @@ try:
 except ModuleNotFoundError:          # Python 3.10
     import tomli as tomllib
 
+from code_builder import DATABASE_RE
 from engines import (
     DEFAULT_GLUE_VERSION,
     DEFAULT_WORKER_TYPE,
@@ -54,7 +55,8 @@ _AWS_KEYS = {"regiao": "region", "autenticacao": "auth_mode", "perfil": "profile
              "session_token": "session_token"}
 _INST_KEYS = {"tipo_worker": "worker_type", "workers": "num_workers", "versao_glue": "glue_version",
               "minutos_sem_uso": "idle_timeout_min", "lake_formation": "lake_formation",
-              "iniciar_ao_abrir": "start_on_open", "argumentos_extras": "extra_args", "tags": "tags"}
+              "iniciar_ao_abrir": "start_on_open", "database_padrao": "default_database",
+              "argumentos_extras": "extra_args", "tags": "tags"}
 
 
 @dataclass
@@ -173,6 +175,13 @@ def from_dict(data: dict) -> tuple[AwsAccount, InstanceConfig, list[str], bool]:
             inst.idle_timeout_min = _as_int(valor, chave, MIN_IDLE, MAX_IDLE, inst.idle_timeout_min, problemas)
         elif campo in ("lake_formation", "start_on_open"):
             setattr(inst, campo, _as_bool(valor, chave, getattr(inst, campo), problemas))
+        elif campo == "default_database":
+            nome = str(valor).strip() if isinstance(valor, (str, int)) and not isinstance(valor, bool) else None
+            if nome is not None and (not nome or DATABASE_RE.match(nome)):
+                inst.default_database = nome
+            else:
+                problemas.append(f"`database_padrao` = {valor!r} não é um nome de database (use letras, números "
+                                 f"e _, ou \"\" para nenhum); usei {inst.default_database!r}.")
         else:
             setattr(inst, campo, _as_str_dict(valor, chave, problemas))
 
@@ -197,6 +206,9 @@ def check(account: AwsAccount, instance: InstanceConfig | None = None, profiles:
                          f"Perfis encontrados: {', '.join(profiles)}.")
     if require_keys and account.auth_mode == "keys" and not (account.access_key and account.secret_key):
         problemas.append("Com autenticação por chaves, informe a access key e a secret key.")
+    if instance is not None and instance.default_database and not DATABASE_RE.match(instance.default_database):
+        problemas.append(f"Database padrão `{instance.default_database}` inválido: use só letras, números e _ "
+                         "(ou deixe vazio).")
     return problemas
 
 
@@ -282,6 +294,9 @@ minutos_sem_uso = {int(i.idle_timeout_min)}
 lake_formation = {str(bool(i.lake_formation)).lower()}
 # Iniciar a sessão em segundo plano assim que o app abre (ela cobra desde que fica pronta)
 iniciar_ao_abrir = {str(bool(i.start_on_open)).lower()}
+# Database das tabelas escritas sem database (USE) e do DDL; "" = nenhum. Dá para trocar em cada
+# orquestração. Se ele não existir ou a role não tiver acesso, a query roda assim mesmo (o log avisa).
+database_padrao = {_toml_str(i.default_database)}
 
 [instancia.argumentos_extras]
 {_toml_table(i.extra_args, '"--datalake-formats" = "iceberg"')}

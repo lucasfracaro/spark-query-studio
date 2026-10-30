@@ -31,6 +31,9 @@ minutos_sem_uso = 30
 lake_formation = false
 # Iniciar a sessão em segundo plano assim que o app abre (ela cobra desde que fica pronta)
 iniciar_ao_abrir = false
+# Database das tabelas escritas sem database (USE) e do DDL; "" = nenhum. Dá para trocar em cada
+# orquestração. Se ele não existir ou a role não tiver acesso, a query roda assim mesmo (o log avisa).
+database_padrao = "workspace_db"
 
 [instancia.argumentos_extras]
 # "--datalake-formats" = "iceberg"

@@ -93,6 +93,11 @@ class FakeDataFrame:
     def limit(self, n):
         return FakeDataFrame(self.rows[:n], self.columns, self.spark, self.plan + (("limit", n),))
 
+    def toLocalIterator(self, prefetchPartitions=False):
+        if self.spark is not None:
+            self.spark.calls.append(("toLocalIterator",))
+        return iter(list(self.rows))
+
     @property
     def storageLevel(self):
         return _StorageLevel(self.plan in self.spark.shared_cache)

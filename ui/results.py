@@ -7,10 +7,14 @@ import pandas as pd
 import streamlit as st
 
 import metadata
-from export import FORMATS, to_csv_bytes
+from code_builder import EXPORT_MAX_ROWS
+from export import FORMATS, ExportError, fetch_full_result, rows_to_csv_bytes
+from session_hub import HUB
+from sizing import fmt_bytes
 from spark_errors import summarize
 from sql_refs import missing_from_spark_error
 from ui import style
+from ui.engine import fingerprint
 
 
 def unique_names(cols: list[str]) -> list[str]:
@@ -22,15 +26,18 @@ def unique_names(cols: list[str]) -> list[str]:
     return uniq
 
 
-def render():
+def render(engine=None):
     ss = st.session_state
     res = ss.result
     if not res:
         return
     style.step(3)
     st.subheader("Resultado")
+    for linha in res.get("log") or []:
+        if linha.startswith("AVISO:"):          # ex.: database padrão que não existe, configuração não aplicada
+            st.caption("⚠️ " + linha[len("AVISO:"):].strip())
     if res.get("ok"):
-        _dados(res)
+        _dados(res, engine)
     else:
         _erro(res)
     if res.get("log"):
@@ -38,7 +45,7 @@ def render():
             st.code("\n".join(res["log"]), language="text")
 
 
-def _dados(res: dict):
+def _dados(res: dict, engine=None):
     uniq = unique_names([c["name"] for c in res["columns"]])
     df = pd.DataFrame(res["rows"], columns=uniq)
 
@@ -50,16 +57,64 @@ def _dados(res: dict):
     t_dados, t_meta = st.tabs(["📋 Dados", "🧾 Metadados"])
     with t_dados:
         st.dataframe(df, width="stretch", height=min(38 + 35 * len(df), 560), hide_index=True)
-        c1, c2, _ = st.columns([1.4, 1, 1.6])
+        c1, c2, c3 = st.columns([1.4, 1, 1.1], vertical_alignment="bottom")
         formato = c1.selectbox("Formato do CSV", list(FORMATS), format_func=FORMATS.get,
                                help="Excel em português espera ; como separador e vírgula nos decimais.")
         tipos = [c.get("type", "") for c in res["columns"]]
-        c2.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
-        c2.download_button("⬇️ Exportar CSV", to_csv_bytes(df, tipos, formato),
+        c2.download_button("⬇️ CSV das linhas exibidas", rows_to_csv_bytes(uniq, res["rows"], tipos, formato),
                            f"resultado_{time.strftime('%Y%m%d_%H%M%S')}.csv", "text/csv", type="primary",
-                           width="stretch")
+                           width="stretch",
+                           help="As linhas que estão na tela (o número vem de Linhas exibidas, na aba ⚙️ Opções).")
+        if c3.button("📦 Preparar CSV com todas as linhas", width="stretch", disabled=not res.get("origem"),
+                     help="Roda a query de novo na sessão e traz todas as linhas (até "
+                          f"{EXPORT_MAX_ROWS + 1:,}".replace(",", ".") + " com o cabeçalho, o máximo do Excel), em "
+                          "partes, pela própria sessão. A tela continua igual."):
+            _preparar_completo(engine, res, formato)
+        _baixar_completo()
     with t_meta:
         render_metadata(res, uniq)
+
+
+def _preparar_completo(engine, res: dict, formato: str):
+    ss = st.session_state
+    ss.full_export = None
+    origem = res["origem"]
+    if engine is None:
+        st.error(f"A conexão com a AWS não está pronta ({ss.engine_error}). Revise em **⚙️ Configuração**.")
+        return
+    t0 = time.time()
+    with st.status("Preparando o CSV completo…", expanded=False) as box:
+        def rodar(codigo, on_status):
+            return HUB.run(engine, codigo, on_status, fingerprint=fingerprint())
+        try:
+            dados, info = fetch_full_result(rodar, origem["sql"], origem["orch"], origem["reader"], formato,
+                                            on_status=lambda m: box.update(label=m))
+        except (ExportError, ValueError) as e:
+            box.update(label="Não deu para preparar o CSV completo", state="error")
+            st.error(str(e))
+            return
+        except Exception as e:
+            box.update(label="Não deu para preparar o CSV completo", state="error")
+            st.error(f"{type(e).__name__}: {e}")
+            return
+        segundos = round(time.time() - t0, 1)
+        box.update(label=f"CSV completo pronto em {segundos}s", state="complete")
+    ss.full_export = {"data": dados, "rows": info["rows"], "truncated": info["truncated"], "format": formato,
+                      "result_version": ss.result_version, "name": f"resultado_completo_{time.strftime('%Y%m%d_%H%M%S')}.csv"}
+
+
+def _baixar_completo():
+    ss = st.session_state
+    pronto = ss.get("full_export")
+    if not pronto or pronto["result_version"] != ss.result_version:
+        return
+    linhas = f"{pronto['rows']:,}".replace(",", ".")
+    st.download_button(f"⬇️ Baixar CSV completo ({linhas} linhas, {fmt_bytes(len(pronto['data']))}, "
+                       f"{FORMATS[pronto['format']].split(' (')[0]})", pronto["data"], pronto["name"], "text/csv",
+                       type="primary", key="baixar_completo", on_click="ignore")
+    if pronto["truncated"]:
+        st.warning(f"O resultado tem mais linhas que isso: o arquivo tem as primeiras {linhas}, o máximo que o Excel "
+                   "abre. Para ter tudo, divida a query (por data, por exemplo) e exporte cada parte.")
 
 
 def _erro(res: dict):

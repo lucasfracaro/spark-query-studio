@@ -69,6 +69,23 @@ def test_chaves_so_vao_para_o_arquivo_quando_pedido(config_tmp):
         assert stat.S_IMODE(os.stat(config_tmp).st_mode) == 0o600     # só o dono lê
 
 
+def test_database_padrao_no_arquivo(config_tmp):
+    assert InstanceConfig().default_database == "workspace_db"            # vem preenchido por padrão
+    config_tmp.parent.mkdir(parents=True, exist_ok=True)
+    config_tmp.write_text('[instancia]\ndatabase_padrao = "analytics_db"\n', encoding="utf-8")
+    assert settings_store.load().instance.default_database == "analytics_db"
+    config_tmp.write_text('[instancia]\ndatabase_padrao = ""\n', encoding="utf-8")        # vazio = nenhum
+    lc = settings_store.load()
+    assert lc.instance.default_database == "" and lc.ok
+    config_tmp.write_text('[instancia]\ndatabase_padrao = "meu db"\n', encoding="utf-8")
+    lc = settings_store.load()
+    assert lc.instance.default_database == "workspace_db" and "database_padrao" in lc.problems[0]
+    settings_store.save(AwsAccount(), InstanceConfig(default_database="outro_db"))
+    assert 'database_padrao = "outro_db"' in config_tmp.read_text(encoding="utf-8")
+    assert settings_store.load().instance.default_database == "outro_db"
+    assert settings_store.check(AwsAccount(), InstanceConfig(default_database="x-y"))
+
+
 def test_exemplo_versionado_esta_em_dia():
     esperado = settings_store.to_toml(AwsAccount(), InstanceConfig())
     assert settings_store.EXAMPLE_FILE.read_text(encoding="utf-8") == esperado

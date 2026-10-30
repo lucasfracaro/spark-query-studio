@@ -148,12 +148,19 @@ def _formulario(lc: settings_store.LoadedConfig):
                           help="A sessão sobe em segundo plano enquanto você monta a query. Ela cobra desde que fica "
                                "pronta, mesmo sem uso, até o tempo sem uso acabar.")
 
+    st.markdown("**Consultas**")
+    db_padrao = st.text_input("Database padrão (USE)", inst.default_database, key=f"cfg_db_{v}",
+                              placeholder="vazio = nenhum",
+                              help="Usado nas tabelas escritas sem database e no DDL. Cada orquestração pode trocar "
+                                   "(aba ⚙️ Opções). Se ele não existir ou a role não tiver acesso, a query roda assim "
+                                   "mesmo e o log avisa.")
+
     novo_acc = AwsAccount(region=region.strip(), auth_mode=auth_mode, profile=profile.strip(),
                           access_key=ak.strip(), secret_key=sk.strip(), session_token=tok.strip(),
                           glue_role_arn=role.strip(), temp_dir=temp.strip())
     nova_inst = InstanceConfig(worker_type=worker, num_workers=int(workers), glue_version=versao,
                                idle_timeout_min=int(ocioso), extra_args=dict(inst.extra_args), tags=dict(inst.tags),
-                               start_on_open=iniciar, lake_formation=lf)
+                               start_on_open=iniciar, lake_formation=lf, default_database=db_padrao.strip())
     perfis = aws_profiles() if auth_mode == "profile" and novo_acc.profile else None
     problemas = settings_store.check(novo_acc, nova_inst, profiles=perfis)
     for p in problemas:
