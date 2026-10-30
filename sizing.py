@@ -584,6 +584,24 @@ def _list_partitions(glue, ident: dict, expression: str | None, deadline: float,
             return out, False
 
 
+def partition_values(glue, database: str, table: str, expression: str | None,
+                     deadline: float) -> tuple[list[tuple[str, str]], list[list[str]], bool]:
+    """Colunas de partição [(nome, tipo)] e os valores de cada partição (só metadados do catálogo), e se a lista
+    veio inteira. expression: filtro no formato do Glue, para listar menos."""
+    tabela = glue.get_table(DatabaseName=database, Name=table)["Table"]
+    chaves = [(str(k.get("Name", "")).lower(), k.get("Type", "string")) for k in tabela.get("PartitionKeys") or []]
+    if not chaves:
+        return chaves, [], True
+    ident = {"DatabaseName": database, "TableName": table}
+    partes, completo = _list_partitions(glue, ident, expression, deadline)
+    alvo = tabela.get("TargetTable") or {}
+    if not partes and alvo.get("Name"):           # link do Lake Formation: lê na tabela de origem
+        ident = {k: v for k, v in (("CatalogId", alvo.get("CatalogId")), ("DatabaseName", alvo.get("DatabaseName")),
+                                   ("TableName", alvo.get("Name"))) if v}
+        partes, completo = _list_partitions(glue, ident, expression, deadline)
+    return chaves, [list(p.get("Values") or []) for p in partes], completo
+
+
 def _chosen_partitions(glue, ident: dict, filtro: str, keys: list[tuple[str, str]], deadline: float,
                        notes: list[str]) -> tuple[list[dict] | None, int | None, bool]:
     """(partições escolhidas pelo filtro, total de partições se conhecido, lista completa?).

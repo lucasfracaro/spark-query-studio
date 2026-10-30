@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 
 import athena_import
+import latest_partition
 import orchestration_io
 from code_builder import validate_orchestration
 from ui import sizing as ui_sizing
@@ -99,19 +100,29 @@ def athena_body():
                           help="Pelo tamanho das partições que os filtros escolhem (Glue Data Catalog; S3 só nos "
                                "buckets da sua conta) e pela execução desta query no histórico do Athena, se houver. "
                                "Nada roda no Athena.")
+    trocar_max = c2.checkbox(
+        "Trocar max/min de colunas de partição pelo valor do catálogo", False, disabled=not usar_glue,
+        help="Um filtro como `dt = (SELECT max(dt) FROM db.tabela)` faz o Spark ler a tabela inteira para achar o "
+             "máximo. Marcado, o valor é calculado pela lista de partições do Glue (só metadados) e fica fixo na "
+             "query e na orquestração. Consultas a `tabela$partitions`, que só existem no Athena, são sempre "
+             "trocadas.")
     if estimar:
         ui_sizing.options()
 
     if st.button("🔎 Gerar orquestração", type="primary", disabled=not sql_athena.strip()):
-        lookup = None
+        lookup = valores = None
         ss.sizing_data = None
         if usar_glue:
             try:
-                lookup = athena_import.glue_partition_lookup(ss.account.client("glue"))
+                glue = ss.account.client("glue")
+                lookup = athena_import.glue_partition_lookup(glue)
+                valores = latest_partition.glue_partition_values(glue)
             except Exception as e:
                 st.warning(f"Não consegui conectar ao Glue ({e}). As partições serão supostas pelo nome.")
         try:
-            ss.athena_result = athena_import.import_athena_query(sql_athena, lookup, db_padrao.strip())
+            with st.spinner("Lendo a query e consultando o Glue Data Catalog…"):
+                ss.athena_result = athena_import.import_athena_query(
+                    sql_athena, lookup, db_padrao.strip(), partition_values=valores, resolve_max=trocar_max)
         except ValueError as e:
             ss.athena_result = None
             st.error(str(e))

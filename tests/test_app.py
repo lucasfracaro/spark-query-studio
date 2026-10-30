@@ -482,6 +482,24 @@ def test_janela_do_athena_estima_o_tamanho_da_sessao(janela, monkeypatch):
     assert conf["spark.sql.adaptive.enabled"] == "true"              # as outras configurações continuam
 
 
+def test_janela_do_athena_troca_partitions_pelo_valor_do_catalogo(janela, monkeypatch):
+    pytest.importorskip("sqlglot")
+    from tests.fakes import FakeCatalog, glue_partition, glue_table
+    glue = FakeCatalog({("db", "w"): glue_table(keys=(("anomes", "string"),))},
+                       {("db", "w"): [glue_partition("202608"), glue_partition("202609")]})
+    _aws_falsa(monkeypatch, glue=glue)
+    at = janela("athena", engine_kind="glue")
+    next(c for c in at.checkbox if c.label.startswith("Estimar")).uncheck().run()
+    assert any(c.label.startswith("Trocar max/min") for c in at.checkbox)
+    sql = 'SELECT * FROM db.w WHERE anomes = (SELECT max(anomes) FROM "db"."w$partitions")'
+    next(t for t in at.text_area if t.label == "Query do Athena").set_value(sql).run()
+    _botao(at, "Gerar orquestração").click().run()
+    assert not at.exception, at.exception
+    r = at.session_state["athena_result"]
+    assert [(i.alias, i.filter) for i in r.orchestration.inputs] == [("w", "anomes = '202609'")]
+    assert any("tabela do Athena com a lista de partições" in w.value for w in at.warning)
+
+
 def test_janela_do_athena_sem_estimativa_nao_consulta_a_aws(janela, monkeypatch):
     pytest.importorskip("sqlglot")
     _aws_falsa(monkeypatch)                                           # qualquer cliente pedido daria erro

@@ -118,6 +118,10 @@ Cole (ou abra) uma query escrita para o Athena e clique em **Gerar orquestraçã
 4. `INSERT ... SELECT` e `CREATE TABLE ... AS SELECT` viram só o `SELECT`: você vê o que seria gravado, sem gravar, e a tabela de destino não entra na orquestração;
 5. traduz a query para Spark SQL com o [sqlglot](https://github.com/tobymao/sqlglot) (`date_add('day', 1, d)` → `date_add(d, 1)`, `%Y-%m-%d` → `yyyy-MM-dd`, `approx_distinct` → `approx_count_distinct`…) e troca `db.tabela` pelo alias da orquestração;
 6. mostra um relatório do que precisa de revisão: filtros dinâmicos (`dt = (SELECT max(dt) ...)`), `OR` misturando partição com outras colunas, funções sem tradução, bases particionadas lidas sem filtro.
+7. **`tabela$partitions`** (a tabela do Athena com a lista de partições, que não existe no Spark): a consulta a ela é calculada pela lista de partições do Glue Data Catalog (só metadados, nada é lido do S3) e trocada pelo valor de agora, no `=`, no `IN`, em `(year, month, day) = (...)` e em CTEs. O valor entra também no filtro da orquestração, então só aquela partição é lida. Dá conta de `max`/`min`, `ORDER BY ... LIMIT`, `concat`, `lpad`, `substr` e das funções de data mais usadas (`date_add`, `date_format`, `date_parse`, `format_datetime`, `date_trunc`, `year`...), como `date_format(date_add('month', -1, max(dt)), '%Y%m')`. O valor fica fixo: para pegar uma partição mais nova, importe de novo;
+8. **filtro com subquery que calcula max/min lendo uma base** (`dt = (SELECT max(dt) FROM db.tabela)`): no Spark, isso lê a tabela inteira para achar o máximo. O relatório avisa e mostra o valor que a subquery dá hoje pela lista de partições. Com **Trocar max/min de colunas de partição pelo valor do catálogo**, a troca é feita (vale só quando a subquery usa apenas colunas de partição; confira se a partição mais recente pode estar vazia).
+
+Por que o Spark lê a tabela inteira para um `max`: ele calcula o máximo a partir dos dados. Para uma coluna de partição, os valores já estão na lista de partições do catálogo, que é o que a importação usa. O Spark até tem a opção `spark.sql.optimizer.metadataOnly`, que responde pelo catálogo, mas ela está obsoleta desde o Spark 3.0 porque erra quando há partições vazias. Para uma coluna que não é de partição, o Spark lê só aquela coluna (Parquet), mas de todos os arquivos das partições escolhidas: filtre as partições antes.
 
 Os filtros são **copiados**, não movidos: a query continua com as condições originais, então o resultado não muda. O filtro na orquestração só faz o Spark ler menos partições.
 
@@ -227,6 +231,7 @@ O GitHub Actions roda tudo a cada push: o verificador de código, os testes unit
 | `settings_store.py` | Lê, confere e grava o `configuracao.toml` |
 | `athena_import.py` | Importa query do Athena: orquestração automática + tradução para Spark |
 | `sizing.py` | Estimativa do tamanho da sessão (catálogo do Glue, S3 da sua conta e histórico do Athena) |
+| `latest_partition.py` | `tabela$partitions` e max/min de partição: calculados pela lista de partições do Glue |
 | `orchestration_io.py` | Formato de arquivo da orquestração (JSON) |
 | `sql_refs.py` | Descobre as bases usadas pela query e confere com a orquestração |
 | `spark_errors.py` | Resume os erros do Spark e do Java para a tela |

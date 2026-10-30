@@ -18,6 +18,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+import latest_partition
 from code_builder import DEFAULT_LIMIT, InputSource, Orchestration
 from sql_refs import is_read_table
 
@@ -169,9 +170,14 @@ def _analyze_occurrence(table, key, partition_keys: set[str], lookup_keys) -> _O
     if isinstance(parent, exp.Join) and (parent.side or "").upper() in ("", "LEFT"):
         # no ON de um JOIN interno ou LEFT, condições só da base juntada filtram essa base
         candidates += _conjuncts(parent.args.get("on"))
+    for j in select.args.get("joins") or []:
+        # o ON de um JOIN interno filtra o resultado inteiro: uma condição só desta base também a filtra
+        if j is not parent and not (j.side or "") and (j.kind or "").upper() not in ("CROSS", "OUTER", "FULL"):
+            candidates += _conjuncts(j.args.get("on"))
 
     for cond in candidates:
-        cols = list(cond.find_all(exp.Column))
+        # só as colunas deste SELECT (as de dentro de uma subquery são de outra consulta)
+        cols = [c for c in cond.find_all(exp.Column) if c.find_ancestor(exp.Select) is select]
         if not cols:
             continue
         mine, foreign = [], False
@@ -186,11 +192,14 @@ def _analyze_occurrence(table, key, partition_keys: set[str], lookup_keys) -> _O
         if not part_cols:
             continue
         sql_txt = cond.sql(dialect="athena")
+        subquery = cond.find(exp.Select)
+        if subquery is not None:
+            # max/min numa subquery já tem um aviso próprio (a base dela é lida inteira)
+            if subquery.find(exp.Max, exp.Min) is None:
+                occ.reasons.append(f"`{sql_txt}` depende de uma subquery (filtro dinâmico)")
+            continue
         if foreign or len(part_cols) != len(mine):
             occ.reasons.append(f"`{sql_txt}` mistura coluna de partição com outras colunas")
-            continue
-        if cond.find(exp.Select) is not None:
-            occ.reasons.append(f"`{sql_txt}` depende de uma subquery (filtro dinâmico)")
             continue
         if cond.find(exp.Is) is not None or cond.find(exp.Coalesce) is not None:
             occ.reasons.append(f"`{sql_txt}` trata valores nulos")
@@ -231,7 +240,11 @@ def _is_sql_command(stmt) -> bool:
 # Importação
 # --------------------------------------------------------------------------------------------
 def import_athena_query(sql: str, partition_lookup: PartitionLookup | None = None,
-                        default_database: str = "") -> AthenaImport:
+                        default_database: str = "", partition_values=None,
+                        resolve_max: bool = False) -> AthenaImport:
+    """partition_values: lista de partições do catálogo (latest_partition.glue_partition_values), para trocar as
+    consultas a `tabela$partitions` (que só existem no Athena) pelo valor atual. resolve_max: troca também
+    max/min de colunas de partição lidos de uma base (senão, só avisa que a base é lida inteira)."""
     if sqlglot is None:
         raise RuntimeError("O pacote sqlglot não está instalado (pip install sqlglot).")
 
@@ -267,6 +280,10 @@ def import_athena_query(sql: str, partition_lookup: PartitionLookup | None = Non
                     notes.append(Note("atencao", f"O comando {i + 1} ({tipo}) altera dados e foi mantido como está. "
                                                  "Com o modo somente leitura ele não é executado."))
 
+        # ---- tabela$partitions (só existe no Athena) e max/min que leem a base inteira
+        for nivel, texto in latest_partition.resolve(statements, partition_values, default_database, resolve_max):
+            notes.append(Note(nivel, texto))
+
         cte_names = {c.alias_or_name.lower() for s in statements for c in s.find_all(exp.CTE)}
 
         # ---- bases usadas
@@ -274,8 +291,10 @@ def import_athena_query(sql: str, partition_lookup: PartitionLookup | None = Non
             return ((t.db or default_database or "").lower(), t.name.lower())
 
         def is_base(t) -> bool:
-            # só bases LIDAS: destino de escrita, hints, funções de tabela e CTEs ficam de fora
-            return is_read_table(t) and not (not t.db and t.name.lower() in cte_names)
+            # só bases LIDAS: destino de escrita, hints, funções de tabela, CTEs e as tabelas de metadados do
+            # Athena (tabela$partitions...) ficam de fora
+            return (is_read_table(t) and not (not t.db and t.name.lower() in cte_names)
+                    and latest_partition.meta_table(t) is None)
 
         occurrences = [t for s in statements for t in s.find_all(exp.Table) if is_base(t)]
         keys: list[tuple[str, str]] = []

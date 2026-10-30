@@ -341,6 +341,12 @@ class MissingTable:
 
     def message(self) -> str:
         onde = "linha " + ", ".join(map(str, self.lines)) if len(self.lines) <= 5 else f"{len(self.lines)} lugares"
+        nome = self.name.replace("`", "")
+        if "$" in nome:
+            base, _, tipo = nome.rpartition("$")
+            return (f"`{nome}` ({onde}) é uma tabela de metadados do Athena (`${tipo}` de `{base}`) e não existe no "
+                    "Spark. Troque a subquery que usa ela por um valor fixo (ex.: a partição mais recente). Ao "
+                    "importar a query do Athena com o Glue ligado, isso é feito sozinho.")
         return (f"A base `{self.name}` é usada na query ({onde}), mas não está na orquestração. "
                 f"Adicione-a em Passo 1 › Entradas de dados.")
 
