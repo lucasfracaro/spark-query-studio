@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, field
 
 RESULT_MARKER = "__SQS_RESULT__"
 DEFAULT_LIMIT = 100
-GLUE_CODE_LIMIT = 68_000   # tamanho máximo do campo Code do RunStatement (API do Glue)
+GLUE_CODE_LIMIT = 68_000   # tamanho máximo do campo Code do RunStatement, em bytes (API do Glue)
 EXPORT_MAX_ROWS = 1_048_575          # resultado completo: o máximo que o Excel abre (1.048.576 com o cabeçalho)
 EXPORT_CHUNK_BYTES = 2 * 1024 * 1024  # o arquivo do resultado completo volta em partes deste tamanho
 READERS = ("spark", "glue_context")
@@ -576,12 +576,17 @@ def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reade
         template = (_TEMPLATE.replace("#__VALOR__", _VALOR_FUNCTION)
                     .replace("#__EXPORT__\n", _EXPORT_FUNCTION.lstrip("\n") + "\n\n"))
     code = template.replace("#__PAYLOAD__", _payload_readable(statements, payload))
-    if len(code) > GLUE_CODE_LIMIT:
+    if code_size(code) > GLUE_CODE_LIMIT:
         code = template.replace("#__PAYLOAD__", _payload_compressed(statements, payload))
-    if len(code) > GLUE_CODE_LIMIT:
+    if code_size(code) > GLUE_CODE_LIMIT:
         raise ValueError(f"A query é grande demais para o Glue: mesmo comprimido, o código tem "
-                         f"{len(code):,} caracteres e o limite é {GLUE_CODE_LIMIT:,}.".replace(",", "."))
+                         f"{code_size(code):,} bytes e o limite é {GLUE_CODE_LIMIT:,}.".replace(",", "."))
     return code
+
+
+def code_size(code: str) -> int:
+    """Tamanho como a API do Glue conta: bytes em UTF-8 (uma letra acentuada ocupa 2)."""
+    return len(code.encode("utf-8"))
 
 
 # Resultado completo: todas as linhas vão para um CSV comprimido no driver da sessão (lidas aos poucos,

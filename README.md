@@ -4,12 +4,12 @@
 
 **⬇️ [Baixar o projeto completo (.zip)](https://github.com/lucasfracaro/spark-query-studio/raw/main/dist/spark-query-studio.zip)**: o arquivo também está na pasta [`dist/`](dist/) do repositório e é atualizado a cada versão.
 
-Frontend em Streamlit para escrever ou importar uma query Spark SQL, configurar a orquestração das entradas e a instância, executar no **AWS Glue (Interactive Sessions)** e ver as primeiras linhas, com exportação para CSV. Assim você não precisa passar pelo Athena para validar uma ETL.
+Frontend em Streamlit para escrever ou importar uma query Spark SQL, configurar a orquestração das entradas e a instância, executar no **AWS Glue (Interactive Sessions)** e ver o total de linhas e as primeiras delas, com exportação para CSV de todas as linhas. Assim você não precisa passar pelo Athena para validar uma ETL.
 
 ```
 Navegador (Streamlit)  ──boto3──▶  Glue Interactive Session (Spark gerenciado)
   orquestração + query               ├─ lê Glue Data Catalog (mesmas tabelas do Athena)
-  ◀── 100 primeiras linhas ───────   └─ lê S3 direto (parquet/csv/json/…)
+  ◀── total + primeiras linhas ───   └─ lê S3 direto (parquet/csv/json/…)
 ```
 
 ## Como rodar
@@ -23,7 +23,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m streamlit run app.py
 ```
 
-O navegador abre em `http://localhost:8501`. Os scripts instalam as dependências na primeira vez e de novo quando o `requirements.txt` muda. Se a instalação falhar no meio (rede, proxy), é só rodar outra vez: ela recomeça em vez de abrir o app pela metade.
+Precisa de Python 3.10 ou mais novo. O navegador abre em `http://localhost:8501`. Os scripts instalam as dependências na primeira vez e de novo quando o `requirements.txt` muda. Se a instalação falhar no meio (rede, proxy), é só rodar outra vez: ela recomeça em vez de abrir o app pela metade.
 
 ## Configuração (`configuracao.toml`)
 
@@ -86,7 +86,7 @@ A sessão do Glue é a parte cara: leva de 30 a 90 s para subir e cobra enquanto
 - Para escolher o tipo e o número de workers, veja a [estimativa do tamanho da sessão](#-estimativa-do-tamanho-da-sessão), feita ao importar a query do Athena.
 - Cada execução roda numa **sessão Spark nova** dentro da sessão do Glue, o que é quase instantâneo: configurações Spark, `USE database` e views de execuções anteriores não passam para a próxima, como num job novo.
 - **Cache entre execuções**: entradas marcadas com **Cache** são lidas do S3 uma vez e ficam em memória; as execuções seguintes, mesmo com outra query, usam os dados em memória enquanto a definição da entrada (origem, filtro, formato) não mudar. O mesmo vale para `CACHE TABLE` escrito na própria query. O que sai da orquestração é liberado. Como todo cache, ele é uma foto dos dados: se a tabela mudou no S3, use **🧹 Limpar cache** na barra lateral. O log da execução diz o que veio do cache e de que horas são os dados.
-- A conferência do resultado começa em 0,25 s e vai espaçando até 2 s (antes eram 3 s fixos), então queries rápidas aparecem logo. A conexão com a AWS é criada uma vez, e as chamadas à AWS têm tempo limite: com a rede bloqueada, a tela avisa em segundos.
+- A conferência do resultado começa em 0,25 s e vai espaçando até 2 s, então queries rápidas aparecem logo. A conexão com a AWS é criada uma vez, e as chamadas à AWS têm tempo limite: com a rede bloqueada, a tela avisa em segundos.
 
 ## Dados em outra conta (Lake Formation)
 
@@ -117,7 +117,7 @@ Cole (ou abra) uma query escrita para o Athena e clique em **Gerar orquestraçã
 3. em cada CTE ou subquery, separa o `WHERE` e o `ON` do join pelos `AND` e leva para a orquestração as condições que usam **só colunas de partição** daquela base. Se a mesma base é lida com filtros diferentes, eles são combinados com `OR`;
 4. `INSERT ... SELECT` e `CREATE TABLE ... AS SELECT` viram só o `SELECT`: você vê o que seria gravado, sem gravar, e a tabela de destino não entra na orquestração;
 5. traduz a query para Spark SQL com o [sqlglot](https://github.com/tobymao/sqlglot) (`date_add('day', 1, d)` → `date_add(d, 1)`, `%Y-%m-%d` → `yyyy-MM-dd`, `approx_distinct` → `approx_count_distinct`…) e troca `db.tabela` pelo alias da orquestração;
-6. mostra um relatório do que precisa de revisão: filtros dinâmicos (`dt = (SELECT max(dt) ...)`), `OR` misturando partição com outras colunas, funções sem tradução, bases particionadas lidas sem filtro.
+6. mostra um relatório do que precisa de revisão: filtros dinâmicos (`dt = (SELECT max(dt) ...)`), `OR` misturando partição com outras colunas, funções sem tradução, bases particionadas lidas sem filtro;
 7. **`tabela$partitions`** (a tabela do Athena com a lista de partições, que não existe no Spark): a consulta a ela é calculada pela lista de partições do Glue Data Catalog (só metadados, nada é lido do S3) e trocada pelo valor de agora, no `=`, no `IN`, em `(year, month, day) = (...)` e em CTEs. O valor entra também no filtro da orquestração, então só aquela partição é lida. Dá conta de `max`/`min`, `ORDER BY ... LIMIT`, `concat`, `lpad`, `substr` e das funções de data mais usadas (`date_add`, `date_format`, `date_parse`, `format_datetime`, `date_trunc`, `year`...), como `date_format(date_add('month', -1, max(dt)), '%Y%m')`. O valor fica fixo: para pegar uma partição mais nova, importe de novo;
 8. **filtro com subquery que calcula max/min lendo uma base** (`dt = (SELECT max(dt) FROM db.tabela)`): no Spark, isso lê a tabela inteira para achar o máximo. O relatório avisa e mostra o valor que a subquery dá hoje pela lista de partições. Com **Trocar max/min de colunas de partição pelo valor do catálogo**, a troca é feita (vale só quando a subquery usa apenas colunas de partição; confira se a partição mais recente pode estar vazia).
 
@@ -169,7 +169,7 @@ Dá para baixar o dicionário em CSV ou JSON e gerar o **DDL `CREATE EXTERNAL TA
 
 ### Código gerado
 
-**Ver código PySpark gerado** mostra exatamente o que vai rodar no cluster, com a query como foi escrita e a orquestração em texto normal: dá para copiar e rodar num notebook do Glue. A API do Glue aceita no máximo 68 mil caracteres de código por comando; se a query passar disso, ela vai comprimida (zlib) dentro do código, o que permite queries várias vezes maiores.
+**Ver código PySpark gerado** mostra exatamente o que vai rodar no cluster, com a query como foi escrita e a orquestração em texto normal: dá para copiar e rodar num notebook do Glue. A API do Glue aceita no máximo 68 mil bytes de código por comando (letras acentuadas ocupam 2); se a query passar disso, ela vai comprimida (zlib) dentro do código, o que permite queries várias vezes maiores.
 
 ## Segurança
 
@@ -193,7 +193,7 @@ O Spark UI não vem ligado: em sessões interativas ele só funciona com um cami
 
 ## Modo Spark local
 
-Para testar a interface sem gastar com a AWS, instale o PySpark da mesma versão do Spark do seu Glue e escolha **Spark local**. Para o Glue 5.x: `pip install "pyspark==3.5.*"` (Python 3.11 e Java 8, 11 ou 17, como no Glue). Para o Glue 6.0: `pip install "pyspark==4.1.*"`, que exige Java 17 ou mais novo. Entradas `s3` funcionam com caminhos locais (ex.: `/dados/arquivo.parquet`). Para ler `s3a://` localmente, adicione `spark.jars.packages = org.apache.hadoop:hadoop-aws:3.3.4` nos argumentos extras. Como no Glue, a sessão local é criada uma vez e o cache das entradas vale entre as execuções.
+Para testar a interface sem gastar com a AWS, instale o PySpark da mesma versão do Spark do seu Glue e escolha **Spark local**. Para o Glue 4.0: `pip install "pyspark==3.3.*"`, com Python 3.10 e Java 8, 11 ou 17 (o Glue 4.0 usa Java 8). Para o Glue 5.x: `pip install "pyspark==3.5.*"`, com Python 3.11 e Java 17, como no Glue (o PySpark 3.5 também aceita Java 8 e 11). Para o Glue 6.0: `pip install "pyspark==4.1.*"`, com Python 3.13 e Java 17 ou mais novo. Entradas `s3` funcionam com caminhos locais (ex.: `/dados/arquivo.parquet`). Para ler `s3a://` localmente, adicione `spark.jars.packages = org.apache.hadoop:hadoop-aws:3.3.4` nos argumentos extras. Como no Glue, a sessão local é criada uma vez e o cache das entradas vale entre as execuções.
 
 ## Atualizar o zip do projeto
 
@@ -238,6 +238,8 @@ O GitHub Actions roda tudo a cada push: o verificador de código, os testes unit
 | `export.py` | Exportação do resultado em CSV (Excel em português, padrão, tabulação) |
 | `metadata.py` | Dicionário de dados, tipos do Athena e DDL |
 | `configuracao.exemplo.toml` | Modelo comentado do arquivo de configuração |
+| `iam_user_policy.json`, `iam_glue_role_policy.json` | Permissões na AWS (veja acima) |
+| `run.sh`, `run_windows.bat` | Sobem o app (e instalam as dependências quando o `requirements.txt` muda) |
 | `scripts/gerar_zip.py` | Gera `dist/spark-query-studio.zip` com o projeto completo |
 | `tests/` | Testes (pytest); `fakes.py` tem o Spark, o GlueContext, o cliente Glue, o catálogo, o S3 e o histórico do Athena simulados |
 

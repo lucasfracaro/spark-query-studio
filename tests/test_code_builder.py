@@ -13,6 +13,7 @@ from code_builder import (
     Orchestration,
     build_clear_cache_code,
     build_spark_code,
+    code_size,
     filter_parts,
     input_cache_key,
     parse_options,
@@ -534,6 +535,15 @@ def test_query_grande_vai_comprimida_e_continua_funcionando():
     spark = FakeSpark()
     assert run_generated(code, spark)["ok"] is True
     assert spark.last_session.sql_log == [sql]
+
+
+def test_limite_do_glue_e_contado_em_bytes():
+    # 30 mil letras acentuadas = 30 mil caracteres, mas 60 mil bytes: com o resto do código, passa dos 68 mil
+    sql = "SELECT '" + "ç" * 30_000 + "' AS texto"
+    legivel_caberia_em_caracteres = len(sql) + 20_000 < GLUE_CODE_LIMIT
+    code = build_spark_code(sql, Orchestration(inputs=[]))
+    assert legivel_caberia_em_caracteres and code_size(code) <= GLUE_CODE_LIMIT
+    assert "_zlib.decompress" in code                       # foi comprimida porque, em bytes, não cabia
 
 
 def test_query_grande_demais_mesmo_comprimida(monkeypatch):
