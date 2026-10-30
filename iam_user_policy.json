@@ -16,6 +16,26 @@
       "Resource": "arn:aws:iam::SUA-CONTA:role/GlueInteractiveSessionRole",
       "Condition": {"StringEquals": {"iam:PassedToService": "glue.amazonaws.com"}}
     },
-    {"Sid": "TestarConexao", "Effect": "Allow", "Action": "sts:GetCallerIdentity", "Resource": "*"}
+    {"Sid": "TestarConexao", "Effect": "Allow", "Action": "sts:GetCallerIdentity", "Resource": "*"},
+    {
+      "Sid": "ImportarQueryDoAthenaEEstimarASessao",
+      "Effect": "Allow",
+      "Action": ["glue:GetTable", "glue:GetPartitions",
+                 "athena:ListWorkGroups", "athena:ListQueryExecutions", "athena:BatchGetQueryExecution",
+                 "athena:GetQueryExecution", "athena:GetQueryRuntimeStatistics"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EstimativaListarOsBucketsDaConta",
+      "Effect": "Allow",
+      "Action": "s3:ListAllMyBuckets",
+      "Resource": "*"
+    },
+    {
+      "Sid": "EstimativaTamanhoDosArquivosNoSeuBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::SEU-BUCKET"
+    }
   ]
 }

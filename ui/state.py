@@ -43,6 +43,8 @@ def init():
     ss.setdefault("orch_draft_version", 0)
     ss.setdefault("open_orch_after", False)
     ss.setdefault("athena_result", None)
+    ss.setdefault("sizing_data", None)       # o que a estimativa do tamanho da sessão coletou (importação)
+    ss.setdefault("sizing", None)            # a última estimativa (aparece na barra lateral)
     ss.setdefault("allow_writes", False)     # modo somente leitura ligado por padrão
     ss.setdefault("engine_error", None)
     ss.setdefault("auto_start_done", False)  # "iniciar ao abrir" já foi feito nesta aba
@@ -75,7 +77,10 @@ def apply_orchestration(orch: Orchestration, keep_conf: bool = False):
     ss = st.session_state
     ss.inputs_base = pd.DataFrame([{c: getattr(i, c) for c in INPUT_COLUMNS} for i in orch.inputs],
                                   columns=INPUT_COLUMNS)
-    if not keep_conf:
+    if keep_conf:
+        # os editores são recriados: as configurações editadas na tela (e ainda não aplicadas) continuam
+        ss.conf_base = ss.conf_df.copy()
+    else:
         ss.conf_base = pd.DataFrame([{"chave": k, "valor": v} for k, v in orch.spark_conf.items()],
                                     columns=["chave", "valor"])
         ss.row_limit = int(orch.limit)

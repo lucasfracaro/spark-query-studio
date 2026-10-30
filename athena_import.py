@@ -28,8 +28,9 @@ except ImportError:  # pragma: no cover - tratado na tela
     sqlglot = None
     exp = None
 
-# nome do argumento WITH nos nós do sqlglot ("with_" nas versões novas, "with" nas antigas)
+# nomes dos argumentos WITH e FROM nos nós do sqlglot ("with_"/"from_" nas versões novas, "with"/"from" nas antigas)
 _WITH_KEY = ("with_" if exp is not None and "with_" in exp.Select.arg_types else "with")
+FROM_KEY = ("from_" if exp is not None and "from_" in exp.Select.arg_types else "from")
 
 # nomes comuns de colunas de partição (usados só quando não dá para consultar o Glue)
 _LIKELY_PARTITION_NAMES = {
@@ -127,7 +128,7 @@ def _sanitize_alias(name: str) -> str:
 def _sources_of(select) -> list:
     """Tabelas/subqueries do FROM e dos JOINs de um SELECT."""
     out = []
-    frm = select.args.get("from")
+    frm = select.args.get(FROM_KEY)
     if frm is not None:
         out.append(frm.this)
     for j in select.args.get("joins") or []:

@@ -439,3 +439,69 @@ def test_janela_do_athena_monta_a_orquestracao(janela):
     assert list(entradas["source"]) == ["db.vendas"] and "dt" in entradas["filter"][0]
     assert "db.vendas" not in at.session_state["sql"]           # a query passa a usar o alias
     assert at.session_state["open_orch_after"] is True          # a orquestração abre para revisar
+
+
+def _aws_falsa(monkeypatch, **clientes):
+    """Troca os clientes boto3 da conta por falsos (glue, s3, athena)."""
+    import engines
+    monkeypatch.setattr(engines.AwsAccount, "client", lambda self, servico: clientes[servico])
+
+
+def test_janela_do_athena_estima_o_tamanho_da_sessao(janela, monkeypatch):
+    pytest.importorskip("sqlglot")
+    from tests.fakes import FakeAthena, FakeCatalog, FakeS3, athena_execution, glue_partition, glue_table
+    gib = 1024 ** 3
+    sql = "SELECT cliente, valor FROM db.vendas WHERE dt BETWEEN '2026-10-01' AND '2026-10-03'"
+    particoes = [glue_partition(f"2026-10-0{d}", totalSize=40 * gib) for d in range(1, 6)]
+    athena = FakeAthena([athena_execution("a1", sql, scanned=60 * gib)], runtime={"a1": {
+        "Rows": {"InputRows": 10 ** 9}, "OutputStage": {"SubStages": [{"OutputBytes": 200 * gib}]}}})
+    _aws_falsa(monkeypatch, glue=FakeCatalog({("db", "vendas"): glue_table()}, {("db", "vendas"): particoes}),
+               s3=FakeS3(), athena=athena)
+    at = janela("athena", engine_kind="glue")
+    next(t for t in at.text_area if t.label == "Query do Athena").set_value(sql).run()
+    _botao(at, "Gerar orquestração").click().run()
+    assert not at.exception, at.exception
+
+    est = at.session_state["sizing"]
+    assert est.ok and est.confidence == "alta" and est.read_bytes == 60 * gib
+    assert any(est.label in s.value and "DPU" in s.value for s in at.success)
+    assert any("Athena, mesma query" in c.value for c in at.caption)
+    assert any("vendas" in str(df.value.values) and "120 GB" in str(df.value.values) for df in at.dataframe)
+    # o tempo desejado refaz a conta na hora, sem consultar a AWS de novo
+    chamadas = len(athena.calls)
+    next(s for s in at.selectbox if s.label == "Processar em").set_value(600).run()
+    assert at.session_state["sizing"].num_workers < est.num_workers and len(athena.calls) == chamadas
+    est = at.session_state["sizing"]
+
+    _botao(at, "Aplicar e revisar a orquestração").click().run()
+    assert not at.exception, at.exception
+    inst = at.session_state["instance"]
+    assert (inst.worker_type, inst.num_workers) == (est.worker_type, est.num_workers)
+    conf = dict(zip(at.session_state["conf_base"]["chave"], at.session_state["conf_base"]["valor"], strict=True))
+    assert conf["spark.sql.shuffle.partitions"] == str(est.shuffle_partitions)
+    assert conf["spark.sql.adaptive.enabled"] == "true"              # as outras configurações continuam
+
+
+def test_janela_do_athena_sem_estimativa_nao_consulta_a_aws(janela, monkeypatch):
+    pytest.importorskip("sqlglot")
+    _aws_falsa(monkeypatch)                                           # qualquer cliente pedido daria erro
+    at = janela("athena", engine_kind="local")
+    next(t for t in at.text_area if t.label == "Query do Athena").set_value("SELECT * FROM db.t").run()
+    _botao(at, "Gerar orquestração").click().run()
+    assert not at.exception, at.exception
+    assert at.session_state["sizing_data"] is None
+    assert not any("Tamanho sugerido" in m.value for m in at.markdown)
+
+
+def test_barra_lateral_sugere_a_ultima_estimativa(novo_app):
+    import sizing
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["sizing"] = sizing.Estimate(worker_type="G.2X", num_workers=9, confidence="média")
+    at.run()
+    assert not at.exception, at.exception
+    assert any("**G.2X × 9**" in c.value for c in at.sidebar.caption)
+    next(b for b in at.sidebar.button if b.label == "Usar").click().run()
+    assert not at.exception, at.exception
+    inst = at.session_state["instance"]
+    assert (inst.worker_type, inst.num_workers) == ("G.2X", 9)
+    assert not any("**G.2X × 9**" in c.value for c in at.sidebar.caption)     # já está em uso

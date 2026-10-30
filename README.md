@@ -81,6 +81,7 @@ A sessão do Glue é a parte cara: leva de 30 a 90 s para subir e cobra enquanto
 - Se o app foi reiniciado e você tem uma sessão criada antes **com a mesma configuração**, ela é reaproveitada em vez de pagar outra. Sessões com outra configuração aparecem na barra lateral com **♻️ Reaproveitar** ou **⏹️ Encerrar**.
 - **▶️ Iniciar sessão agora** sobe a sessão em segundo plano: dá para continuar montando a query enquanto isso. Com `iniciar_ao_abrir = true`, isso acontece sozinho quando o app abre.
 - A barra lateral mostra quando a sessão deve encerrar sozinha se ficar sem uso.
+- Para escolher o tipo e o número de workers, veja a [estimativa do tamanho da sessão](#-estimativa-do-tamanho-da-sessão), feita ao importar a query do Athena.
 - Cada execução roda numa **sessão Spark nova** dentro da sessão do Glue, o que é quase instantâneo: configurações Spark, `USE database` e views de execuções anteriores não passam para a próxima, como num job novo.
 - **Cache entre execuções**: entradas marcadas com **Cache** são lidas do S3 uma vez e ficam em memória; as execuções seguintes, mesmo com outra query, usam os dados em memória enquanto a definição da entrada (origem, filtro, formato) não mudar. O mesmo vale para `CACHE TABLE` escrito na própria query. O que sai da orquestração é liberado. Como todo cache, ele é uma foto dos dados: se a tabela mudou no S3, use **🧹 Limpar cache** na barra lateral. O log da execução diz o que veio do cache e de que horas são os dados.
 - A conferência do resultado começa em 0,25 s e vai espaçando até 2 s (antes eram 3 s fixos), então queries rápidas aparecem logo. A conexão com a AWS é criada uma vez, e as chamadas à AWS têm tempo limite: com a rede bloqueada, a tela avisa em segundos.
@@ -120,6 +121,23 @@ Os filtros são **copiados**, não movidos: a query continua com as condições 
 
 Ao aplicar, a orquestração gerada abre para revisão.
 
+### 📏 Estimativa do tamanho da sessão
+
+Na mesma janela, com **Estimar o tamanho da sessão** marcado, a ferramenta sugere o tipo e o número de workers para a query processar em ~2 minutos (dá para escolher 1, 2, 5 ou 10). **Nada roda no Athena**: a estimativa não ocupa sessão nem espaço de resultado dele. As informações vêm de:
+
+1. **Glue Data Catalog**: quais partições o filtro de cada entrada escolhe (pelo `Expression` do `GetPartitions`; se o Glue não aceitar o filtro, ele é avaliado aqui, partição por partição) e o tamanho guardado nelas (estatísticas do crawler, do Hive ou do `ANALYZE TABLE`). Das colunas da tabela sai quanto dela a query lê: em Parquet/ORC o Spark lê só as colunas usadas, e texto pesa mais que número.
+2. **S3**, quando o catálogo não tem o tamanho: soma os arquivos das partições escolhidas (até 40 partições; o resto é proporcional), **só em buckets da sua conta**. A lista vem do `ListBuckets`, que só devolve buckets da própria conta: um bucket de outra conta nunca recebe nenhuma chamada.
+3. **Histórico do Athena**: se a mesma query já rodou no Athena (o histórico guarda 45 dias), os números daquela execução: dados lidos, linhas e quanto as etapas passaram umas para as outras. A busca ignora comentários, espaços e maiúsculas, e a mesma query com outra data também serve, com confiança menor. Dá para informar o workgroup (a busca fica mais rápida) ou colar o **ID da execução** (console do Athena → *Recent queries*). Execuções que reaproveitaram resultado são ignoradas; uma que falhou (por falta de recursos, por exemplo) entra com números parciais.
+4. **A própria query**: JOINs, funções de janela, `COUNT(DISTINCT)`, `ORDER BY` sem `LIMIT`.
+
+A conta (em `sizing.py`) é simples de propósito, e a janela mostra cada número usado:
+- leitura: ~50 MB/s por núcleo em Parquet/ORC comprimido (~20 MB/s pelo DynamicFrame, que lê todas as colunas), mais ~0,15 s por pedaço de 128 MB de arquivo;
+- shuffle: ~60 MB/s por núcleo, com o volume do Athena ou estimado pela query (leve, média ou pesada);
+- workers: os núcleos que terminam no tempo escolhido, sem passar do paralelismo que os dados rendem. Cada worker é 1 executor, 1 worker é o driver, e o shuffle precisa caber no disco livre dos workers;
+- tipo: G.1X por padrão (o preço por DPU é o mesmo e, com workers menores, sobram mais executores pelo mesmo custo); G.2X para query pesada com mais de 20 GB ou com muitas partições (driver maior); G.4X/G.8X para volumes de TB.
+
+No Glue 4.0 com Lake Formation, a janela mostra também o tamanho necessário se a leitura cair no DynamicFrame. Quando o shuffle é grande, ela sugere `spark.sql.shuffle.partitions` (com o padrão, 200, cada tarefa ficaria grande demais e iria para o disco). Ao aplicar a orquestração, o tamanho sugerido e essa configuração passam a valer (dá para desmarcar); a sugestão também fica na barra lateral, com **Usar**. A estimativa acerta a ordem de grandeza, não o segundo: depois da primeira execução, o tempo real mostra se vale subir ou descer.
+
 ### 📝 Abrir orquestração
 
 Mostra a orquestração em JSON para editar à mão, **salvar na máquina** ou **abrir um arquivo salvo**. Os erros de formato aparecem na hora, com linha e coluna. Exemplo:
@@ -156,7 +174,7 @@ Dá para baixar o dicionário em CSV ou JSON e gerar o **DDL `CREATE EXTERNAL TA
 
 ## Permissões na AWS
 
-- **Seu usuário/role** (quem roda o app): `iam_user_policy.json` (criar/consultar sessões Glue e `iam:PassRole`).
+- **Seu usuário/role** (quem roda o app): `iam_user_policy.json` (criar/consultar sessões Glue e `iam:PassRole`; para importar do Athena e estimar a sessão, só leitura: tabelas e partições do catálogo, histórico do Athena e lista dos seus buckets). Sem essas permissões o app funciona do mesmo jeito; a importação supõe as partições pelo nome e a estimativa usa o que conseguir ler.
 - **Role do Glue** (assumida pela sessão): trust policy com `glue.amazonaws.com` + `iam_glue_role_policy.json` (S3, Glue Catalog e `lakeformation:GetDataAccess`). Se as tabelas usam Lake Formation, conceda também SELECT a essa role no Lake Formation.
 
 Troque `SEU-BUCKET` e `SUA-CONTA` pelos valores reais.
@@ -191,7 +209,7 @@ ruff check .                          # verificador de código
 pip install pyspark && pytest tests/test_local_spark.py   # integração com Spark real (Java 17)
 ```
 
-Nenhum teste precisa de conta AWS. O motor Glue e a sessão do app são testados com um cliente falso em memória, que simula sessões provisionando, falhando, expirando ou ocupadas, além de statements com erro, cancelados ou com saída inválida. O código PySpark gerado roda contra um Spark simulado e, no CI, contra um Spark local de verdade (inclusive o cache entre execuções e a leitura pelo GlueContext, com um GlueContext simulado). A interface é testada com o `AppTest` do próprio Streamlit, sem navegador: a tela inteira e o conteúdo das janelas de configuração, orquestração e Athena.
+Nenhum teste precisa de conta AWS. O motor Glue e a sessão do app são testados com um cliente falso em memória, que simula sessões provisionando, falhando, expirando ou ocupadas, além de statements com erro, cancelados ou com saída inválida. A estimativa do tamanho da sessão usa um catálogo, um S3 e um histórico do Athena falsos (os testes conferem que nenhum bucket de outra conta é chamado e que nada roda no Athena). O código PySpark gerado roda contra um Spark simulado e, no CI, contra um Spark local de verdade (inclusive o cache entre execuções e a leitura pelo GlueContext, com um GlueContext simulado). A interface é testada com o `AppTest` do próprio Streamlit, sem navegador: a tela inteira e o conteúdo das janelas de configuração, orquestração e Athena.
 
 O GitHub Actions roda tudo a cada push: o verificador de código, os testes unitários e de tela em Python 3.10, 3.12 e 3.13, e os de Spark local com o mesmo Spark e Python de cada versão do Glue (4.0 com Spark 3.3, 5.x com Spark 3.5 e 6.0 com Spark 4.1).
 
@@ -200,12 +218,13 @@ O GitHub Actions roda tudo a cada push: o verificador de código, os testes unit
 | Arquivo | Função |
 |---|---|
 | `app.py` | Entrada da interface: junta as partes da tela, na ordem |
-| `ui/` | Partes da tela: barra lateral e sessão, janela de configuração, orquestração, query e execução, resultado |
+| `ui/` | Partes da tela: barra lateral e sessão, janela de configuração, orquestração e estimativa da sessão, query e execução, resultado |
 | `session_hub.py` | A sessão Spark do app: criada uma vez, conferida antes de cada execução e recriada se cair |
 | `engines.py` | Motores: Glue Interactive Sessions e Spark local |
 | `code_builder.py` | Gera o código PySpark a partir da orquestração e da query (cache entre execuções, leitura pelo GlueContext) e lê o resultado |
 | `settings_store.py` | Lê, confere e grava o `configuracao.toml` |
 | `athena_import.py` | Importa query do Athena: orquestração automática + tradução para Spark |
+| `sizing.py` | Estimativa do tamanho da sessão (catálogo do Glue, S3 da sua conta e histórico do Athena) |
 | `orchestration_io.py` | Formato de arquivo da orquestração (JSON) |
 | `sql_refs.py` | Descobre as bases usadas pela query e confere com a orquestração |
 | `spark_errors.py` | Resume os erros do Spark e do Java para a tela |
@@ -213,7 +232,7 @@ O GitHub Actions roda tudo a cada push: o verificador de código, os testes unit
 | `metadata.py` | Dicionário de dados, tipos do Athena e DDL |
 | `configuracao.exemplo.toml` | Modelo comentado do arquivo de configuração |
 | `scripts/gerar_zip.py` | Gera `dist/spark-query-studio.zip` com o projeto completo |
-| `tests/` | Testes (pytest); `fakes.py` tem o Spark, o GlueContext e o cliente Glue simulados |
+| `tests/` | Testes (pytest); `fakes.py` tem o Spark, o GlueContext, o cliente Glue, o catálogo, o S3 e o histórico do Athena simulados |
 
 ## Próximos passos possíveis
 

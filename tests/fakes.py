@@ -381,3 +381,168 @@ class FakeSts:
         if self.falha:
             raise PermissionError("AccessDenied")
         return {"Arn": self.arn, "Account": "123456789012", "UserId": "X"}
+
+
+# --------------------------------------------------------------------------- catálogo, S3 e Athena falsos
+class InvalidInputException(Exception):
+    pass
+
+
+class AccessDeniedException(Exception):
+    pass
+
+
+def _paginar(itens, inicio, tamanho):
+    inicio = int(inicio or 0)
+    fim = inicio + tamanho
+    return itens[inicio:fim], (str(fim) if fim < len(itens) else None)
+
+
+class FakeCatalog:
+    """Glue Data Catalog em memória: get_table e get_partitions, com o Expression avaliado como o Glue faria.
+
+    tables: {(db, tabela): Table}; partitions: {(db, tabela): [Partition]}.
+    """
+
+    def __init__(self, tables, partitions=None, reject_expressions=False, deny=()):
+        self.tables = dict(tables)
+        self.partitions = dict(partitions or {})
+        self.reject_expressions = reject_expressions
+        self.deny = set(deny)                 # tabelas cujo get_partitions dá AccessDenied
+        self.calls = []                       # (db, tabela, Expression, CatalogId)
+
+    def get_table(self, DatabaseName, Name, **_):
+        if (DatabaseName, Name) not in self.tables:
+            raise EntityNotFoundException(f"{DatabaseName}.{Name}")
+        return {"Table": self.tables[(DatabaseName, Name)]}
+
+    def get_partitions(self, DatabaseName, TableName, Expression=None, NextToken=None, MaxResults=1000,
+                       CatalogId=None, ExcludeColumnSchema=False, **_):
+        import sqlglot
+
+        import sizing
+        chave = (DatabaseName, TableName)
+        self.calls.append((DatabaseName, TableName, Expression, CatalogId))
+        if chave in self.deny:
+            raise AccessDeniedException("sem permissão no Lake Formation")
+        particoes = self.partitions.get(chave, [])
+        if Expression:
+            if self.reject_expressions:
+                raise InvalidInputException(f"Unsupported expression: {Expression}")
+            chaves = (self.tables.get(chave) or {}).get("PartitionKeys") or []
+            tipos = {k["Name"].lower(): k.get("Type", "string") for k in chaves}
+            arvore = sqlglot.parse_one(Expression)
+            nomes = [k["Name"].lower() for k in chaves]
+            particoes = [p for p in particoes
+                         if sizing.partition_matches(arvore, dict(zip(nomes, p["Values"], strict=False)), tipos)]
+        pagina, proximo = _paginar(particoes, NextToken, MaxResults)
+        resp = {"Partitions": pagina}
+        if proximo:
+            resp["NextToken"] = proximo
+        return resp
+
+
+def glue_table(keys=(("dt", "string"),), columns=(("id", "bigint"), ("valor", "decimal(18,2)"), ("descricao", "string")),
+               params=None, location="s3://meu-bucket/tabela/", fmt="parquet", target=None):
+    serde = {"parquet": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+             "csv": "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"}.get(fmt, fmt)
+    tabela = {"Name": "t", "PartitionKeys": [{"Name": n, "Type": t} for n, t in keys],
+              "StorageDescriptor": {"Columns": [{"Name": n, "Type": t} for n, t in columns], "Location": location,
+                                    "SerdeInfo": {"SerializationLibrary": serde}},
+              "Parameters": dict(params or {})}
+    if target:
+        tabela["TargetTable"] = target
+    return tabela
+
+
+def glue_partition(values, location=None, **params):
+    if isinstance(values, str):
+        values = [values]
+    return {"Values": list(values), "StorageDescriptor": {"Location": location or "s3://meu-bucket/tabela/x/"},
+            "Parameters": {k: str(v) for k, v in params.items()}}
+
+
+class FakeS3:
+    """S3 em memória. buckets: os da conta (o que o ListBuckets devolve); objects: {bucket: [(chave, bytes)]}."""
+
+    def __init__(self, buckets=(), objects=None, deny_list_buckets=False):
+        self.buckets = list(buckets)
+        self.objects = dict(objects or {})
+        self.deny_list_buckets = deny_list_buckets
+        self.listed = []                      # (bucket, prefixo) de cada list_objects_v2
+
+    def list_buckets(self, **_):
+        if self.deny_list_buckets:
+            raise AccessDeniedException("s3:ListAllMyBuckets")
+        return {"Buckets": [{"Name": b} for b in self.buckets]}
+
+    def list_objects_v2(self, Bucket, Prefix="", ContinuationToken=None, **_):
+        self.listed.append((Bucket, Prefix))
+        objetos = [(k, s) for k, s in self.objects.get(Bucket, []) if k.startswith(Prefix)]
+        pagina, proximo = _paginar(objetos, ContinuationToken, 1000)
+        resp = {"Contents": [{"Key": k, "Size": s} for k, s in pagina], "IsTruncated": bool(proximo)}
+        if proximo:
+            resp["NextContinuationToken"] = proximo
+        return resp
+
+
+def athena_execution(execution_id, query, state="SUCCEEDED", scanned=10 * 1024 ** 3, workgroup="primary",
+                     when=None, reused=False, error="", engine_ms=41_000, statement_type="DML"):
+    from datetime import datetime
+    status = {"State": state, "SubmissionDateTime": when or datetime(2026, 10, 29, 14, 32)}
+    if error:
+        status["AthenaError"] = {"ErrorMessage": error}
+    return {"QueryExecutionId": execution_id, "Query": query, "StatementType": statement_type, "WorkGroup": workgroup,
+            "Status": status,
+            "Statistics": {"DataScannedInBytes": scanned, "EngineExecutionTimeInMillis": engine_ms,
+                           "ResultReuseInformation": {"ReusedPreviousResult": reused}}}
+
+
+class FakeAthena:
+    """Histórico do Athena em memória (execuções da mais nova para a mais antiga).
+
+    Só tem as operações de leitura do histórico: qualquer tentativa de rodar uma query falha o teste.
+    """
+
+    def __init__(self, executions=(), workgroups=("primary",), deny_workgroups=False, runtime=None):
+        self.executions = list(executions)
+        self.workgroups = list(workgroups)
+        self.deny_workgroups = deny_workgroups
+        self.runtime = dict(runtime or {})   # {id: QueryRuntimeStatistics}
+        self.calls = []
+
+    def list_work_groups(self, NextToken=None, **_):
+        self.calls.append("ListWorkGroups")
+        if self.deny_workgroups:
+            raise AccessDeniedException("athena:ListWorkGroups")
+        return {"WorkGroups": [{"Name": w, "State": "ENABLED"} for w in self.workgroups]}
+
+    def list_query_executions(self, WorkGroup, MaxResults=50, NextToken=None):
+        self.calls.append("ListQueryExecutions")
+        ids = [e["QueryExecutionId"] for e in self.executions if e.get("WorkGroup") == WorkGroup]
+        pagina, proximo = _paginar(ids, NextToken, MaxResults)
+        resp = {"QueryExecutionIds": pagina}
+        if proximo:
+            resp["NextToken"] = proximo
+        return resp
+
+    def batch_get_query_execution(self, QueryExecutionIds):
+        self.calls.append("BatchGetQueryExecution")
+        por_id = {e["QueryExecutionId"]: e for e in self.executions}
+        return {"QueryExecutions": [por_id[i] for i in QueryExecutionIds], "UnprocessedQueryExecutionIds": []}
+
+    def get_query_execution(self, QueryExecutionId):
+        self.calls.append("GetQueryExecution")
+        for e in self.executions:
+            if e["QueryExecutionId"] == QueryExecutionId:
+                return {"QueryExecution": e}
+        raise InvalidInputException(f"QueryExecution {QueryExecutionId} was not found")
+
+    def get_query_runtime_statistics(self, QueryExecutionId):
+        self.calls.append("GetQueryRuntimeStatistics")
+        if QueryExecutionId not in self.runtime:
+            raise InvalidInputException("sem estatísticas")
+        return {"QueryRuntimeStatistics": self.runtime[QueryExecutionId]}
+
+    def start_query_execution(self, **_):
+        raise AssertionError("a estimativa não pode rodar nada no Athena")

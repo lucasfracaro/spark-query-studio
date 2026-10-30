@@ -7,6 +7,7 @@ import streamlit as st
 import athena_import
 import orchestration_io
 from code_builder import validate_orchestration
+from ui import sizing as ui_sizing
 from ui import style
 from ui.editor import ace
 from ui.state import apply_orchestration, current_orchestration
@@ -93,9 +94,16 @@ def athena_body():
                               help="Usado para tabelas escritas sem database na query.")
     usar_glue = c2.checkbox("Consultar o Glue para saber as colunas de partição", ss.engine_kind == "glue",
                             help="Sem o Glue, as colunas de partição são supostas pelo nome (dt, anomes...).")
+    estimar = c2.checkbox("Estimar o tamanho da sessão (workers e tipo de worker)", ss.engine_kind == "glue",
+                          help="Pelo tamanho das partições que os filtros escolhem (Glue Data Catalog; S3 só nos "
+                               "buckets da sua conta) e pela execução desta query no histórico do Athena, se houver. "
+                               "Nada roda no Athena.")
+    if estimar:
+        ui_sizing.options()
 
     if st.button("🔎 Gerar orquestração", type="primary", disabled=not sql_athena.strip()):
         lookup = None
+        ss.sizing_data = None
         if usar_glue:
             try:
                 lookup = athena_import.glue_partition_lookup(ss.account.client("glue"))
@@ -109,6 +117,12 @@ def athena_body():
         except Exception as e:      # qualquer outra falha vira mensagem, sem derrubar a janela
             ss.athena_result = None
             st.error(f"Não consegui importar a query ({type(e).__name__}: {e}).")
+        if ss.athena_result is not None and estimar:
+            with st.spinner("Estimando o tamanho da sessão (catálogo do Glue e histórico do Athena)…"):
+                try:
+                    ss.sizing_data = ui_sizing.collect(ss.athena_result, sql_athena)
+                except Exception as e:
+                    st.warning(f"Não consegui estimar o tamanho da sessão ({type(e).__name__}: {e}).")
 
     r = ss.athena_result
     if r is None:
@@ -123,11 +137,17 @@ def athena_body():
         "filtro": t.filter or "—"} for t in r.tables]), hide_index=True, width="stretch")
     with st.expander("Query traduzida para Spark SQL"):
         st.code(r.spark_sql, language="sql")
+    estimativa = None
+    if ss.sizing_data is not None:
+        st.divider()
+        estimativa = ui_sizing.render(ss.sizing_data)
     if st.button("✅ Aplicar e revisar a orquestração", type="primary"):
         apply_orchestration(r.orchestration, keep_conf=True)
+        ui_sizing.apply(estimativa)
         ss.sql = r.spark_sql
         ss.editor_version += 1
         ss.athena_result = None
+        ss.sizing_data = None
         ss.open_orch_after = True
         st.rerun()
 

@@ -19,6 +19,7 @@ from engines import (
 from session_hub import HUB
 from ui.config_dialog import file_status, lake_formation_help, open_config_dialog
 from ui.engine import fingerprint, make_engine
+from ui.sizing import sidebar_hint
 from ui.state import apply_config, clean
 
 
@@ -97,6 +98,7 @@ def _instancia():
     st.caption(f"≈ **{dpu:g} DPU** enquanto a sessão estiver ativa."
                + (" Com 2 workers, só 1 processa os dados (o outro coordena): para tabelas grandes, use mais."
                   if inst.num_workers <= 2 else ""))
+    sidebar_hint(inst)
     with st.expander("Argumentos extras do job"):
         st.caption("Ex: `--datalake-formats` = `iceberg`, `--additional-python-modules` = `pyarrow==14`")
         if "args_base" not in ss:
