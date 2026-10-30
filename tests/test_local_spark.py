@@ -363,3 +363,19 @@ def test_glue_context_coluna_do_catalogo_que_a_leitura_nao_trouxe(engine, tmp_pa
     assert info["catalog"] == ["id", "doc", "doc_str"]               # o que a "role" vê no catálogo
     d = column_errors.diagnose(res["error"], sql, sql, res["inputs"], None, [entrada], glue=True)
     assert d.kind == "arquivos" and d.title == "A leitura de `clientes` não trouxe a coluna `doc_str`"
+
+
+def test_coluna_que_falta_numa_cte_que_a_query_nao_usa(engine, csv_vendas):
+    # Glue 4.0 (Spark 3.3): "unresolved operator 'Project [...]", sem linha; do Spark 3.4 em diante, a coluna e a linha
+    import column_errors
+    from spark_errors import locate, locate_error
+    entrada = InputSource("vendas", "s3", str(csv_vendas), "csv", "header=true;sep=;;inferSchema=true")
+    sql = "WITH base AS (\n  SELECT id,\n    regiao\n  FROM vendas\n)\nSELECT count(*) AS n FROM vendas"
+    res = _run(engine, sql, inputs=[entrada])
+    assert res["ok"] is False and res["inputs"][0]["columns"] == ["id", "cliente", "valor", "dt"], res
+    d = column_errors.diagnose(res["error"], sql, sql, res["inputs"], None, [entrada])
+    assert d.kind == "nao_existe" and "`regiao`" in d.title, res["error"]
+    local = locate_error(res["error"], sql, 0) or locate(sql, 0, *d.position)
+    assert (local.line, local.column) == (3, 4)
+    if "unresolved operator" in res["error"]:
+        assert d.cte == "base" and "que a query final não usa" in d.cause

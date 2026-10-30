@@ -177,6 +177,8 @@ Quando a query falha, a tela mostra o erro resumido (sem o plano da query e sem 
 - **a coluna é de outra tabela**, o **alias não existe naquele trecho**, a coluna **não chega até ali** (CTE ou subquery que não a seleciona) ou é **um nome criado no próprio SELECT** (usado no `WHERE` ou, no Glue 4.0, no mesmo `SELECT`);
 - **o nome não existe**: com os nomes parecidos.
 
+No Glue 4.0 (Spark 3.3), quando a coluna que falta está numa CTE que a query final nem usa, o Spark não diz o nome nem a linha: mostra o trecho inteiro (`unresolved operator 'Project [...]`, corrigido no Spark 3.4). A ferramenta lê esse trecho (as colunas que faltam são as que aparecem com `'` na frente e sem `#número`), acha a CTE e a linha na query e avisa quando a CTE não é usada: nesse caso, apagá-la resolve. O Athena confere todas as CTEs também, então, se a query roda lá, as colunas existem para o seu usuário.
+
 ### Código gerado
 
 **Ver código PySpark gerado** mostra exatamente o que vai rodar no cluster, com a query como foi escrita e a orquestração em texto normal: dá para copiar e rodar num notebook do Glue. A API do Glue aceita no máximo 68 mil bytes de código por comando (letras acentuadas ocupam 2); se a query passar disso, ela vai comprimida (zlib) dentro do código, o que permite queries várias vezes maiores.

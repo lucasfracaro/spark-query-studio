@@ -11,7 +11,7 @@ import metadata
 from code_builder import EXPORT_MAX_ROWS, split_statements
 from export import FORMATS, fetch_full_result, rows_to_csv_bytes
 from session_hub import HUB
-from spark_errors import QueryLocation, locate_error, summarize
+from spark_errors import QueryLocation, locate, locate_error, summarize
 from sql_refs import missing_from_spark_error
 from ui import style
 from ui.engine import fingerprint
@@ -127,9 +127,16 @@ def csv_generator(engine, origem: dict, result_key: str | None, formato: str, fp
 
 
 def error_location(res: dict) -> QueryLocation | None:
-    """A linha do editor onde está o erro (a da query que rodou), se o Spark disse a posição."""
+    """A linha do editor onde está o erro (a da query que rodou): a que o Spark diz ou, quando ele não diz
+    ("unresolved operator"), a da coluna que o diagnóstico achou na query."""
     origem = res.get("origem") or {}
-    return locate_error(res.get("error") or "", origem.get("sql") or "", res.get("statement"))
+    sql = origem.get("sql") or ""
+    local = locate_error(res.get("error") or "", sql, res.get("statement"))
+    if local is None and sql:
+        diag = column_diagnosis(res)
+        if diag is not None and diag.position is not None:
+            local = locate(sql, res.get("statement"), *diag.position)
+    return local
 
 
 def column_diagnosis(res: dict) -> column_errors.ColumnDiagnosis | None:

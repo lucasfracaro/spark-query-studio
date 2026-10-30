@@ -53,9 +53,16 @@ _CAMPO = (
                 r"\[(?P<lista>[^\n]*?)\]\.?)?"), False),
     (re.compile(r"No such struct field (?P<nome>\S+) in (?P<lista>[^;\n]*)"), True),
 )
+# Spark 3.3 (Glue 4.0), coluna que falta numa CTE que a query final não usa: no lugar do nome da coluna, o operador
+# inteiro ("unresolved operator 'Project [...]"; corrigido no Spark 3.4, SPARK-40595). No texto do operador, as
+# colunas encontradas têm número (DATA#3768) e as que não foram encontradas vêm com ' na frente ('DATA_REF).
+_OPERADOR = re.compile(r"unresolved operator '(?P<op>\w+)(?P<resto>[^\n]*)")
+_IDENT = r"(?:`(?:[^`]|``)*`|[A-Za-z_][\w$]*)"
+_NAO_RESOLVIDA = re.compile(rf"(?<![\w#'`])'({_IDENT}(?:\.{_IDENT})*)(?![\w$(`])")
+_RESOLVIDA = re.compile(rf"(?<![\w'`.])({_IDENT})#\d+")
 _SEM_COMENTARIOS = re.compile(r"--[^\n]*|/\*.*?\*/", re.S)
 _MAX_LISTA = 12                   # colunas listadas numa frase; o resto vira "e mais N"
-_TALVEZ_PERMISSAO = ("Se a coluna aparece no Athena, o motivo provável é permissão: com o Lake Formation, a role da "
+_TALVEZ_PERMISSAO = ("Se no Athena essa query roda, o motivo provável é permissão: com o Lake Formation, a role da "
                      "sessão só enxerga no catálogo as colunas que pode ler (o Athena usa a sua permissão).")
 
 
@@ -70,6 +77,10 @@ class UnresolvedColumn:
     candidates: list[tuple[str, str]]           # (qualificador, coluna) que o Spark listou, na ordem dele
     full_list: bool                             # o Spark listou todas as colunas visíveis (3.3) ou só as parecidas
     struct: str = ""                            # campo de struct: a coluna struct onde ele foi procurado
+    # "unresolved operator": as outras colunas não encontradas, o operador e os nomes que ele cria (AS x)
+    others: list[str] = field(default_factory=list)
+    operator: str = ""
+    outputs: list[str] = field(default_factory=list)
 
 
 def _partes(identificador: str) -> list[str]:
@@ -142,6 +153,18 @@ def parse(error: str) -> UnresolvedColumn | None:
             struct = ".".join(_partes(m.groupdict().get("struct") or ""))
             return UnresolvedColumn(".".join(partes), partes[-1], "", _candidatos(m.group("lista")), completa,
                                     struct=struct or "?")
+    m = _OPERADOR.search(texto)
+    if m:
+        resto = m.group("resto")
+        nomes = list(dict.fromkeys(".".join(_partes(n)) for n in _NAO_RESOLVIDA.findall(resto)))
+        if nomes:
+            lidas, criadas = [], []
+            for a in _RESOLVIDA.finditer(resto):
+                (criadas if resto[:a.start()].endswith("AS ") else lidas).append(".".join(_partes(a.group(1))))
+            partes = nomes[0].split(".")
+            return UnresolvedColumn(nomes[0], partes[-1], partes[-2] if len(partes) > 1 else "",
+                                    [("", n) for n in dict.fromkeys(lidas)], False, others=nomes[1:],
+                                    operator=m.group("op"), outputs=list(dict.fromkeys(criadas)))
     return None
 
 
@@ -242,6 +265,9 @@ class ColumnDiagnosis:
     similar: list[str] = field(default_factory=list)       # nomes parecidos
     missing_too: list[str] = field(default_factory=list)   # outras colunas da query que faltam pelo mesmo motivo
     scope: str = ""                 # o que o Spark enxerga naquele ponto da query
+    # onde está a coluna no comando (linha, posição), quando o Spark não diz ("unresolved operator")
+    position: tuple[int, int] | None = None
+    cte: str = ""                   # a CTE onde está o erro, quando se sabe
 
 
 def _entradas(inputs_info, orch_inputs, user_catalog) -> list[_Entrada]:
@@ -281,8 +307,10 @@ def _analisa_query(statement: str) -> tuple[dict[str, tuple[str, str]], set[str]
         return {}, set()
     if arvore is None:
         return {}, set()
+    # um "f(x) AS x" só formata a própria coluna: x continua sendo a coluna da tabela, não um nome novo
     calculadas = {e.alias.lower() for sel in arvore.find_all(exp.Select) for e in sel.expressions
-                  if isinstance(e, exp.Alias) and e.alias}
+                  if isinstance(e, exp.Alias) and e.alias
+                  and not any(c.name.lower() == e.alias.lower() for c in e.this.find_all(exp.Column))}
     mapa: dict[str, tuple[str, str]] = {}
     ctes = {c.alias_or_name.lower() for c in arvore.find_all(exp.CTE) if c.alias_or_name}
     for cte in ctes:
@@ -315,6 +343,79 @@ def _parecidos(coluna: str, nomes: list[str], n: int = 5) -> list[str]:
     return [por_minuscula[a] for a in achados]
 
 
+def _rotulo(nomes: list[str]) -> str:
+    """'a coluna `x`' ou 'as colunas `x` e `y`'."""
+    if len(nomes) == 1:
+        return f"a coluna `{nomes[0]}`"
+    return "as colunas " + ", ".join(f"`{n}`" for n in nomes[:-1]) + f" e `{nomes[-1]}`"
+
+
+def _maiuscula(texto: str) -> str:
+    return texto[:1].upper() + texto[1:]
+
+
+@dataclass
+class _CteDoErro:
+    nome: str = ""                          # a CTE onde está a coluna ("" = fora de CTE)
+    usada: bool | None = None               # a query final usa essa CTE (direta ou indiretamente)?
+    posicao: tuple[int, int] | None = None  # (linha, posição) da primeira coluna não encontrada, no comando
+
+
+def _cte_do_erro(statement: str, uc: UnresolvedColumn, nomes: list[str]) -> _CteDoErro:
+    """Para o "unresolved operator" (que não diz linha nem CTE): acha a CTE pelo que o operador cria (os AS x) e
+    pelas colunas não encontradas, se a query final a usa, e a linha da primeira dessas colunas."""
+    try:
+        import sqlglot
+        from sqlglot import exp
+        arvore = sqlglot.parse_one(statement, read="spark")
+    except Exception:
+        return _CteDoErro()
+    if arvore is None:
+        return _CteDoErro()
+    procuradas = {n.lower() for n in nomes}
+    criadas = {n.lower() for n in uc.outputs}
+
+    def referencias(no) -> list:
+        return [c for c in no.find_all(exp.Column) if c.name.lower() in procuradas]
+
+    with_ = arvore.find(exp.With)
+    ctes = list(with_.expressions) if with_ is not None else []
+    escolhida, melhor = None, (0, 0)
+    for cte in ctes:
+        refs = referencias(cte.this)
+        if not refs:
+            continue
+        pontos = (len(criadas & {n.lower() for n in getattr(cte.this, "named_selects", [])}), len(refs))
+        if pontos > melhor:
+            escolhida, melhor = cte, pontos
+    saida = _CteDoErro()
+    alvo = escolhida.this if escolhida is not None else arvore
+    inicios = [c.this.meta["start"] for c in referencias(alvo)
+               if isinstance(c.this, exp.Identifier) and isinstance(c.this.meta.get("start"), int)]
+    if inicios:
+        inicio = min(inicios)
+        saida.posicao = (statement.count("\n", 0, inicio) + 1, inicio - (statement.rfind("\n", 0, inicio) + 1))
+    if escolhida is None:
+        return saida
+    saida.nome = escolhida.alias_or_name
+    nomes_ctes = {c.alias_or_name.lower() for c in ctes}
+
+    def usa(no) -> set[str]:
+        return {t.name.lower() for t in no.find_all(exp.Table) if not t.db and t.name.lower() in nomes_ctes}
+
+    grafo = {c.alias_or_name.lower(): usa(c.this) for c in ctes}
+    principal = arvore.copy()
+    principal.find(exp.With).pop()
+    usadas, fila = set(), list(usa(principal))
+    while fila:
+        nome = fila.pop()
+        if nome not in usadas:
+            usadas.add(nome)
+            fila.extend(grafo.get(nome, ()))
+    saida.usada = saida.nome.lower() in usadas
+    return saida
+
+
 def diagnose(error: str, statement: str = "", query: str = "", inputs=None, user_catalog=None, orch_inputs=(),
              role: str = "", glue: bool = False) -> ColumnDiagnosis | None:
     """O motivo provável de uma coluna não encontrada, ou None se o erro não é desse tipo.
@@ -325,6 +426,27 @@ def diagnose(error: str, statement: str = "", query: str = "", inputs=None, user
     uc = parse(error)
     if uc is None:
         return None
+    diag = _diagnostico(uc, statement, query, inputs, user_catalog, orch_inputs, role, glue)
+    if not uc.operator:
+        return diag
+    # "unresolved operator": todas as colunas que faltam, a CTE e a linha (o Spark não diz)
+    cte = _cte_do_erro(statement, uc, [uc.column] + [o.split(".")[-1] for o in uc.others])
+    diag.position, diag.cte = cte.posicao, cte.nome
+    for outra in uc.others:
+        nome = outra.split(".")[-1]
+        if nome.lower() not in {c.lower() for c in [uc.column] + diag.missing_too}:
+            diag.missing_too.append(nome)
+    if cte.nome and cte.usada is False:
+        diag.cause += (f"\n\n**O erro está na CTE `{cte.nome}`, que a query final não usa.** O Glue 4.0 (Spark 3.3) "
+                       "confere todas as CTEs mesmo assim e, nesse caso, mostra o trecho inteiro em vez do nome da "
+                       "coluna. Se ela não é necessária, apague-a da query: o resto roda sem essas colunas.")
+    elif cte.nome:
+        diag.cause += f"\n\nO erro está na CTE `{cte.nome}`."
+    return diag
+
+
+def _diagnostico(uc: UnresolvedColumn, statement: str, query: str, inputs, user_catalog, orch_inputs, role: str,
+                 glue: bool) -> ColumnDiagnosis:
     texto_query = _SEM_COMENTARIOS.sub(" ", query or statement or "")
     entradas = _entradas(inputs, orch_inputs, user_catalog)
     por_alias = {e.alias.lower(): e for e in entradas}
@@ -344,12 +466,28 @@ def diagnose(error: str, statement: str = "", query: str = "", inputs=None, user
     # o que o Spark enxerga ali: os qualificadores da lista dele (no Spark 3.3, a lista inteira)
     escopo = list(dict.fromkeys(q for q, _ in uc.candidates if q))
     no_escopo = [e for e in (entrada_de(q) for q in escopo) if e is not None]
+    nomes_visiveis = [c for _, c in uc.candidates]
+    if uc.operator and nomes_visiveis:
+        # sem qualificadores: a entrada é a que tem as colunas que o operador encontrou
+        lidas = {n.lower() for n in nomes_visiveis}
+        pontos = [(len(lidas & {c.lower() for c in (e.columns or [])}), e) for e in entradas]
+        melhor = max((p for p, _ in pontos), default=0)
+        no_escopo = [e for p, e in pontos if melhor and p == melhor]
     alvo = entrada_de(uc.qualifier) if uc.qualifier else None
     candidatas = [alvo] if alvo else (no_escopo or entradas)
-    nomes_visiveis = [c for _, c in uc.candidates]
-    parecidos = _parecidos(uc.column, nomes_visiveis + [c for e in candidatas for c in (e.columns or [])])
+    if uc.operator:
+        # as colunas que o próprio trecho já usa não são sugestão (ex.: ESTADO para SUBESTADO); as outras da tabela, sim
+        ja_usadas = {n.lower() for n in nomes_visiveis}
+        parecidos = _parecidos(uc.column, [c for e in candidatas for c in (e.columns or []) if c.lower() not in ja_usadas])
+    else:
+        parecidos = _parecidos(uc.column, nomes_visiveis + [c for e in candidatas for c in (e.columns or [])])
     escopo_txt = _descreve_escopo(uc, escopo, entrada_de, aliases)
+    if uc.operator and len(no_escopo) == 1:
+        escopo_txt = (f"As outras colunas desse trecho ({_lista(nomes_visiveis)}) o Spark encontrou na entrada "
+                      f"{no_escopo[0].nome()}.")
     coluna = uc.column
+    todas = list(dict.fromkeys([coluna] + [o.split(".")[-1] for o in uc.others]))
+    alvo_txt = _rotulo(todas)
 
     if uc.struct:
         return ColumnDiagnosis(
@@ -361,7 +499,9 @@ def diagnose(error: str, statement: str = "", query: str = "", inputs=None, user
 
     # 1) é o nome de uma coluna calculada num SELECT da própria query (SELECT a + b AS soma ... WHERE soma > 0)
     calculada = next((n for n in (coluna, uc.qualifier) if n and n.lower() in calculadas), None)
-    if calculada is not None:
+    if calculada is not None and any(e.tem(lista, calculada) for e in entradas for lista in (e.role, e.user)):
+        calculada = None                    # é coluna de uma tabela (só não chegou à sessão): os casos abaixo
+    if calculada is not None and not (uc.operator and calculada.lower() in {o.lower() for o in uc.outputs}):
         causa = (f"`{calculada}` é o nome de uma coluna calculada num SELECT da própria query, não uma coluna das "
                  "tabelas. Esse nome vale por fora da consulta que o cria (numa subquery ou CTE) e no ORDER BY dela, "
                  "mas não no WHERE da mesma consulta, nem (no Glue 4.0, Spark 3.3) dentro do mesmo SELECT. Repita "
@@ -412,7 +552,7 @@ def diagnose(error: str, statement: str = "", query: str = "", inputs=None, user
             if outras:
                 causa += (f"\n\nA query usa também {_lista(outras)}, que "
                           f"{'falta' if len(outras) == 1 else 'faltam'} pelo mesmo motivo.")
-            return ColumnDiagnosis("arquivos", f"A leitura de `{e.alias}` não trouxe a coluna `{coluna}`", causa,
+            return ColumnDiagnosis("arquivos", f"A leitura de `{e.alias}` não trouxe {alvo_txt}", causa,
                                    uc.name, [], outras, escopo_txt)
 
     # 5) o seu usuário vê a coluna no catálogo, a role da sessão não: permissão do Lake Formation
@@ -433,22 +573,25 @@ def diagnose(error: str, statement: str = "", query: str = "", inputs=None, user
                 causa += f"\n\nA query usa {len(usadas)} colunas que a role não vê: {_lista(usadas)}."
             if len(escondidas) > len(outras) + 1:
                 causa += f" Ao todo, a role não vê {len(escondidas)} colunas dessa tabela."
-            return ColumnDiagnosis("role", f"A role da sessão não enxerga a coluna `{coluna}`", causa, uc.name,
+            return ColumnDiagnosis("role", f"A role da sessão não enxerga {alvo_txt}", causa, uc.name,
                                    [], outras, escopo_txt)
 
     # 6) ninguém tem a coluna: nome errado (ou ela é de uma tabela que não está na orquestração)
     conferidas = [e for e in candidatas if e.columns is not None or e.role is not None or e.user is not None]
+    varias = len(todas) > 1
     if conferidas:
         usuario_conferido = any(e.user is not None for e in conferidas)
         onde = "no alcance desse trecho" if (alvo is not None or no_escopo) else "da orquestração"
-        causa = f"Nenhuma entrada {onde} ({_lista([e.alias for e in conferidas])}) tem a coluna `{coluna}`"
+        causa = f"Nenhuma entrada {onde} ({_lista([e.alias for e in conferidas])}) tem {alvo_txt}"
         if usuario_conferido:
             causa += ", nem no catálogo com a sua permissão"
         causa += ". Confira o nome" + (": há nomes parecidos abaixo." if parecidos else ".")
         if glue and not usuario_conferido:
             causa += " " + _TALVEZ_PERMISSAO + _sem_conferir(conferidas)
-        titulo = (f"A coluna `{coluna}` não existe" if usuario_conferido or not glue
-                  else f"A sessão não encontrou a coluna `{coluna}`")
+        if usuario_conferido or not glue:
+            titulo = f"{_maiuscula(alvo_txt)} não {'existem' if varias else 'existe'}"
+        else:
+            titulo = f"A sessão não encontrou {alvo_txt}"
         return ColumnDiagnosis("nao_existe", titulo, causa, uc.name, parecidos, [], escopo_txt)
 
     # 7) sem as listas: só o que a mensagem diz
@@ -456,7 +599,7 @@ def diagnose(error: str, statement: str = "", query: str = "", inputs=None, user
                                                                     else ".")
     if glue:
         causa += " " + _TALVEZ_PERMISSAO + _sem_conferir(candidatas)
-    return ColumnDiagnosis("desconhecido", f"O Spark não encontrou a coluna `{coluna}`", causa, uc.name,
+    return ColumnDiagnosis("desconhecido", f"O Spark não encontrou {alvo_txt}", causa, uc.name,
                            parecidos, [], escopo_txt)
 
 

@@ -83,6 +83,10 @@ _PADROES = [
                                   "no Glue. No Spark local, desligue essa opção."),
     (_tem(r"Column '[^'\n]+' does not exist|given input columns: \["),
      "Coluna não encontrada", "Confira o nome e de qual tabela ou alias ela vem."),
+    (_tem(r"unresolved operator '"), "O Spark não conseguiu resolver um trecho da query",
+     "No trecho abaixo, o que o Spark encontrou aparece com número (DATA#123); o que ele não encontrou aparece com "
+     "' na frente e sem número ('DATA_REF). No Glue 4.0 (Spark 3.3), isso costuma ser uma coluna que não existe "
+     "numa CTE que a query final nem usa."),
     (_tem(r"Path does not exist|FileNotFoundException"),
      "Arquivo ou caminho não encontrado", "Confira o caminho. Se os arquivos foram trocados durante a leitura "
                                           "(ex.: um ETL regravou a tabela), rode de novo."),
@@ -91,6 +95,7 @@ _PADROES = [
 _JAVA_STACK = re.compile(r"^\s*(at |\.\.\. \d+ more)")
 _SUGESTOES = re.compile(r"(Did you mean one of the following\? \[|given input columns: \[)([^\]\n]*)\]")
 _MAX_SUGESTOES = 8
+_MAX_LINHA = 1500
 _PLAN_LINE = re.compile(r"^\s*('|\+-|:-|:\s+[+:]-|\|)")
 _CLASS_RE = re.compile(r"\[([A-Z][A-Z0-9_]+)(?:\.[A-Z0-9_]+)*\]")
 
@@ -127,6 +132,12 @@ def _encurta_sugestoes(m: re.Match) -> str:
     return f"{m.group(1)}{', '.join(itens[:_MAX_SUGESTOES])}, … mais {len(itens) - _MAX_SUGESTOES}]"
 
 
+def _encurta_linha(linha: str) -> str:
+    """Um operador inteiro do plano pode ocupar milhares de caracteres numa linha só: a mensagem completa continua
+    disponível na tela."""
+    return linha if len(linha) <= _MAX_LINHA else linha[:_MAX_LINHA] + " … (continua na mensagem completa)"
+
+
 def summarize(error: str, traceback: str = "") -> ErrorSummary:
     error = (error or "").strip()
     tudo = f"{error}\n{traceback or ''}"
@@ -137,7 +148,7 @@ def summarize(error: str, traceback: str = "") -> ErrorSummary:
         principal = error.split("\n: ", 1)[1]
     causas = re.findall(r"^Caused by: (.+)$", tudo, re.M)
 
-    linhas = [_SUGESTOES.sub(_encurta_sugestoes, linha) for linha in _sem_pilha_e_plano(principal)]
+    linhas = [_encurta_linha(_SUGESTOES.sub(_encurta_sugestoes, linha)) for linha in _sem_pilha_e_plano(principal)]
     detalhe = "\n".join(linhas[:12]) if linhas else error
     sql = _bloco_sql(tudo)
     if sql and sql not in detalhe:

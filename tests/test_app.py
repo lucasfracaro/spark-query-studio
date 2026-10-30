@@ -226,6 +226,24 @@ def test_erro_de_sintaxe_aponta_a_linha_da_query(app, monkeypatch):
     assert not any("== SQL ==" in c.value for c in app.code)       # a linha já aparece com o número do editor
 
 
+def test_unresolved_operator_aponta_a_linha_e_a_cte(app, monkeypatch):
+    sql = ("WITH base AS (\n  SELECT id,\n    CASE WHEN regiao IS NULL THEN '00' ELSE regiao END AS regiao\n"
+           "  FROM minha_view\n)\nSELECT id FROM minha_view")
+    erro = "AnalysisException: unresolved operator 'Project [id#1, CASE WHEN isnull('regiao) THEN 00 ELSE 'regiao END AS regiao#9];"
+    _motor_falso(monkeypatch, {"ok": False, "log": [], "traceback": "", "error": erro, "statement": 0,
+                               "inputs": [{"alias": "minha_view", "kind": "catalog", "read": "nativa",
+                                           "source": "meu_database.minha_tabela", "columns": ["id", "valor"],
+                                           "catalog": ["id", "valor"]}]})
+    app.session_state["engine_kind"] = "local"
+    app.text_area[0].set_value(sql).run()
+    _botao(app, "Executar").click().run()
+    assert not app.exception, app.exception
+    assert [e.value for e in app.error] == ["**A coluna `regiao` não existe**"]
+    assert any("linha 3, coluna 15" in m.value for m in app.markdown)       # o Spark 3.3 não diz: vem da query
+    assert any(c.value.endswith("\n  | " + " " * 14 + "^^^^^^") for c in app.code)
+    assert "que a query final não usa" in app.info[0].value
+
+
 def test_marcacao_do_erro_no_editor():
     from ui.query import _aceita_marcacao
     from ui.results import error_annotations

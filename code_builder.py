@@ -270,6 +270,12 @@ try:
                 _s.conf.set(_row[0], _row[1])
         except Exception:
             pass
+    # Só muda a mensagem de erro: o trecho da query que ela mostra vem inteiro, sem "... 30 more fields" (o padrão
+    # corta em 25 colunas e pode esconder justamente a coluna que faltou). As configurações abaixo podem trocar.
+    try:
+        _s.conf.set("spark.sql.debug.maxToStringFields", "1000")
+    except Exception:
+        pass
 
     for _k, _v in _p["conf"].items():
         try:
@@ -503,7 +509,7 @@ except Exception as _e:
     _falha = {"ok": False, "error": type(_e).__name__ + ": " + str(_e), "traceback": _tb.format_exc(),
               "elapsed": round(_time.time() - _t0, 2), "log": _log, "statement": _i_cmd}
     if any(_x in str(_e) for _x in ("Column '", "UNRESOLVED_COLUMN", "UNRESOLVED_FIELD", "cannot resolve",
-                                    "No such struct field")):
+                                    "No such struct field", "unresolved operator")):
         try:
             _falha["inputs"] = _colunas_das_entradas()   # coluna não encontrada: o que cada entrada tem
         except Exception:

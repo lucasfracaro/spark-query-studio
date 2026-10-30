@@ -214,7 +214,8 @@ def test_execucao_completa():
     assert [c["name"] for c in res["columns"]] == ["id", "nome", "valor"]
     assert res["rows"] == [[1, "a", None], [2, "b", 3.5]]           # limite aplicado
     s = spark.last_session                                          # tudo roda numa sessão nova
-    assert s.conf_values == {"spark.sql.catalogImplementation": "hive", "spark.sql.shuffle.partitions": "10"}
+    assert s.conf_values == {"spark.sql.catalogImplementation": "hive", "spark.sql.shuffle.partitions": "10",
+                             "spark.sql.debug.maxToStringFields": "1000"}     # erro mostra o trecho inteiro
     assert s.sql_log == ["USE `analytics`", "SET x=1", "SELECT * FROM vendas"]
     assert set(s.views) == {"vendas", "clientes"}
     assert ("where", "dt >= '2026-01-01'") in s.calls
@@ -234,7 +235,8 @@ def test_cada_execucao_usa_sessao_nova():
     primeira, segunda = spark.sessions
     assert primeira is not segunda
     assert "v" in primeira.views and segunda.views == {}            # a view da 1ª execução não existe na 2ª
-    assert segunda.conf_values == {"spark.sql.catalogImplementation": "hive", "spark.glue.algo": "x"}
+    assert segunda.conf_values == {"spark.sql.catalogImplementation": "hive", "spark.glue.algo": "x",
+                                   "spark.sql.debug.maxToStringFields": "1000"}
     assert spark.cache_cleared == 0                                 # o cache não é jogado fora a cada execução
 
 
@@ -486,6 +488,14 @@ def test_erro_de_coluna_traz_o_comando_e_as_colunas_de_cada_entrada(glue_context
     assert clientes == {"alias": "clientes", "kind": "catalog", "source": "db.clientes", "read": "nativa",
                         "columns": ["id", "doc"], "catalog": ["id", "doc"]}
     assert arquivo["read"] == "s3" and "catalog" not in arquivo and arquivo["columns"] == ["id", "doc"]
+
+
+def test_unresolved_operator_tambem_traz_as_colunas_das_entradas():
+    erro = "unresolved operator 'Project [id#1, 'regiao];"
+    spark = FakeSpark(columns=[("id", "int")], fail_on="regiao", fail_message=erro)
+    res = run_generated(build_spark_code("WITH b AS (SELECT id, regiao FROM v) SELECT 1",
+                                         Orchestration(inputs=[InputSource("v", "s3", "s3://b/v/")])), spark)
+    assert res["inputs"] == [{"alias": "v", "kind": "s3", "source": "s3://b/v/", "read": "s3", "columns": ["id"]}]
 
 
 def test_erro_de_coluna_com_leitura_pelo_dynamic_frame_e_catalogo_inacessivel(glue_context):

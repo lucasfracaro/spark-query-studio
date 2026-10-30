@@ -233,3 +233,61 @@ def test_so_confere_o_catalogo_quando_nenhuma_entrada_trouxe_a_coluna():
     assert ce.needs_user_catalog({"error": ERRO_33, "inputs": _sessao()})
     assert not ce.needs_user_catalog({"error": ERRO_33, "inputs": _sessao(COLUNAS + ["codigo9_str"])})
     assert not ce.needs_user_catalog({"error": "[TABLE_OR_VIEW_NOT_FOUND] x"})
+
+
+# --------------------------------------------------------------------------- "unresolved operator" (Glue 4.0)
+QUERY_CTE = """WITH base_rotas AS (
+  SELECT
+    lpad(cast(ESTADO_ORIGEM AS int), 2, '0') AS ESTADO_ORIGEM,
+    CASE WHEN CIDADE_ORIGEM IS NULL THEN '000' ELSE concat(ESTADO_ORIGEM, CIDADE_ORIGEM) END AS CIDADE_ORIGEM,
+    CASE WHEN CIDADE_DESTINO IS NULL THEN '000' ELSE CIDADE_DESTINO END AS CIDADE_DESTINO,
+    DATA
+  FROM rotas
+),
+resumo AS (
+  SELECT r.ESTADO_ORIGEM, b.CIDADE_ORIGEM FROM rotas r JOIN base_rotas b ON r.ESTADO_ORIGEM = b.ESTADO_ORIGEM
+)
+SELECT ESTADO_ORIGEM, count(*) AS n FROM rotas GROUP BY ESTADO_ORIGEM"""
+ERRO_OPERADOR = ("AnalysisException: unresolved operator 'Project [lpad(cast(cast(ESTADO_ORIGEM#101 as int) as "
+                 "string), 2, 0) AS ESTADO_ORIGEM#201, CASE WHEN isnull('CIDADE_ORIGEM) THEN 000 ELSE "
+                 "concat(ESTADO_ORIGEM#101, 'CIDADE_ORIGEM) END AS CIDADE_ORIGEM#202, CASE WHEN "
+                 "isnull('CIDADE_DESTINO) THEN 000 ELSE 'CIDADE_DESTINO END AS CIDADE_DESTINO#203, DATA#110];")
+ROTAS = [InputSource("rotas", "catalog", "produtor.rotas")]
+LIDAS = ["ESTADO_ORIGEM", "VALOR", "DATA"]
+SESSAO_ROTAS = [{"alias": "rotas", "kind": "catalog", "source": "produtor.rotas", "read": "nativa",
+                 "columns": LIDAS, "catalog": LIDAS}]
+
+
+def test_unresolved_operator_vira_as_colunas_que_faltam():
+    uc = ce.parse(ERRO_OPERADOR)
+    assert (uc.column, uc.others, uc.operator) == ("CIDADE_ORIGEM", ["CIDADE_DESTINO"], "Project")
+    assert [c for _, c in uc.candidates] == ["ESTADO_ORIGEM", "DATA"]               # as que o Spark encontrou
+    assert uc.outputs == ["ESTADO_ORIGEM", "CIDADE_ORIGEM", "CIDADE_DESTINO"]        # as que o trecho cria
+    assert ce.parse("unresolved operator 'Project [id#1, 'f(x#2) AS y#3];") is None   # função, não coluna
+
+
+def test_unresolved_operator_numa_cte_que_a_query_final_nao_usa():
+    usuario = {"rotas": {"source": "produtor.rotas", "columns": LIDAS + ["CIDADE_ORIGEM", "CIDADE_DESTINO"]}}
+    d = ce.diagnose(ERRO_OPERADOR, QUERY_CTE, QUERY_CTE, SESSAO_ROTAS, usuario, ROTAS, role="SessaoGlue", glue=True)
+    assert d.kind == "role" and d.title == "A role da sessão não enxerga as colunas `CIDADE_ORIGEM` e `CIDADE_DESTINO`"
+    assert d.missing_too == ["CIDADE_DESTINO"] and d.cte == "base_rotas"
+    assert "CTE `base_rotas`, que a query final não usa" in d.cause and "apague-a" in d.cause
+    assert d.position == (4, 14)                               # a 1ª CIDADE_ORIGEM, dentro da CTE
+    assert d.scope == ("As outras colunas desse trecho (`ESTADO_ORIGEM`, `DATA`) o Spark encontrou na entrada "
+                       "`rotas` (`produtor.rotas`).")
+
+
+def test_unresolved_operator_numa_cte_usada_sem_conferir_o_catalogo():
+    usada = QUERY_CTE.replace("SELECT ESTADO_ORIGEM, count(*) AS n FROM rotas GROUP BY ESTADO_ORIGEM",
+                              "SELECT * FROM resumo")
+    d = ce.diagnose(ERRO_OPERADOR, usada, usada, SESSAO_ROTAS, None, ROTAS, glue=True)
+    assert d.kind == "nao_existe" and d.title == "A sessão não encontrou as colunas `CIDADE_ORIGEM` e `CIDADE_DESTINO`"
+    assert "O erro está na CTE `base_rotas`." in d.cause and "não usa" not in d.cause
+    assert d.similar == [] or "CIDADE_ORIGEM" not in d.similar
+
+
+def test_coluna_formatada_com_o_proprio_nome_nao_e_nome_criado_no_select():
+    sql = "SELECT CASE WHEN regiao IS NULL THEN '00' ELSE regiao END AS regiao FROM vendas"
+    erro = "Column 'regiao' does not exist. Did you mean one of the following? [vendas.id]; line 1 pos 17;"
+    d = ce.diagnose(erro, sql, sql, [{"alias": "vendas", "kind": "s3", "source": "s3://b/", "columns": ["id"]}])
+    assert d.kind == "nao_existe"
