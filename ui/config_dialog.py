@@ -121,6 +121,11 @@ def _formulario(lc: settings_store.LoadedConfig):
                          help="Role que o Glue assume para rodar a sessão Spark (precisa ler o S3 e o Glue Catalog). "
                               "Se os jobs de produção já leem as tabelas, a role deles é a escolha mais segura.")
     temp = st.text_input("Diretório temporário no S3 (opcional)", acc.temp_dir, placeholder="s3://meu-bucket/glue-tmp/")
+    pasta_queries = st.text_input(
+        "Pasta das queries no S3 (opcional)", acc.queries_root, placeholder="s3://meu-bucket/queries/",
+        key=f"cfg_queries_{v}",
+        help="Onde ficam as queries salvas como nome_da_tabela.sql. Na importação do Athena, a busca pelo nome da "
+             "tabela começa por aqui (e olha as subpastas).")
 
     st.markdown("**Sessão do Glue**")
     c1, c2 = st.columns(2)
@@ -157,7 +162,7 @@ def _formulario(lc: settings_store.LoadedConfig):
 
     novo_acc = AwsAccount(region=region.strip(), auth_mode=auth_mode, profile=profile.strip(),
                           access_key=ak.strip(), secret_key=sk.strip(), session_token=tok.strip(),
-                          glue_role_arn=role.strip(), temp_dir=temp.strip())
+                          glue_role_arn=role.strip(), temp_dir=temp.strip(), queries_root=pasta_queries.strip())
     nova_inst = InstanceConfig(worker_type=worker, num_workers=int(workers), glue_version=versao,
                                idle_timeout_min=int(ocioso), extra_args=dict(inst.extra_args), tags=dict(inst.tags),
                                start_on_open=iniciar, lake_formation=lf, default_database=db_padrao.strip())

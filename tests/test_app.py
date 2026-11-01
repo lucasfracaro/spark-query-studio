@@ -408,6 +408,9 @@ def _script_janela(nome):
     elif nome == "orquestracao":
         from ui.orchestration import orchestration_body
         orchestration_body()
+    elif nome == "processo":
+        from ui.s3_queries import process_body
+        process_body()
     else:
         from ui.orchestration import athena_body
         athena_body()
@@ -604,6 +607,173 @@ def test_janela_do_athena_sem_estimativa_nao_consulta_a_aws(janela, monkeypatch)
     assert not at.exception, at.exception
     assert at.session_state["sizing_data"] is None
     assert not any("Tamanho sugerido" in m.value for m in at.markdown)
+
+
+# --------------------------------------------------------------------------- busca no S3
+_B = "meu-bucket"
+_ARQUIVOS_S3 = {
+    (_B, "queries/financeiro/athena/vendas.sql"): b"SELECT * FROM db.vendas WHERE dt = '2026-10-01'",
+    (_B, "queries/financeiro/spark/vendas.sql"): b"SELECT * FROM vendas",
+    (_B, "queries/financeiro/orchestration/vendas.json"):
+        b'{"entradas": [{"alias": "vendas", "source": "db.vendas", "filter": "dt = \'2026-10-01\'"}]}',
+    (_B, "queries/financeiro/metadata/vendas.json"): b'{"colunas": [{"coluna": "valor", "descricao": "Valor em R$"}]}',
+    (_B, "queries/antigo/athena/orchestration/vendas.json"): b'{"saf": {"motor": "athena"}}',
+    (_B, "queries/financeiro/athena/clientes.sql"): b"SELECT * FROM db.clientes",
+    (_B, "queries/antigo/athena/clientes.sql"): b"SELECT id FROM db.clientes",
+}
+
+
+def _s3_falso(monkeypatch, **kw):
+    from fakes import FakeS3
+    s3 = FakeS3(buckets=[_B], contents=_ARQUIVOS_S3, **kw)
+    _aws_falsa(monkeypatch, s3=s3)
+    return s3
+
+
+def _buscar_no_s3(at, nome, raiz="s3://meu-bucket/queries/", rotulo="Tabela"):
+    next(t for t in at.text_input if t.label == rotulo).set_value(nome)
+    next(t for t in at.text_input if t.label == "Pasta raiz").set_value(raiz)
+    _botao(at, "Buscar").click().run()
+    assert not at.exception, at.exception
+
+
+def _query_do_athena(at) -> str:
+    return next(t for t in at.text_area if t.label == "Query do Athena").value
+
+
+def test_athena_busca_no_s3_e_abre_a_query_do_athena(janela, monkeypatch):
+    s3 = _s3_falso(monkeypatch)
+    at = janela("athena", engine_kind="local")
+    _buscar_no_s3(at, "db.vendas")
+    assert _query_do_athena(at) == "SELECT * FROM db.vendas WHERE dt = '2026-10-01'"     # a de /athena/, não a do Spark
+    assert any("Aberta de: s3://meu-bucket/queries/financeiro/athena/vendas.sql" in c.value for c in at.caption)
+    assert s3.read == [(_B, "queries/financeiro/athena/vendas.sql")]
+    listagens = len(s3.listed)
+    _buscar_no_s3(at, "vendas")                                          # mesma pasta: a lista já lida vale
+    assert len(s3.listed) == listagens
+
+
+def test_athena_com_duas_queries_deixa_escolher(janela, monkeypatch):
+    _s3_falso(monkeypatch)
+    at = janela("athena", engine_kind="local")
+    _buscar_no_s3(at, "clientes")
+    assert _query_do_athena(at) == ""                                   # duas do Athena: nada abre sozinho
+    escolha = next(r for r in at.radio if r.label == "Arquivos encontrados")
+    escolha.set_value(next(o for o in escolha.options if "antigo" in o)).run()
+    _botao(at, "Abrir esta query").click().run()
+    assert not at.exception, at.exception
+    assert _query_do_athena(at) == "SELECT id FROM db.clientes"
+
+
+def test_athena_sem_o_arquivo_e_bucket_de_fora(janela, monkeypatch):
+    s3 = _s3_falso(monkeypatch)
+    at = janela("athena", engine_kind="local")
+    _buscar_no_s3(at, "nao_existe")
+    assert any("Nenhum `nao_existe.sql`" in w.value for w in at.warning)
+    _buscar_no_s3(at, "vendas", raiz="s3://bucket-de-outra-conta/queries/")
+    assert any("não é da conta logada" in e.value for e in at.error)
+    assert all(b == _B for b, _ in s3.listed)
+
+
+def test_athena_navega_nas_pastas_e_abre_o_arquivo(janela, monkeypatch):
+    _s3_falso(monkeypatch)
+    at = janela("athena", engine_kind="local")
+    next(t for t in at.text_input if t.label == "Pasta raiz").set_value("s3://meu-bucket/queries/")
+    _botao(at, "Navegar nas pastas").click().run()
+    assert any("s3://meu-bucket/queries/" in m.value for m in at.markdown)
+    _botao(at, "📁 antigo/").click().run()
+    _botao(at, "📁 athena/").click().run()
+    _botao(at, "📄 clientes.sql").click().run()
+    assert not at.exception, at.exception
+    assert _query_do_athena(at) == "SELECT id FROM db.clientes"
+    assert not any("s3://meu-bucket/queries/antigo/athena/" in m.value for m in at.markdown)    # fechou
+    _botao(at, "Navegar nas pastas").click().run()
+    _botao(at, "Acima").click().run()
+    _botao(at, "Buckets").click().run()
+    assert any(b.label == "🪣 meu-bucket" for b in at.button)
+
+
+def test_processo_do_spark_acha_os_tres_arquivos_e_usa(janela, monkeypatch):
+    _s3_falso(monkeypatch)
+    at = janela("processo")
+    _buscar_no_s3(at, "vendas", rotulo="Base final")
+    assert any("financeiro/spark/vendas.sql" in c.value for c in at.caption)
+    assert any("financeiro/metadata/vendas.json" in c.value for c in at.caption)
+    orquestracao = next(r for r in at.radio if r.label == "Orquestração (JSON)")
+    assert len(orquestracao.options) == 2 and "financeiro/orchestration" in orquestracao.value.key
+    next(t for t in at.toggle if t.label == "Comparar o conteúdo").set_value(True).run()
+    assert any('"motor": "athena"' in c.value for c in at.code)
+    _botao(at, "Usar os arquivos escolhidos").click().run()
+    assert not at.exception, at.exception
+    assert at.session_state["sql"] == "SELECT * FROM vendas"
+    assert list(at.session_state["inputs_base"]["source"]) == ["db.vendas"]
+    assert at.session_state["metadata_descricoes"] == {"valor": "Valor em R$"}
+    assert len(at.session_state["s3p_resumo"]["feito"]) == 3
+
+
+def test_processo_com_orquestracao_do_saf_fica_pendente(janela, monkeypatch):
+    _s3_falso(monkeypatch)
+    at = janela("processo")
+    _buscar_no_s3(at, "vendas", rotulo="Base final")
+    orquestracao = next(r for r in at.radio if r.label == "Orquestração (JSON)")
+    orquestracao.set_value(next(o for o in orquestracao.options if "antigo" in o)).run()   # opções: os rótulos
+    _botao(at, "Usar os arquivos escolhidos").click().run()
+    assert not at.exception, at.exception
+    resumo = at.session_state["s3p_resumo"]
+    assert any("formato que o app ainda não converte" in p for p in resumo["pendente"])
+    assert at.session_state["saf_orquestracao"][0].endswith("antigo/athena/orchestration/vendas.json")
+    assert list(at.session_state["inputs_base"]["alias"]) == ["minha_view"]           # o Passo 1 não mudou
+
+
+def test_processo_escolhe_cada_arquivo_navegando(janela, monkeypatch):
+    _s3_falso(monkeypatch)
+    at = janela("processo")
+    next(t for t in at.text_input if t.label == "Pasta raiz").set_value("s3://meu-bucket/queries/financeiro/")
+    _botao(at, "Navegar nas pastas").click().run()
+    _botao(at, "📁 spark/").click().run()
+    _botao(at, "📄 vendas.sql").click().run()
+    assert at.session_state["s3p_escolhas"]["query"].key == "queries/financeiro/spark/vendas.sql"
+    assert at.session_state["s3p_alvo"] == "orquestracao"                # o próximo tipo que falta
+    _botao(at, "Acima").click().run()
+    _botao(at, "📁 metadata/").click().run()
+    next(r for r in at.radio if r.label == "O arquivo clicado vai para").set_value("metadados").run()
+    _botao(at, "📄 vendas.json").click().run()
+    assert not at.exception, at.exception
+    escolhas = at.session_state["s3p_escolhas"]
+    assert escolhas["metadados"].key == "queries/financeiro/metadata/vendas.json" and escolhas["orquestracao"] is None
+    _botao(at, "Usar os arquivos escolhidos").click().run()
+    assert at.session_state["sql"] == "SELECT * FROM vendas"
+
+
+def test_passo_2_tem_a_busca_no_s3_e_mostra_o_que_foi_carregado(app):
+    app.session_state["s3p_resumo"] = {"feito": ["a query foi para o editor (`s3://b/q.sql`)"], "pendente": []}
+    app.run()
+    assert any(b.label == "☁️ Buscar no S3" for b in app.button)
+    assert any("A query foi para o editor" in c.value for c in app.caption)
+    _botao(app, "✖").click().run()
+    assert app.session_state["s3p_resumo"] is None
+
+
+def test_descricoes_dos_metadados_do_s3_entram_no_dicionario(app, monkeypatch):
+    _motor_falso(monkeypatch, {"ok": True, "log": [], "rows": [[1, 2.5]],
+                               "columns": [{"name": "ID", "type": "int"}, {"name": "valor", "type": "double"}]})
+    app.session_state["engine_kind"] = "local"
+    app.session_state["metadata_descricoes"] = {"id": "Identificador da venda"}
+    app.run()
+    _botao(app, "Executar").click().run()
+    assert not app.exception, app.exception
+    dicionario = next(d for d in app.dataframe if "descricao" in d.value.columns).value
+    assert list(dicionario["descricao"]) == ["Identificador da venda", ""]
+
+
+def test_configuracao_guarda_a_pasta_das_queries(config_file, janela):
+    at = janela("config")
+    next(t for t in at.text_input if t.label == "Pasta das queries no S3 (opcional)").set_value(
+        "s3://meu-bucket/queries/").run()
+    _botao(at, "Salvar no arquivo").click().run()
+    assert not at.exception, at.exception
+    assert 'pasta_queries = "s3://meu-bucket/queries/"' in config_file.read_text(encoding="utf-8")
+    assert at.session_state["account"].queries_root == "s3://meu-bucket/queries/"
 
 
 def test_barra_lateral_sugere_a_ultima_estimativa(novo_app):

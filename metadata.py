@@ -52,6 +52,38 @@ def dictionary_to_json(rows: list[dict], table: str = "", rows_total: int | None
                       default=str)
 
 
+_CHAVES_NOME = ("coluna", "column", "column_name", "nome", "name", "campo", "field")
+_CHAVES_DESCRICAO = ("descricao", "descrição", "description", "comment", "comentario", "comentário", "desc")
+
+
+def descriptions_from_json(text: str) -> dict[str, str]:
+    """{coluna em minúsculas: descrição} de um JSON de metadados: procura, em qualquer nível, objetos com um nome
+    (coluna, name, column...) e uma descrição (descricao, description, comment...). Serve para o JSON que o app
+    gera e para outros formatos com essa mesma ideia. ValueError se o texto não for JSON."""
+    try:
+        dados = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"O arquivo não é um JSON válido ({e}).") from e
+    saida: dict[str, str] = {}
+
+    def visita(no):
+        if isinstance(no, dict):
+            chaves = {str(k).lower(): k for k in no}
+            nome = next((no[chaves[k]] for k in _CHAVES_NOME if k in chaves and isinstance(no[chaves[k]], str)), "")
+            descricao = next((no[chaves[k]] for k in _CHAVES_DESCRICAO
+                              if k in chaves and isinstance(no[chaves[k]], str)), "")
+            if nome.strip() and descricao.strip():
+                saida.setdefault(nome.strip().lower(), descricao.strip())
+            for valor in no.values():
+                visita(valor)
+        elif isinstance(no, list):
+            for valor in no:
+                visita(valor)
+
+    visita(dados)
+    return saida
+
+
 def _quote_ident(name: str) -> str:
     return "`" + name.replace("`", "``") + "`"
 

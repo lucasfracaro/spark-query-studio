@@ -8,6 +8,7 @@ import athena_import
 import latest_partition
 import orchestration_io
 from code_builder import validate_orchestration
+from ui import s3_queries as ui_s3
 from ui import sizing as ui_sizing
 from ui import style
 from ui.editor import ace
@@ -85,11 +86,19 @@ def athena_body():
     if not athena_import.sqlglot_available():
         st.error("Para importar queries do Athena instale o pacote **sqlglot** (`pip install sqlglot`).")
         return
-    st.caption("Cole a query do Athena ou abra o arquivo. A orquestração é montada a partir das bases usadas e dos "
-               "filtros de partição das CTEs, e a query é traduzida para Spark SQL.")
+    ss.setdefault("athena_texto", "")
+    ss.setdefault("athena_origem", "")
+    ss.setdefault("athena_versao", 0)
+    st.caption("Cole a query do Athena, abra o arquivo da máquina ou busque no S3. A orquestração é montada a partir "
+               "das bases usadas e dos filtros de partição das CTEs, e a query é traduzida para Spark SQL.")
     up = st.file_uploader("Abrir arquivo", type=["sql", "txt"], key="athena_file")
-    inicial = up.getvalue().decode("utf-8", errors="replace") if up is not None else ""
-    sql_athena = st.text_area("Query do Athena", inicial, height=260, key=f"athena_sql_{up.file_id if up else 0}")
+    if up is not None and ss.get("athena_upload_id") != up.file_id:
+        ss.athena_upload_id = up.file_id
+        _abrir_query_athena(up.getvalue().decode("utf-8", errors="replace"), f"arquivo {up.name}")
+    ui_s3.render_athena(_abrir_query_athena)
+    if ss.athena_origem:
+        st.caption(f"📄 Aberta de: {ss.athena_origem}")
+    sql_athena = st.text_area("Query do Athena", ss.athena_texto, height=260, key=f"athena_sql_{ss.athena_versao}")
     c1, c2 = st.columns(2)
     db_padrao = c1.text_input("Database padrão", ss.default_db, placeholder="opcional",
                               help="Usado para tabelas escritas sem database na query e como USE na execução. Vem "
@@ -160,8 +169,19 @@ def athena_body():
         ss.editor_version += 1
         ss.athena_result = None
         ss.sizing_data = None
+        ss.athena_texto, ss.athena_origem = "", ""      # a próxima importação começa com a caixa vazia
+        ss.athena_versao += 1
         ss.open_orch_after = True
         st.rerun()
+
+
+def _abrir_query_athena(texto: str, origem: str):
+    """Põe a query na caixa da importação (arquivo da máquina ou do S3); o resultado anterior deixa de valer."""
+    ss = st.session_state
+    ss.athena_texto, ss.athena_origem = texto, origem
+    ss.athena_versao += 1
+    ss.athena_result = None
+    ss.sizing_data = None
 
 
 # ------------------------------------------------------------------------------------

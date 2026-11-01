@@ -226,7 +226,9 @@ def _erro(res: dict):
 
 def render_metadata(res: dict, col_names: list[str]):
     ss = st.session_state
-    cols = [dict(c, name=n) for c, n in zip(res["columns"], col_names, strict=True)]
+    descricoes = ss.get("metadata_descricoes") or {}        # do JSON de metadados carregado do S3
+    cols = [dict(c, name=n, descricao=descricoes.get(n.lower(), "")) for c, n in zip(res["columns"], col_names,
+                                                                                     strict=True)]
     profile = res.get("profile")
     rows = metadata.build_dictionary(cols, profile)
     if profile:

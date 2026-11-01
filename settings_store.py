@@ -51,8 +51,8 @@ ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]+$")
 
 # chave no arquivo -> campo no app
 _AWS_KEYS = {"regiao": "region", "autenticacao": "auth_mode", "perfil": "profile", "role_glue": "glue_role_arn",
-             "diretorio_temporario": "temp_dir", "access_key": "access_key", "secret_key": "secret_key",
-             "session_token": "session_token"}
+             "diretorio_temporario": "temp_dir", "pasta_queries": "queries_root", "access_key": "access_key",
+             "secret_key": "secret_key", "session_token": "session_token"}
 _INST_KEYS = {"tipo_worker": "worker_type", "workers": "num_workers", "versao_glue": "glue_version",
               "minutos_sem_uso": "idle_timeout_min", "lake_formation": "lake_formation",
               "iniciar_ao_abrir": "start_on_open", "database_padrao": "default_database",
@@ -201,6 +201,8 @@ def check(account: AwsAccount, instance: InstanceConfig | None = None, profiles:
                          "`arn:aws:iam::123456789012:role/NomeDaRole`.")
     if account.temp_dir and not account.temp_dir.startswith("s3://"):
         problemas.append("O diretório temporário deve começar com `s3://`.")
+    if account.queries_root and not account.queries_root.startswith("s3://"):
+        problemas.append("A pasta das queries no S3 deve começar com `s3://` (ex.: `s3://meu-bucket/queries/`).")
     if account.auth_mode == "profile" and account.profile and profiles and account.profile not in profiles:
         problemas.append(f"O perfil `{account.profile}` não existe no AWS CLI deste computador. "
                          f"Perfis encontrados: {', '.join(profiles)}.")
@@ -279,6 +281,9 @@ perfil = {_toml_str(a.profile)}
 role_glue = {_toml_str(a.glue_role_arn)}
 # Diretório temporário no S3 (opcional), ex.: "s3://meu-bucket/glue-tmp/"
 diretorio_temporario = {_toml_str(a.temp_dir)}
+# Pasta no S3 onde ficam as queries salvas como nome_da_tabela.sql (opcional), para a busca na importação
+# do Athena, ex.: "s3://meu-bucket/queries/". A busca olha as subpastas; as de uma pasta /athena/ são do Athena.
+pasta_queries = {_toml_str(a.queries_root)}
 # Só com autenticacao = "chaves". Chaves gravadas aqui ficam em texto puro: prefira um perfil.
 {chaves}
 [instancia]

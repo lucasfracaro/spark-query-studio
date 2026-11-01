@@ -36,6 +36,7 @@ autenticacao = "perfil"        # perfil (AWS CLI), chaves ou padrao (env vars, S
 perfil = "dev"
 role_glue = "arn:aws:iam::123456789012:role/GlueInteractiveSessionRole"
 diretorio_temporario = ""
+pasta_queries = "s3://meu-bucket/queries/"   # onde ficam as queries salvas (busca no S3)
 
 [instancia]
 tipo_worker = "G.1X"
@@ -51,6 +52,7 @@ database_padrao = "workspace_db"   # USE de cada execução e database do DDL; "
 - Se o arquivo tiver um problema (erro de digitação, região inválida, chave com nome errado, perfil que não existe no computador), o app abre mesmo assim, usa o valor padrão onde havia erro e mostra no topo o que corrigir, com um botão que abre a configuração.
 - Para usar um arquivo em outro lugar: `SQS_CONFIG=/caminho/minha_config.toml ./run.sh`.
 - Chaves de acesso (`access_key`/`secret_key`) só vão para o arquivo se você marcar **Guardar as chaves no arquivo**. Nesse caso o arquivo fica legível só pelo seu usuário. Prefira um perfil do AWS CLI.
+- **Pasta das queries no S3** (`pasta_queries`): vem preenchida nas buscas no S3 (importação do Athena e query do Spark) e pode ser trocada em cada busca.
 - **Database padrão** (`database_padrao`, padrão `workspace_db`): vem preenchido na orquestração (aba **⚙️ Opções**), na importação do Athena e no DDL, e pode ser trocado em cada orquestração ou deixado vazio. Ele vira um `USE` no começo de cada execução e vale para as tabelas escritas sem database. Escrever `database.tabela` na query continua funcionando sempre. Se o database não existir ou a role não tiver acesso a ele, a query roda assim mesmo e o resultado mostra um aviso.
 
 ## Fluxo
@@ -68,7 +70,7 @@ database_padrao = "workspace_db"   # USE de cada execução e database do DDL; "
    - `catalog` + `database.tabela` → lê do Glue Data Catalog;
    - `s3` + `s3://bucket/caminho/` + formato + opções (`header=true;sep=;`).
    Também dá para aplicar um filtro antes de criar a view, ligar **cache**, definir configs `spark.*`, escolher um database padrão e o limite de linhas. Em **📝 Abrir orquestração** ela pode ser editada como arquivo, salva na máquina ou carregada de um arquivo (veja abaixo).
-4. **Passo 2 – Query**: escreva no editor ou importe um `.sql`/`.txt`. O conteúdo vai para o editor, onde pode ser alterado. Vários comandos separados por `;` são executados em ordem, e o resultado exibido é o do último. Comentários e hints do Spark (`/*+ BROADCAST(t) */`) chegam ao Spark exatamente como foram escritos.
+4. **Passo 2 – Query**: escreva no editor, importe um `.sql`/`.txt` ou use **☁️ Buscar no S3** (veja [Buscar no S3](#-buscar-no-s3)). O conteúdo vai para o editor, onde pode ser alterado. Vários comandos separados por `;` são executados em ordem, e o resultado exibido é o do último. Comentários e hints do Spark (`/*+ BROADCAST(t) */`) chegam ao Spark exatamente como foram escritos.
 5. **Conferência da orquestração**: antes de enviar ao cluster, a query é lida e cada base usada em `FROM`/`JOIN` é comparada com as entradas da orquestração. Se faltar alguma, a execução é bloqueada com uma mensagem como *"A base `db.produtos` é usada na query (linha 3), mas não está na orquestração"*. O aviso já aparece embaixo do editor enquanto você digita. CTEs (`WITH`), views criadas na própria query, subqueries e funções como `range()` não são cobradas. Se o Spark ainda assim não encontrar uma tabela, o erro dele é traduzido para a mesma mensagem. A conferência pode ser desligada em **Opções**.
 6. **🔒 Modo somente leitura** (ligado por padrão): comandos que gravam ou alteram dados ou o catálogo (`INSERT`, `CREATE TABLE`, `DROP`, `ALTER`, `MERGE`, `DELETE`, `MSCK REPAIR`…) são bloqueados antes de ir para o cluster, com o número e a linha do comando. Consultas e comandos que só afetam a sessão (`CREATE TEMP VIEW`, `CACHE TABLE`, `SET`, `USE`) rodam normalmente. A role do Glue costuma ter permissão de escrita, então um comando esquecido na query gravaria de verdade; para executar mesmo assim, ligue **Permitir comandos que gravam** em **Opções**.
 7. **▶️ Executar**: veja [Sessão e velocidade](#sessão-e-velocidade). Durante a execução no Glue aparece **⏹️ Cancelar execução**, que cancela a query no cluster.
@@ -110,7 +112,7 @@ Cuidados com a leitura pelo GlueContext (Glue 4.0):
 
 ### 📥 Importar query do Athena
 
-Cole (ou abra) uma query escrita para o Athena e clique em **Gerar orquestração**. A ferramenta:
+Cole uma query escrita para o Athena, abra o arquivo da máquina ou busque no S3 pelo nome da tabela (veja [Buscar no S3](#-buscar-no-s3)) e clique em **Gerar orquestração**. A ferramenta:
 
 1. encontra as bases usadas. CTEs (e views criadas na própria query) não viram entrada da orquestração, porque não vêm do catálogo: os filtros de partição de dentro delas vão para a base de origem. Um filtro de partição aplicado fora da CTE, na query de cima, não é levado: o relatório avisa que todas as partições serão lidas, e dá para colocar o filtro na orquestração à mão;
 2. consulta o **Glue Data Catalog** para saber quais colunas são de partição. Sem acesso ao Glue, supõe pelo nome (`dt`, `anomes`…) e avisa;
@@ -126,6 +128,16 @@ Por que o Spark lê a tabela inteira para um `max`: ele calcula o máximo a part
 Os filtros são **copiados**, não movidos: a query continua com as condições originais, então o resultado não muda. O filtro na orquestração só faz o Spark ler menos partições.
 
 Ao aplicar, a orquestração gerada abre para revisão.
+
+### 🔎 Buscar no S3
+
+As queries salvas no S3 têm o nome da tabela (`nome_da_tabela.sql`) e, no padrão do SAF, o motor de execução faz parte do caminho. Nas duas buscas, você informa o nome e a **pasta raiz** (vem de `pasta_queries` na configuração); a busca olha a pasta e as subpastas. A lista de arquivos de uma pasta raiz vale por 10 minutos: buscar outra tabela na mesma pasta é imediato. Numa pasta com arquivos demais (um data lake inteiro, por exemplo), a busca para em ~25 s e pede uma pasta mais específica.
+
+- **Na importação do Athena**: a busca procura `nome_da_tabela.sql` em uma pasta `/athena/`. Se houver uma só, ela vai direto para a caixa da query, como se fosse um arquivo aberto da máquina. Com mais de uma (ou só fora de `/athena/`), você escolhe qual abrir.
+- **No Passo 2 (☁️ Buscar no S3)**, para o processo do Spark: a query `nome_da_base.sql` em uma pasta `/spark/`, a orquestração `nome_da_base.json` em uma pasta `/orchestration/` e os metadados `nome_da_base.json` em uma pasta `/metadata/`, todos com o nome da base final. Quando há mais de um arquivo do mesmo tipo (um para execução no Athena e outro no Spark, por exemplo), a janela mostra as opções, com caminho e data, e deixa **comparar o conteúdo** antes de escolher. **Usar os arquivos escolhidos** põe a query no editor, aplica a orquestração no Passo 1 e leva as descrições das colunas para os [metadados do resultado](#-metadados-do-resultado). A orquestração no formato do app é aplicada direto; a do SAF ainda não é convertida (o app avisa e não mexe no Passo 1).
+- **📂 Navegar nas pastas**: abre os buckets da sua conta, começando pela pasta raiz, para escolher um arquivo específico. Dá para filtrar a pasta pelo começo do nome. No Passo 2, você escolhe para qual dos três tipos vai o arquivo clicado.
+
+A busca e a navegação usam as **suas** credenciais e só abrem buckets da sua conta (os que o `ListBuckets` devolve): nenhum bucket de outra conta é consultado.
 
 ### 📏 Estimativa do tamanho da sessão
 
@@ -192,10 +204,10 @@ No Glue 4.0 (Spark 3.3), quando a coluna que falta está numa CTE que a query fi
 
 ## Permissões na AWS
 
-- **Seu usuário/role** (quem roda o app): `iam_user_policy.json` (criar/consultar sessões Glue e `iam:PassRole`; para importar do Athena, estimar a sessão e explicar uma coluna não encontrada, só leitura: tabelas e partições do catálogo, histórico do Athena e lista dos seus buckets). Sem essas permissões o app funciona do mesmo jeito; a importação supõe as partições pelo nome e a estimativa usa o que conseguir ler.
+- **Seu usuário/role** (quem roda o app): `iam_user_policy.json` (criar/consultar sessões Glue e `iam:PassRole`; para importar do Athena, estimar a sessão, explicar uma coluna não encontrada e buscar queries no S3, só leitura: tabelas e partições do catálogo, histórico do Athena, lista dos seus buckets, listagem do bucket e leitura dos arquivos de query). Sem essas permissões o app funciona do mesmo jeito; a importação supõe as partições pelo nome e a estimativa usa o que conseguir ler.
 - **Role do Glue** (assumida pela sessão): trust policy com `glue.amazonaws.com` + `iam_glue_role_policy.json` (S3, Glue Catalog e `lakeformation:GetDataAccess`). Se as tabelas usam Lake Formation, conceda também SELECT a essa role no Lake Formation.
 
-Troque `SEU-BUCKET` e `SUA-CONTA` pelos valores reais.
+Troque `SEU-BUCKET`, `PASTA-DAS-QUERIES` e `SUA-CONTA` pelos valores reais.
 
 ## Custos
 
@@ -227,7 +239,7 @@ ruff check .                          # verificador de código
 pip install pyspark && pytest tests/test_local_spark.py   # integração com Spark real (Java 17)
 ```
 
-Nenhum teste precisa de conta AWS. O motor Glue e a sessão do app são testados com um cliente falso em memória, que simula sessões provisionando, falhando, expirando ou ocupadas, além de statements com erro, cancelados ou com saída inválida. A estimativa do tamanho da sessão usa um catálogo, um S3 e um histórico do Athena falsos (os testes conferem que nenhum bucket de outra conta é chamado e que nada roda no Athena). O código PySpark gerado roda contra um Spark simulado e, no CI, contra um Spark local de verdade (inclusive o cache entre execuções e a leitura pelo GlueContext, com um GlueContext simulado). A interface é testada com o `AppTest` do próprio Streamlit, sem navegador: a tela inteira e o conteúdo das janelas de configuração, orquestração e Athena.
+Nenhum teste precisa de conta AWS. O motor Glue e a sessão do app são testados com um cliente falso em memória, que simula sessões provisionando, falhando, expirando ou ocupadas, além de statements com erro, cancelados ou com saída inválida. A estimativa do tamanho da sessão e a busca de queries no S3 usam um catálogo, um S3 (com pastas e arquivos) e um histórico do Athena falsos (os testes conferem que nenhum bucket de outra conta é chamado e que nada roda no Athena). O código PySpark gerado roda contra um Spark simulado e, no CI, contra um Spark local de verdade (inclusive o cache entre execuções e a leitura pelo GlueContext, com um GlueContext simulado). A interface é testada com o `AppTest` do próprio Streamlit, sem navegador: a tela inteira e o conteúdo das janelas de configuração, orquestração e Athena.
 
 O GitHub Actions roda tudo a cada push: o verificador de código, os testes unitários e de tela em Python 3.10, 3.12 e 3.13, e os de Spark local com o mesmo Spark e Python de cada versão do Glue (4.0 com Spark 3.3, 5.x com Spark 3.5 e 6.0 com Spark 4.1).
 
@@ -236,7 +248,7 @@ O GitHub Actions roda tudo a cada push: o verificador de código, os testes unit
 | Arquivo | Função |
 |---|---|
 | `app.py` | Entrada da interface: junta as partes da tela, na ordem |
-| `ui/` | Partes da tela: barra lateral e sessão, janela de configuração, orquestração e estimativa da sessão, query e execução, resultado |
+| `ui/` | Partes da tela: barra lateral e sessão, janela de configuração, orquestração e estimativa da sessão, busca no S3, query e execução, resultado |
 | `session_hub.py` | A sessão Spark do app: criada uma vez, conferida antes de cada execução e recriada se cair |
 | `engines.py` | Motores: Glue Interactive Sessions e Spark local |
 | `code_builder.py` | Gera o código PySpark a partir da orquestração e da query (cache entre execuções, leitura pelo GlueContext) e lê o resultado |
@@ -247,6 +259,7 @@ O GitHub Actions roda tudo a cada push: o verificador de código, os testes unit
 | `orchestration_io.py` | Formato de arquivo da orquestração (JSON) |
 | `sql_refs.py` | Descobre as bases usadas pela query e confere com a orquestração |
 | `spark_errors.py` | Resume os erros do Spark e do Java para a tela e acha a linha do erro na query |
+| `s3_queries.py` | Busca das queries salvas no S3 (pelo nome, com o motor no caminho) e navegação pelos buckets da conta |
 | `column_errors.py` | Coluna não encontrada: o motivo provável (nome, alias, permissão do Lake Formation, arquivos) |
 | `export.py` | Exportação do resultado em CSV (Excel em português, padrão, tabulação) |
 | `metadata.py` | Dicionário de dados, tipos do Athena e DDL |

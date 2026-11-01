@@ -11,6 +11,7 @@ from code_builder import build_spark_code, split_statements, validate_orchestrat
 from engines import EngineError
 from session_hub import HUB
 from sql_refs import check_query_against_orchestration, find_write_statements
+from ui import s3_queries as ui_s3
 from ui import style
 from ui.editor import ace
 from ui.engine import aws_client, fingerprint, reader
@@ -23,8 +24,13 @@ def render(engine):
     style.step(2)
     st.subheader("Query")
 
-    up_sql = st.file_uploader("Importar query de arquivo (.sql / .txt) — ou escreva direto no editor abaixo",
-                              type=["sql", "txt", "hql"], key="sql_upload")
+    c_arquivo, c_s3 = st.columns([3, 1], vertical_alignment="center")
+    up_sql = c_arquivo.file_uploader("Importar query de arquivo (.sql / .txt) — ou escreva direto no editor abaixo",
+                                     type=["sql", "txt", "hql"], key="sql_upload")
+    buscar_s3 = c_s3.button("☁️ Buscar no S3", width="stretch",
+                            help="A query do Spark e os JSON de orquestração e de metadados de uma base, pelo nome "
+                                 "dela ou navegando nas pastas.")
+    ui_s3.render_summary()
     if up_sql is not None and ss.last_upload != up_sql.file_id:
         ss.sql = up_sql.getvalue().decode("utf-8", errors="replace")
         ss.last_upload = up_sql.file_id
@@ -76,6 +82,8 @@ def render(engine):
         except ValueError as e:
             st.caption(str(e))
 
+    if buscar_s3:
+        ui_s3.process_dialog()
     _cancelar(engine)
     if run_clicked:
         _executar(engine, orch, ref_check, escritas, leitor)

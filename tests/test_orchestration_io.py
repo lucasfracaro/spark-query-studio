@@ -67,3 +67,10 @@ def test_tipo_e_formato_vazios_usam_o_padrao():
     o = from_json('{"entradas": [{"alias": "v", "source": "db.v", "kind": "", "fmt": " "},'
                   ' {"alias": "a", "kind": "s3", "source": "s3://b/p/", "fmt": "CSV"}]}')
     assert [(i.kind, i.fmt) for i in o.inputs] == [("catalog", "parquet"), ("s3", "csv")]
+
+
+def test_reconhece_o_formato_do_app():
+    from orchestration_io import is_app_format
+    assert is_app_format('{"entradas": []}') and is_app_format('{"inputs": [{"alias": "v"}]}')
+    assert not is_app_format('{"saf": {"tabelas": ["db.t"]}}')      # outro formato: não vira orquestração vazia
+    assert not is_app_format("[1, 2]") and not is_app_format("{ quebrado")

@@ -492,27 +492,67 @@ def glue_partition(values, location=None, **params):
 
 
 class FakeS3:
-    """S3 em memória. buckets: os da conta (o que o ListBuckets devolve); objects: {bucket: [(chave, bytes)]}."""
+    """S3 em memória. buckets: os da conta (o que o ListBuckets devolve); objects: {bucket: [(chave, bytes)]};
+    contents: {(bucket, chave): conteúdo} (esses objetos entram na lista com o tamanho do conteúdo);
+    page_size: objetos por página do list_objects_v2 (1.000 no S3)."""
 
-    def __init__(self, buckets=(), objects=None, deny_list_buckets=False):
+    def __init__(self, buckets=(), objects=None, deny_list_buckets=False, contents=None, modified=None,
+                 deny_get=(), page_size=1000):
         self.buckets = list(buckets)
-        self.objects = dict(objects or {})
+        self.objects = {b: list(objs) for b, objs in (objects or {}).items()}
+        self.contents = dict(contents or {})
+        for (bucket, chave), dados in self.contents.items():
+            self.objects.setdefault(bucket, []).append((chave, len(dados)))
+        self.modified = dict(modified or {})      # {(bucket, chave): datetime}
         self.deny_list_buckets = deny_list_buckets
+        self.deny_get = set(deny_get)
+        self.page_size = page_size
         self.listed = []                      # (bucket, prefixo) de cada list_objects_v2
+        self.read = []                        # (bucket, chave) de cada get_object
 
     def list_buckets(self, **_):
         if self.deny_list_buckets:
             raise AccessDeniedException("s3:ListAllMyBuckets")
         return {"Buckets": [{"Name": b} for b in self.buckets]}
 
-    def list_objects_v2(self, Bucket, Prefix="", ContinuationToken=None, **_):
+    def _objeto(self, bucket, chave, tamanho):
+        from datetime import datetime, timezone
+        return {"Key": chave, "Size": tamanho,
+                "LastModified": self.modified.get((bucket, chave), datetime(2026, 10, 30, 17, 0, tzinfo=timezone.utc))}
+
+    def list_objects_v2(self, Bucket, Prefix="", ContinuationToken=None, Delimiter=None, **_):
         self.listed.append((Bucket, Prefix))
         objetos = [(k, s) for k, s in self.objects.get(Bucket, []) if k.startswith(Prefix)]
-        pagina, proximo = _paginar(objetos, ContinuationToken, 1000)
-        resp = {"Contents": [{"Key": k, "Size": s} for k, s in pagina], "IsTruncated": bool(proximo)}
+        if Delimiter:                          # como no S3: o que tem subpasta vira CommonPrefixes, em ordem
+            itens, vistos = [], set()
+            for k, tamanho in sorted(objetos):
+                resto = k[len(Prefix):]
+                if Delimiter in resto:
+                    pasta = Prefix + resto.split(Delimiter, 1)[0] + Delimiter
+                    if pasta not in vistos:
+                        vistos.add(pasta)
+                        itens.append(("pasta", pasta))
+                else:
+                    itens.append(("objeto", (k, tamanho)))
+        else:
+            itens = [("objeto", o) for o in objetos]
+        pagina, proximo = _paginar(itens, ContinuationToken, self.page_size)
+        resp = {"Contents": [self._objeto(Bucket, k, t) for tipo, (k, t) in
+                             ((tipo, v) for tipo, v in pagina if tipo == "objeto")],
+                "IsTruncated": bool(proximo)}
+        if Delimiter:
+            resp["CommonPrefixes"] = [{"Prefix": v} for tipo, v in pagina if tipo == "pasta"]
         if proximo:
             resp["NextContinuationToken"] = proximo
         return resp
+
+    def get_object(self, Bucket, Key, **_):
+        import io
+        self.read.append((Bucket, Key))
+        if (Bucket, Key) in self.deny_get:
+            raise AccessDeniedException(f"s3:GetObject {Key}")
+        dados = self.contents[(Bucket, Key)]
+        return {"Body": io.BytesIO(dados), "ContentLength": len(dados)}
 
 
 def athena_execution(execution_id, query, state="SUCCEEDED", scanned=10 * 1024 ** 3, workgroup="primary",

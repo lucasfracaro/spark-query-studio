@@ -13,6 +13,9 @@ perfil = ""
 role_glue = ""
 # Diretório temporário no S3 (opcional), ex.: "s3://meu-bucket/glue-tmp/"
 diretorio_temporario = ""
+# Pasta no S3 onde ficam as queries salvas como nome_da_tabela.sql (opcional), para a busca na importação
+# do Athena, ex.: "s3://meu-bucket/queries/". A busca olha as subpastas; as de uma pasta /athena/ são do Athena.
+pasta_queries = ""
 # Só com autenticacao = "chaves". Chaves gravadas aqui ficam em texto puro: prefira um perfil.
 # access_key = ""
 # secret_key = ""

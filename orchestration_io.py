@@ -85,3 +85,13 @@ def from_json(text: str) -> Orchestration:
     except json.JSONDecodeError as e:
         raise OrchestrationFormatError(f"JSON inválido na linha {e.lineno}, coluna {e.colno}: {e.msg}") from None
     return from_dict(data)
+
+
+def is_app_format(text: str) -> bool:
+    """O JSON é uma orquestração do app (tem a lista de entradas)? Um JSON de outro formato (o do SAF, por
+    exemplo) não pode virar uma orquestração vazia sem aviso."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(data, dict) and isinstance(data.get("entradas", data.get("inputs")), list)

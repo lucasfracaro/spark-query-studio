@@ -151,6 +151,7 @@ class AwsAccount:
     session_token: str = ""
     glue_role_arn: str = ""           # role que o Glue assume para rodar a sessão
     temp_dir: str = ""                # s3://bucket/tmp/ (opcional)
+    queries_root: str = ""            # pasta no S3 com as queries salvas (nome_da_tabela.sql), para a busca
 
     def boto_session(self):
         import boto3

@@ -26,16 +26,22 @@
       "Resource": "*"
     },
     {
-      "Sid": "EstimativaListarOsBucketsDaConta",
+      "Sid": "ListarOsBucketsDaConta",
       "Effect": "Allow",
       "Action": "s3:ListAllMyBuckets",
       "Resource": "*"
     },
     {
-      "Sid": "EstimativaTamanhoDosArquivosNoSeuBucket",
+      "Sid": "ListarArquivosDoSeuBucketEstimativaEBuscaDeQueries",
       "Effect": "Allow",
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::SEU-BUCKET"
+    },
+    {
+      "Sid": "LerAsQueriesSalvasNoS3",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::SEU-BUCKET/PASTA-DAS-QUERIES/*"
     }
   ]
 }

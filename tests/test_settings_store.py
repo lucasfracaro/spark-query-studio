@@ -86,6 +86,17 @@ def test_database_padrao_no_arquivo(config_tmp):
     assert settings_store.check(AwsAccount(), InstanceConfig(default_database="x-y"))
 
 
+def test_pasta_das_queries_no_s3(config_tmp):
+    _escreve(config_tmp, '[aws]\npasta_queries = "s3://meu-bucket/queries/"\n')
+    lc = settings_store.load()
+    assert lc.account.queries_root == "s3://meu-bucket/queries/" and lc.ok
+    _escreve(config_tmp, '[aws]\npasta_queries = "meu-bucket/queries"\n')
+    assert any("pasta das queries" in p for p in settings_store.load().problems)
+    settings_store.save(AwsAccount(queries_root="s3://outro/q/"), InstanceConfig())
+    assert 'pasta_queries = "s3://outro/q/"' in config_tmp.read_text(encoding="utf-8")
+    assert settings_store.load().account.queries_root == "s3://outro/q/"
+
+
 def test_exemplo_versionado_esta_em_dia():
     esperado = settings_store.to_toml(AwsAccount(), InstanceConfig())
     assert settings_store.EXAMPLE_FILE.read_text(encoding="utf-8") == esperado
