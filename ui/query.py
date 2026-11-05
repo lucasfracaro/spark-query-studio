@@ -66,6 +66,13 @@ def render(engine):
                    + " grava dados e será bloqueado.")
     if leitor == "glue_context":
         st.caption("🔐 Lake Formation no Glue 4.0: as entradas `catalog` são lidas pelo GlueContext.")
+        ss.catalog_schema = st.checkbox(
+            "Ler as entradas `catalog` com o esquema do catálogo (useCatalogSchema)", ss.catalog_schema,
+            help="Como no Athena: as colunas vêm do catálogo, e a coluna que um arquivo não tem vem vazia nas "
+                 "linhas dele. Desmarcado (o padrão do Glue), as colunas vêm dos arquivos lidos. Serve para testar: "
+                 "o job só lê assim se também usar essa opção. Vale para a leitura nativa; o DynamicFrame não tem "
+                 "essa opção, e o log avisa se a leitura cair nele.")
+    esquema_do_catalogo = leitor == "glue_context" and ss.catalog_schema
 
     b1, b2, b3, _ = st.columns([1.2, 1, 1, 3])
     run_clicked = b1.button("▶️ Executar", type="primary", width="stretch")
@@ -78,7 +85,8 @@ def render(engine):
     with st.expander("Ver código PySpark gerado"):
         try:
             st.caption("É exatamente o código que vai rodar. Dá para copiar e rodar num notebook do Glue.")
-            st.code(build_spark_code(ss.sql, orch, profile=ss.profile, reader=leitor, count=ss.count_rows), language="python")
+            st.code(build_spark_code(ss.sql, orch, profile=ss.profile, reader=leitor, count=ss.count_rows,
+                                     catalog_schema=esquema_do_catalogo), language="python")
         except ValueError as e:
             st.caption(str(e))
 
@@ -114,6 +122,7 @@ def _cancelar(engine):
 
 def _executar(engine, orch, ref_check, escritas, leitor: str):
     ss = st.session_state
+    esquema_do_catalogo = leitor == "glue_context" and ss.catalog_schema
     errors = validate_orchestration(orch)
     if not ss.sql.strip():
         errors.append("A query está vazia.")
@@ -124,7 +133,8 @@ def _executar(engine, orch, ref_check, escritas, leitor: str):
     code = None
     if not errors:
         try:
-            code = build_spark_code(ss.sql, orch, profile=ss.profile, reader=leitor, count=ss.count_rows)
+            code = build_spark_code(ss.sql, orch, profile=ss.profile, reader=leitor, count=ss.count_rows,
+                                    catalog_schema=esquema_do_catalogo)
         except ValueError as e:
             errors.append(str(e))
     if engine is None and not errors:
@@ -146,7 +156,8 @@ def _executar(engine, orch, ref_check, escritas, leitor: str):
             res = HUB.run(engine, code, lambda m: box.update(label=m), fingerprint=fingerprint())
             res["total"] = round(time.time() - t0, 1)
             # o que gerou este resultado: o "baixar todas as linhas" roda exatamente a mesma coisa
-            res["origem"] = {"sql": ss.sql, "orch": orch, "reader": leitor, "engine": ss.engine_kind,
+            res["origem"] = {"sql": ss.sql, "orch": orch, "reader": leitor, "catalog_schema": esquema_do_catalogo,
+                             "engine": ss.engine_kind,
                              "role": (ss.account.glue_role_arn or "").rsplit("/", 1)[-1]}
             res["warnings"] = list(ref_check.warnings)
             if not res.get("ok") and ss.engine_kind == "glue" and column_errors.needs_user_catalog(res):

@@ -367,6 +367,21 @@ def test_lake_formation_no_glue_4_le_pelo_glue_context(app):
     assert "'reader': 'glue_context'" in codigo and "create_dynamic_frame.from_catalog" in codigo
 
 
+def test_caixa_do_esquema_do_catalogo(app):
+    # só aparece com a leitura pelo GlueContext; marcada, a leitura nativa vai com useCatalogSchema
+    assert not any("useCatalogSchema" in c.label for c in app.checkbox)
+    _glue_4_com_lake_formation(app)
+    caixa = next(c for c in app.checkbox if "useCatalogSchema" in c.label)
+    assert caixa.value is False
+    codigo = next(c.value for c in app.code if "_statements" in c.value)
+    assert "'catalog_schema': False" in codigo
+    caixa.check().run()
+    assert not app.exception, app.exception
+    assert app.session_state["catalog_schema"] is True
+    codigo = next(c.value for c in app.code if "_statements" in c.value)
+    assert "'catalog_schema': True" in codigo and '_opcoes["useCatalogSchema"] = True' in codigo
+
+
 def test_lake_formation_no_glue_4_exige_o_alias(app):
     _glue_4_com_lake_formation(app)
     app.text_area[0].set_value("SELECT * FROM meu_database.minha_tabela").run()

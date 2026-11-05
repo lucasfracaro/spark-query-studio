@@ -90,11 +90,12 @@ def fetch_full_result(run: Callable[[str, Callable[[str], None]], dict], sql: st
                       reader: str = "spark", formato: str = "excel_br",
                       on_status: Callable[[str], None] = lambda m: None,
                       max_rows: int = EXPORT_MAX_ROWS, chunk_bytes: int = EXPORT_CHUNK_BYTES,
-                      result_key: str | None = None) -> tuple[bytes, dict]:
+                      result_key: str | None = None, catalog_schema: bool = False) -> tuple[bytes, dict]:
     """O resultado inteiro em CSV (UTF-8 com BOM, como o da tela) e o resumo {rows, truncated, bytes, rerun}.
 
     run(código, on_status) executa um comando na sessão e devolve o resultado lido (ex.: session_hub.HUB.run).
-    result_key: a chave do resultado que a execução deixou guardado na sessão (o "result_key" da resposta)."""
+    result_key: a chave do resultado que a execução deixou guardado na sessão (o "result_key" da resposta).
+    catalog_schema: a leitura com o esquema do catálogo, como na execução (para rodar de novo igual)."""
     if formato not in _SEPARADOR:
         raise ValueError(f"Formato desconhecido: {formato}")
     config = {"format": formato, "sep": _SEPARADOR[formato], "max_rows": int(max_rows), "chunk": int(chunk_bytes)}
@@ -109,7 +110,7 @@ def fetch_full_result(run: Callable[[str, Callable[[str], None]], dict], sql: st
     rodou_de_novo = res is None
     if res is None:
         on_status("Rodando a query de novo para trazer todas as linhas…")
-        res = run(build_spark_code(sql, orch, reader=reader, export=config), on_status)
+        res = run(build_spark_code(sql, orch, reader=reader, export=config, catalog_schema=catalog_schema), on_status)
         if not res or not res.get("ok"):
             raise ExportError((res or {}).get("error") or "A sessão não devolveu o resultado.")
     info = res["export"]

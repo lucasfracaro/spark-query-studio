@@ -136,6 +136,17 @@ def test_csv_completo_roda_de_novo_quando_o_resultado_guardado_e_de_outra_execuc
     assert info["rerun"] is True and info["rows"] == 4
 
 
+def test_csv_completo_roda_de_novo_com_o_esquema_do_catalogo_da_execucao():
+    chamadas = []
+
+    def run(codigo, on_status):
+        chamadas.append(codigo)
+        return {"ok": False, "error": "parou aqui"}
+    with pytest.raises(ExportError, match="parou aqui"):
+        fetch_full_result(run, "SELECT * FROM v", ORCH, reader="glue_context", catalog_schema=True)
+    assert "'catalog_schema': True" in chamadas[0] and "'reader': 'glue_context'" in chamadas[0]
+
+
 def test_arquivo_do_driver_e_apagado_depois_da_ultima_parte():
     import glob
     import os

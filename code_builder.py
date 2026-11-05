@@ -12,6 +12,7 @@ Gera o código PySpark que será executado no motor (Glue Interactive Session ou
   porque no Glue 4.0 só essa leitura usa as permissões do Lake Formation (dados no S3 de outra conta).
   Primeiro a leitura nativa do Spark (create_data_frame.from_catalog com useSparkDataSource, que lê só as
   colunas usadas); se ela não funcionar, o DynamicFrame (create_dynamic_frame.from_catalog), mais lento.
+  Com catalog_schema, a leitura nativa vai com useCatalogSchema (o esquema do catálogo, como no Athena).
 - O resultado volta como uma linha marcada com RESULT_MARKER, com o JSON comprimido em base64.
 """
 from __future__ import annotations
@@ -325,6 +326,8 @@ try:
         # O push_down_predicate só aceita colunas de partição: as partições da tabela são conferidas no
         # catálogo e só a parte do filtro que usa apenas elas vai para a leitura; o filtro inteiro é aplicado
         # depois, então o resultado é o mesmo.
+        # catalog_schema (opção da tela): a leitura nativa vai com useCatalogSchema, que aplica o esquema do
+        # catálogo, como o Athena (sem ela, as colunas vêm dos arquivos). O DynamicFrame não tem essa opção.
         _gc = globals().get("_sqs_gc")
         if _gc is None:
             from awsglue.context import GlueContext
@@ -343,9 +346,12 @@ try:
                 _usar = [_x["sql"] for _x in _partes if _x["cols"] and set(_x["cols"]) <= _part]
                 _depois = [_x["sql"] for _x in _partes if not (_x["cols"] and set(_x["cols"]) <= _part)]
                 _push = _usar[0] if len(_usar) == 1 else " AND ".join("(" + _x + ")" for _x in _usar)
+        _opcoes = {"useSparkDataSource": True}
+        if _p.get("catalog_schema"):
+            _opcoes["useCatalogSchema"] = True
         try:
             _d = _gc.create_data_frame.from_catalog(database=_db, table_name=_tabela, push_down_predicate=_push,
-                                                    additional_options={"useSparkDataSource": True})
+                                                    additional_options=_opcoes)
             _d.limit(1).collect()              # a leitura é preguiçosa: confere agora o acesso aos arquivos
         except Exception as _e:
             _d, _nativa_falhou = None, (str(_e).strip().splitlines() or [""])[0][:200]
@@ -366,7 +372,8 @@ try:
         except Exception:
             _rdd = _nativa_falhou != ""
         _como = ("DynamicFrame: lê todas as colunas, mais lento" if _rdd
-                 else "leitura nativa do Spark: só as colunas usadas")
+                 else "leitura nativa do Spark: só as colunas usadas"
+                 + ("; esquema do catálogo (useCatalogSchema)" if _p.get("catalog_schema") else ""))
         _modos[_chave] = "dynamicframe" if _rdd else "nativa"
         if _push:
             _onde = " (partições: " + _push + ")"
@@ -382,34 +389,48 @@ try:
         # nativa, pelo esquema de um dos arquivos): uma coluna do catálogo que não veio não existe aqui, e no
         # Athena existe (vazia nos arquivos que não a têm). Só avisa: o resultado é o de um job do Glue que lê
         # do mesmo jeito.
+        _faltam = []
         if _no_catalogo is not None:
             try:
                 _lidas = {_f.name.lower() for _f in _d.schema.fields}
                 _faltam = [_n for _n, _e_part in _no_catalogo if not _e_part and _n.lower() not in _lidas]
                 # nenhuma coluna em comum: o esquema do catálogo é outro (ex.: o "col array<string>" de uma
                 # tabela Delta), não uma coluna que faltou
-                if len(_faltam) < len([_n for _n, _e_part in _no_catalogo if not _e_part]):
-                    _ausentes[_chave] = (_faltam, _src, "dynamicframe" if _rdd else "nativa")
+                if len(_faltam) == len([_n for _n, _e_part in _no_catalogo if not _e_part]):
+                    _faltam = []
             except Exception:
-                pass
+                _faltam = []
+        _ausentes[_chave] = {"faltam": _faltam, "src": _src, "modo": "dynamicframe" if _rdd else "nativa",
+                             "catalogo": bool(_p.get("catalog_schema"))}
         return _d.where(_filtro) if _filtro else _d
 
     _ausentes = globals().setdefault("_sqs_ausentes", {})  # colunas do catálogo que a leitura não trouxe
 
     def _avisar_ausentes(_alias, _chave):
-        _faltam, _src, _como = _ausentes.get(_chave) or ([], "", "")
+        _info = _ausentes.get(_chave) or {}
+        _faltam, _src, _como = _info.get("faltam") or [], _info.get("src", ""), _info.get("modo", "")
+        if _info.get("catalogo") and _como == "dynamicframe":
+            _log.append("AVISO: o esquema do catálogo (useCatalogSchema) só vale na leitura nativa, e a leitura de "
+                        + _alias + " foi pelo DynamicFrame: as colunas vêm dos arquivos.")
         if not _faltam:
             return
         _uma = len(_faltam) == 1
         _nomes = ", ".join(_faltam[:12]) + (" e mais " + str(len(_faltam) - 12) if len(_faltam) > 12 else "")
+        _nao_trouxe = ("AVISO: a leitura de " + _alias + " não trouxe "
+                       + ("a coluna " if _uma else str(len(_faltam)) + " colunas ") + "do catálogo de " + _src
+                       + " (" + _nomes + ")")
+        _athena = (". No Athena " + ("ela existe, vazia," if _uma else "elas existem, vazias,") + " onde o arquivo "
+                   "não " + ("a" if _uma else "as") + " tem; aqui, a query que " + ("a usar" if _uma else
+                   "usar alguma delas") + " falha")
+        if _info.get("catalogo") and _como == "nativa":
+            _log.append(_nao_trouxe + ", mesmo com o esquema do catálogo marcado: o Glue desta sessão não aplicou "
+                        "o useCatalogSchema" + _athena + ".")
+            return
         _log.append(
-            "AVISO: a leitura de " + _alias + " não trouxe " + ("a coluna " if _uma else str(len(_faltam)) + " colunas ")
-            + "do catálogo de " + _src + " (" + _nomes + "). Pelo GlueContext, as colunas vêm dos arquivos lidos"
+            _nao_trouxe + ". Pelo GlueContext, as colunas vêm dos arquivos lidos"
             + (" e nenhum deles " + ("a" if _uma else "as") + " tem" if _como == "dynamicframe"
                else " (na leitura nativa, do esquema de um deles), não do catálogo")
-            + ". No Athena " + ("ela existe, vazia," if _uma else "elas existem, vazias,") + " onde o arquivo não "
-            + ("a" if _uma else "as") + " tem; aqui, a query que " + ("a usar" if _uma else "usar alguma delas")
-            + " falha, como num job do Glue que lê do mesmo jeito.")
+            + _athena + ", como num job do Glue que lê do mesmo jeito.")
 
     def _para_esta_sessao(_d, _nome):
         # o GlueContext cria o DataFrame em outra sessão do Spark; uma view global deixa a sessão desta
@@ -557,14 +578,18 @@ def _key(*partes) -> str:
     return hashlib.sha1(texto.encode("utf-8")).hexdigest()[:12]
 
 
-def input_cache_key(inp: InputSource, default_database: str = "", reader: str = "spark") -> str:
+def input_cache_key(inp: InputSource, default_database: str = "", reader: str = "spark",
+                    catalog_schema: bool = False) -> str:
     """Identifica o que é lido por uma entrada: se não mudar, o cache da execução anterior serve.
-    O alias não entra: renomear a view não obriga a reler os dados."""
+    O alias não entra: renomear a view não obriga a reler os dados. catalog_schema: leitura com o esquema
+    do catálogo (useCatalogSchema), que muda as colunas lidas."""
     if inp.kind == "s3":
         ident = ("s3", inp.source.strip(), (inp.fmt or "parquet").lower(), parse_options(inp.options))
     else:
         db = "" if "." in inp.source else default_database.strip()
         ident = ("catalog", inp.source.strip().lower(), db.lower(), reader)
+        if catalog_schema:
+            ident += ("esquema do catálogo",)
     return "e:" + _key(*ident, inp.filter.strip())
 
 
@@ -615,12 +640,14 @@ def filter_parts(texto: str) -> list[dict]:
 
 
 def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reader: str = "spark",
-                     export: dict | None = None, count: bool = False) -> str:
+                     export: dict | None = None, count: bool = False, catalog_schema: bool = False) -> str:
     """Monta o script PySpark que cria as entradas, roda a query e imprime o resultado.
 
     O código mostrado na tela é exatamente o que roda. Se a versão legível passar do limite do
     Glue, a query vai comprimida; se nem assim couber, levanta ValueError.
     reader="glue_context": entradas do catálogo lidas pelo GlueContext (Glue 4.0 com Lake Formation).
+    catalog_schema: com o glue_context, a leitura nativa aplica o esquema do catálogo (useCatalogSchema),
+    como o Athena, em vez de montar as colunas pelos arquivos.
     """
     if reader not in READERS:
         raise ValueError(f"Leitor desconhecido: {reader}")
@@ -629,7 +656,8 @@ def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reade
         raise ValueError("A query está vazia.")
 
     db = orch.default_database.strip()
-    inputs = [dict(asdict(i), options=parse_options(i.options), key=input_cache_key(i, db, reader))
+    catalog_schema = bool(catalog_schema) and reader == "glue_context"
+    inputs = [dict(asdict(i), options=parse_options(i.options), key=input_cache_key(i, db, reader, catalog_schema))
               for i in orch.inputs if i.is_valid()]
     if reader == "glue_context":
         for i in inputs:
@@ -643,6 +671,7 @@ def build_spark_code(sql: str, orch: Orchestration, profile: bool = False, reade
         "limit": int(orch.limit),
         "profile": bool(profile),
         "reader": reader,
+        "catalog_schema": catalog_schema,
         "keep_cached": [i["key"] for i in inputs if i["cache"]] + [c["key"] for c in caches_sql],
         "sql_caches": caches_sql,
         "marker": RESULT_MARKER,

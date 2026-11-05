@@ -41,6 +41,7 @@ def init():
     ss.setdefault("check_refs", True)
     ss.setdefault("profile", False)
     ss.setdefault("count_rows", True)        # contar todas as linhas do resultado (e guardar para o CSV)
+    ss.setdefault("catalog_schema", False)   # Glue 4.0 com Lake Formation: ler com o esquema do catálogo
     ss.setdefault("result_version", 0)
     ss.setdefault("orch_draft", "")
     ss.setdefault("orch_draft_version", 0)

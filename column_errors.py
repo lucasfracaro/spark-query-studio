@@ -635,6 +635,10 @@ def _diagnostico(uc: UnresolvedColumn, statement: str, query: str, inputs, user_
                          "existe mesmo assim (vem vazia onde o arquivo não a tem); no Glue, não, e um job que lê "
                          "essa tabela do mesmo jeito falha igual. Se a query não precisa dela, tire-a; se precisa, "
                          "confira as partições do filtro da entrada.")
+                if e.read != "dynamicframe":
+                    causa += (" Para comparar com o Athena, dá para ler com o esquema do catálogo (a caixa do "
+                              "useCatalogSchema, acima do botão ▶️ Executar); o job só lê assim se também usar "
+                              "essa opção.")
             else:
                 causa = (f"`{coluna}` está no catálogo de `{e.source}`, mas a leitura da entrada `{e.alias}` não "
                          "a trouxe: os arquivos lidos não têm essa coluna. Confira as partições do filtro da entrada.")

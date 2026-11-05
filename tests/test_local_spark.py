@@ -203,7 +203,15 @@ class _GlueContextLocal:
                 if _GlueContextLocal.nativa_falha:
                     raise RuntimeError("useSparkDataSource is not supported")
                 _GlueContextLocal.leituras.append(("nativa", database, table_name, push_down_predicate))
-                return ler(database, table_name, push_down_predicate)
+                df = ler(database, table_name, push_down_predicate)
+                if (additional_options or {}).get("useCatalogSchema"):
+                    # o esquema do catálogo, com as colunas casadas pelo nome (vazia se o arquivo não a tem)
+                    from pyspark.sql import functions as F
+                    lidas = {c.lower(): c for c in df.columns}
+                    df = df.select([(F.col(lidas[f.name.lower()]) if f.name.lower() in lidas else F.lit(None))
+                                    .cast(f.dataType).alias(f.name)
+                                    for f in spark.table(f"{database}.{table_name}").schema.fields])
+                return df
 
         class _Dinamico:
             def from_catalog(self, database, table_name, push_down_predicate=""):
@@ -366,6 +374,26 @@ def test_glue_context_coluna_do_catalogo_que_a_leitura_nao_trouxe(engine, tmp_pa
     # já na leitura, antes do erro: o aviso de que o catálogo tem uma coluna que não veio
     assert any(linha.startswith("AVISO: a leitura de clientes não trouxe a coluna do catálogo de db_diag.clientes "
                                 "(doc_str)") for linha in res["log"]), res["log"]
+
+
+def test_glue_context_com_o_esquema_do_catalogo(engine, tmp_path, awsglue_local):
+    # a caixa "esquema do catálogo" (useCatalogSchema): a coluna do catálogo que o arquivo não tem vem vazia
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
+    spark.sql(f"CREATE DATABASE IF NOT EXISTS db_esq LOCATION '{(tmp_path / 'db').as_posix()}'")
+    (spark.createDataFrame([(1, "123", "123")], ["id", "doc", "doc_str"])
+     .write.mode("overwrite").option("path", (tmp_path / "clientes").as_posix()).saveAsTable("db_esq.clientes"))
+    arquivo = tmp_path / "clientes.csv"
+    arquivo.write_text("id;doc\n1;123\n2;456\n", encoding="utf-8")
+    awsglue_local.tabelas["db_esq.clientes"] = str(arquivo)
+    orch = Orchestration(inputs=[InputSource("clientes", "catalog", "db_esq.clientes")])
+    sql = "SELECT id, doc, doc_str FROM clientes ORDER BY id"
+    assert engine.run(build_spark_code(sql, orch, reader="glue_context"))["ok"] is False
+    res = engine.run(build_spark_code(sql, orch, reader="glue_context", catalog_schema=True))
+    assert res["ok"], res
+    assert res["rows"] == [[1, "123", None], [2, "456", None]]
+    assert any("esquema do catálogo (useCatalogSchema)" in linha for linha in res["log"]), res["log"]
+    assert not any(linha.startswith("AVISO") for linha in res["log"]), res["log"]
 
 
 def test_coluna_que_falta_numa_cte_que_a_query_nao_usa(engine, csv_vendas):

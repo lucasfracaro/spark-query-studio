@@ -471,6 +471,48 @@ def test_glue_context_avisa_das_colunas_do_catalogo_que_a_leitura_nao_trouxe(glu
         assert res["ok"] and not any(linha.startswith("AVISO") for linha in res["log"]), fonte
 
 
+def test_glue_context_com_o_esquema_do_catalogo(glue_context):
+    # a caixa "esquema do catálogo": a leitura nativa vai com useCatalogSchema (as colunas do catálogo, como no
+    # Athena) e o cache é outro (as colunas mudam)
+    spark, ns = FakeSpark(), {}
+    spark.catalog_columns["db.v"] = ["id", "nome", "valor", "regiao_nova"]
+    entrada = InputSource("v", "catalog", "db.v", cache=True)
+    orch = Orchestration(inputs=[entrada])
+    res = run_generated(build_spark_code("SELECT 1", orch, reader="glue_context", catalog_schema=True), spark, ns)
+    assert res["ok"], res
+    assert glue_context[0].native_reads[-1][3] == {"useSparkDataSource": True, "useCatalogSchema": True}
+    assert any("leitura nativa do Spark: só as colunas usadas; esquema do catálogo (useCatalogSchema)" in linha
+               for linha in res["log"])
+    assert not any(linha.startswith("AVISO") for linha in res["log"])            # regiao_nova veio
+    assert input_cache_key(entrada, "", "glue_context", True) != input_cache_key(entrada, "", "glue_context")
+    sem = run_generated(build_spark_code("SELECT 1", orch, reader="glue_context"), spark, ns)
+    assert glue_context[0].native_reads[-1][3] == {"useSparkDataSource": True}   # outra chave: leu de novo
+    assert any(linha.startswith("AVISO: a leitura de v não trouxe a coluna") for linha in sem["log"])
+    # um Glue que ignora a opção: o aviso diz que ela não teve efeito
+    glue_context[0].aplica_esquema_do_catalogo = False
+    spark.catalog_columns["db.w"] = ["id", "nome", "valor", "regiao_nova"]
+    orch_w = Orchestration(inputs=[InputSource("w", "catalog", "db.w")])
+    res = run_generated(build_spark_code("SELECT 1", orch_w, reader="glue_context", catalog_schema=True), spark, ns)
+    assert any(linha.startswith("AVISO: a leitura de w não trouxe a coluna do catálogo de db.w (regiao_nova), mesmo "
+                                "com o esquema do catálogo marcado: o Glue desta sessão não aplicou o useCatalogSchema")
+               for linha in res["log"]), res["log"]
+    # o DynamicFrame não tem a opção: avisa
+    glue_context[0].nativa_falha = True
+    spark.catalog_columns["db.x"] = ["id", "nome", "valor"]
+    orch_x = Orchestration(inputs=[InputSource("x", "catalog", "db.x")])
+    res = run_generated(build_spark_code("SELECT 1", orch_x, reader="glue_context", catalog_schema=True), spark, ns)
+    assert "AVISO: o esquema do catálogo (useCatalogSchema) só vale na leitura nativa, e a leitura de x foi pelo " \
+           "DynamicFrame: as colunas vêm dos arquivos." in res["log"]
+
+
+def test_esquema_do_catalogo_so_vale_com_o_glue_context():
+    orch = Orchestration(inputs=[InputSource("v", "catalog", "db.v")])
+    assert (build_spark_code("SELECT 1", orch, reader="spark", catalog_schema=True)
+            == build_spark_code("SELECT 1", orch, reader="spark"))
+    assert "'catalog_schema': True," in build_spark_code("SELECT 1", orch, reader="glue_context", catalog_schema=True)
+    assert "'catalog_schema': False," in build_spark_code("SELECT 1", orch, reader="glue_context")
+
+
 def test_leitor_desconhecido():
     with pytest.raises(ValueError):
         build_spark_code("SELECT 1", Orchestration(), reader="outro")

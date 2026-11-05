@@ -121,7 +121,8 @@ def csv_generator(engine, origem: dict, result_key: str | None, formato: str, fp
     def gerar() -> bytes:
         dados, _info = fetch_full_result(
             lambda codigo, on_status: HUB.run(engine, codigo, on_status, fingerprint=fp),
-            origem["sql"], origem["orch"], origem["reader"], formato, result_key=result_key)
+            origem["sql"], origem["orch"], origem["reader"], formato, result_key=result_key,
+            catalog_schema=bool(origem.get("catalog_schema")))
         return dados
     return gerar
 

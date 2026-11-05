@@ -276,7 +276,9 @@ class FakeGlueContext:
     """awsglue.context.GlueContext mínimo. As leituras acontecem na sessão principal, como no Glue.
 
     create_data_frame.from_catalog (leitura nativa, useSparkDataSource) e create_dynamic_frame.from_catalog
-    (DynamicFrame). nativa_falha simula um Glue em que a leitura nativa não funciona."""
+    (DynamicFrame). nativa_falha simula um Glue em que a leitura nativa não funciona. Com useCatalogSchema, a
+    leitura nativa devolve as colunas do catálogo (spark.catalog_columns), a não ser que aplica_esquema_do_catalogo
+    seja False (um Glue que ignora a opção)."""
     instancias: list[FakeGlueContext] = []
 
     def __init__(self, spark_context):
@@ -284,6 +286,7 @@ class FakeGlueContext:
         self.reads, self.native_reads = [], []
         self.falhar_com_filtro = False
         self.nativa_falha = False
+        self.aplica_esquema_do_catalogo = True
         contexto = self
 
         class _Dinamico:
@@ -302,8 +305,13 @@ class FakeGlueContext:
                 if contexto.nativa_falha:
                     raise RuntimeError("useSparkDataSource is not supported for this table")
                 contexto._conferir_filtro(push_down_predicate)
-                contexto.native_reads.append((database, table_name, push_down_predicate, dict(additional_options or {})))
-                return contexto.spark.default_df(("Relation", "glue", database, table_name, push_down_predicate))
+                opcoes = dict(additional_options or {})
+                contexto.native_reads.append((database, table_name, push_down_predicate, opcoes))
+                df = contexto.spark.default_df(("Relation", "glue", database, table_name, push_down_predicate))
+                catalogo = contexto.spark.catalog_columns.get(f"{database}.{table_name}")
+                if opcoes.get("useCatalogSchema") and contexto.aplica_esquema_do_catalogo and catalogo:
+                    df = FakeDataFrame(df.rows, [(n, "string") for n in catalogo], contexto.spark, df.plan)
+                return df
 
         self.create_dynamic_frame, self.create_data_frame = _Dinamico(), _Nativo()
         FakeGlueContext.instancias.append(self)
