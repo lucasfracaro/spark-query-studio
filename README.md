@@ -69,7 +69,7 @@ database_padrao = "workspace_db"   # USE de cada execução e database do DDL; "
 3. **Passo 1 – Orquestração**: cada linha de entrada vira uma *temp view*:
    - `catalog` + `database.tabela` → lê do Glue Data Catalog;
    - `s3` + `s3://bucket/caminho/` + formato + opções (`header=true;sep=;`).
-   Também dá para aplicar um filtro antes de criar a view, ligar **cache**, definir configs `spark.*`, escolher um database padrão e o limite de linhas. Em **📝 Abrir orquestração** ela pode ser editada como arquivo, salva na máquina ou carregada de um arquivo (veja abaixo).
+   Também dá para aplicar um filtro antes de criar a view, ligar **cache**, definir configs `spark.*`, escolher um database padrão e o limite de linhas. Em **📝 Abrir orquestração** ela pode ser editada como arquivo, salva na máquina ou carregada de um arquivo da máquina ou do S3 (veja abaixo).
 4. **Passo 2 – Query**: escreva no editor, importe um `.sql`/`.txt` ou use **☁️ Buscar no S3** (veja [Buscar no S3](#-buscar-no-s3)). O conteúdo vai para o editor, onde pode ser alterado. Vários comandos separados por `;` são executados em ordem, e o resultado exibido é o do último. Comentários e hints do Spark (`/*+ BROADCAST(t) */`) chegam ao Spark exatamente como foram escritos.
 5. **Conferência da orquestração**: antes de enviar ao cluster, a query é lida e cada base usada em `FROM`/`JOIN` é comparada com as entradas da orquestração. Se faltar alguma, a execução é bloqueada com uma mensagem como *"A base `db.produtos` é usada na query (linha 3), mas não está na orquestração"*. O aviso já aparece embaixo do editor enquanto você digita. CTEs (`WITH`), views criadas na própria query, subqueries e funções como `range()` não são cobradas. Se o Spark ainda assim não encontrar uma tabela, o erro dele é traduzido para a mesma mensagem. A conferência pode ser desligada em **Opções**.
 6. **🔒 Modo somente leitura** (ligado por padrão): comandos que gravam ou alteram dados ou o catálogo (`INSERT`, `CREATE TABLE`, `DROP`, `ALTER`, `MERGE`, `DELETE`, `MSCK REPAIR`…) são bloqueados antes de ir para o cluster, com o número e a linha do comando. Consultas e comandos que só afetam a sessão (`CREATE TEMP VIEW`, `CACHE TABLE`, `SET`, `USE`) rodam normalmente. A role do Glue costuma ter permissão de escrita, então um comando esquecido na query gravaria de verdade; para executar mesmo assim, ligue **Permitir comandos que gravam** em **Opções**.
@@ -133,11 +133,12 @@ Ao aplicar, a orquestração gerada abre para revisão.
 
 ### 🔎 Buscar no S3
 
-As queries salvas no S3 têm o nome da tabela (`nome_da_tabela.sql`) e, no padrão do SAF, o motor de execução faz parte do caminho. Nas duas buscas, você informa o nome e a **pasta raiz** (vem de `pasta_queries` na configuração); a busca olha a pasta e as subpastas. A lista de arquivos de uma pasta raiz vale por 10 minutos: buscar outra tabela na mesma pasta é imediato. Numa pasta com arquivos demais (um data lake inteiro, por exemplo), a busca para em ~25 s e pede uma pasta mais específica.
+As queries salvas no S3 têm o nome da tabela (`nome_da_tabela.sql`) e, no padrão do SAF, o motor de execução faz parte do caminho. Nas buscas, você informa o nome e a **pasta raiz** (vem de `pasta_queries` na configuração); a busca olha a pasta e as subpastas. O nome da última busca já vem preenchido nas outras, já que os arquivos de uma base têm o mesmo nome. A lista de arquivos de uma pasta raiz vale por 10 minutos: buscar outra tabela na mesma pasta é imediato. Numa pasta com arquivos demais (um data lake inteiro, por exemplo), a busca para em ~25 s e pede uma pasta mais específica.
 
 - **Na importação do Athena**: a busca procura `nome_da_tabela.sql` em uma pasta `/athena/`. Se houver uma só, ela vai direto para a caixa da query, como se fosse um arquivo aberto da máquina. Com mais de uma (ou só fora de `/athena/`), você escolhe qual abrir.
 - **No Passo 2 (☁️ Buscar no S3)**, para o processo do Spark: a query `nome_da_base.sql` em uma pasta `/spark/`, a orquestração `nome_da_base.json` em uma pasta `/orchestration/` e os metadados `nome_da_base.json` em uma pasta `/metadata/`, todos com o nome da base final. Quando há mais de um arquivo do mesmo tipo (um para execução no Athena e outro no Spark, por exemplo), a janela mostra as opções, com caminho e data, e deixa **comparar o conteúdo** antes de escolher. **Usar os arquivos escolhidos** põe a query no editor, aplica a orquestração no Passo 1 e leva as descrições das colunas para os [metadados do resultado](#-metadados-do-resultado). A orquestração no formato do app é aplicada direto; a do SAF ainda não é convertida (o app avisa e não mexe no Passo 1).
-- **📂 Navegar nas pastas**: abre os buckets da sua conta, começando pela pasta raiz, para escolher um arquivo específico. Dá para filtrar a pasta pelo começo do nome. No Passo 2, você escolhe para qual dos três tipos vai o arquivo clicado.
+- **Na janela da orquestração (📝 Abrir orquestração)**: só a orquestração, `nome_da_base.json` em uma pasta `/orchestration/`. Se houver uma só, ela vai direto para o editor da janela, como um arquivo aberto da máquina, para revisar antes de **Aplicar**. Com mais de uma (uma para execução no Athena e outra no Spark, por exemplo), você compara e escolhe. Um JSON que não está no formato do app (o do SAF, por enquanto) aparece no editor com um aviso, e **Aplicar** fica desligado: ele deixaria o Passo 1 sem entradas.
+- **📂 Navegar nas pastas**: abre os buckets da sua conta, começando pela pasta raiz, para escolher um arquivo específico. Dá para filtrar a pasta pelo começo do nome. No Passo 2, você escolhe para qual dos três tipos vai o arquivo clicado; na janela da orquestração, a navegação mostra só pastas e arquivos `.json`.
 
 A busca e a navegação usam as **suas** credenciais e só abrem buckets da sua conta (os que o `ListBuckets` devolve): nenhum bucket de outra conta é consultado.
 
@@ -160,7 +161,7 @@ No Glue 4.0 com Lake Formation, a janela mostra também o tamanho necessário se
 
 ### 📝 Abrir orquestração
 
-Mostra a orquestração em JSON para editar à mão, **salvar na máquina** ou **abrir um arquivo salvo**. Os erros de formato aparecem na hora, com linha e coluna. Exemplo:
+Mostra a orquestração em JSON para editar à mão, **salvar na máquina** ou **abrir um arquivo salvo**, da máquina ou do S3 ([☁️ Buscar no S3](#-buscar-no-s3), pelo nome da base ou navegando nas pastas). Os erros de formato aparecem na hora, com linha e coluna. Exemplo:
 
 ```json
 {

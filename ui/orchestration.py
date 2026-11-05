@@ -26,13 +26,16 @@ def orchestration_dialog():
 def orchestration_body():
     """Conteúdo da janela de orquestração (separado dela para poder ser testado sem abrir a janela)."""
     ss = st.session_state
+    ss.setdefault("orch_draft_origem", "")
     st.caption("Ajuste o que for preciso e clique em **Aplicar**. Use **Salvar na máquina** para guardar o "
-               "arquivo e **Abrir arquivo** para carregar uma orquestração salva.")
+               "arquivo, e **Abrir arquivo** ou **Buscar no S3** para carregar uma orquestração salva.")
     up = st.file_uploader("Abrir arquivo", type=["json"], key=f"orch_file_{ss.orch_draft_version}")
     if up is not None:
-        ss.orch_draft = up.getvalue().decode("utf-8", errors="replace")
-        ss.orch_draft_version += 1
+        _abrir_no_editor(up.getvalue().decode("utf-8", errors="replace"), f"arquivo {up.name}")
         st.rerun(scope="fragment")
+    ui_s3.render_orchestration(_abrir_no_editor)
+    if ss.orch_draft_origem:
+        st.caption(f"📄 Aberta de: {ss.orch_draft_origem}")
 
     key = f"orch_text_{ss.orch_draft_version}"
     st_ace = ace()
@@ -48,6 +51,11 @@ def orchestration_body():
         orch = orchestration_io.from_json(texto)
     except orchestration_io.OrchestrationFormatError as e:
         erro = str(e)
+    if orch is not None and not orchestration_io.is_app_format(texto):
+        # um JSON de outro sistema (o do SAF, por exemplo) viraria uma orquestração vazia
+        orch, erro = None, ("Este JSON não é uma orquestração do app (não tem a lista de `entradas`): parece ser de "
+                            "outro sistema, como o do SAF, que o app ainda não converte. Aplicar deixaria o Passo 1 "
+                            "sem entradas.")
     if erro:
         st.error(erro)
     else:
@@ -65,9 +73,17 @@ def orchestration_body():
         st.rerun()
 
 
+def _abrir_no_editor(texto: str, origem: str):
+    """Põe um JSON (arquivo da máquina ou do S3) no editor da janela, para revisar antes de aplicar."""
+    ss = st.session_state
+    ss.orch_draft, ss.orch_draft_origem = texto, origem
+    ss.orch_draft_version += 1
+
+
 def open_orchestration_dialog():
     ss = st.session_state
     ss.orch_draft = orchestration_io.to_json(current_orchestration())
+    ss.orch_draft_origem = ""
     ss.orch_draft_version += 1
     orchestration_dialog()
 
@@ -198,7 +214,7 @@ def render():
     if b_ath.button("📥 Importar query do Athena", width="stretch"):
         abrir_janela = "athena"
     if b_orch.button("📝 Abrir orquestração", width="stretch",
-                     help="Editar como arquivo, salvar na máquina ou abrir um salvo"):
+                     help="Editar como arquivo, salvar na máquina ou abrir uma salva (da máquina ou do S3)"):
         abrir_janela = "orquestracao"
     if ss.open_orch_after:
         ss.open_orch_after = False

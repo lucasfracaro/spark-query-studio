@@ -5,8 +5,11 @@
 - Processo do Spark (process_dialog): a query (pasta /spark/) e os JSON de orquestração (/orchestration/) e de
   metadados (/metadata/), todos com o nome da base final. Com mais de um arquivo do mesmo tipo, você escolhe (dá
   para comparar o conteúdo); e dá para escolher cada um navegando nas pastas.
+- Orquestração (render_orchestration): só o JSON de orquestração da base, na janela da orquestração; ele vai para o
+  editor da janela, como um arquivo aberto da máquina.
 
-Cada janela guarda o seu estado com um prefixo (ns): "s3q" (Athena) e "s3p" (processo do Spark).
+Cada janela guarda o seu estado com um prefixo (ns): "s3q" (Athena), "s3p" (processo do Spark) e "s3o"
+(orquestração). O nome da última busca vale como sugestão nas outras (os arquivos têm o nome da base final).
 """
 from __future__ import annotations
 
@@ -61,6 +64,8 @@ def _iniciar(ns: str):
 
 def _formulario(ns: str, rotulo: str, ajuda: str) -> tuple[str, str, bool, bool]:
     ss = st.session_state
+    if f"{ns}_nome" not in ss and ss.get("s3_ultimo_nome"):
+        ss[f"{ns}_nome"] = ss.s3_ultimo_nome         # o nome da última busca (as três usam o nome da base)
     with st.form(f"{ns}_busca", border=False):
         c1, c2 = st.columns([2, 3])
         nome = c1.text_input(rotulo, key=f"{ns}_nome", placeholder="nome_da_tabela", help=ajuda)
@@ -107,6 +112,21 @@ def _texto(arquivo: s3_queries.S3File) -> str:
 def _rotulo_arquivo(f: s3_queries.S3File) -> str:
     motor = {"athena": "Athena", "spark": "Spark"}.get(f.engine, "sem motor no caminho")
     return f"{f.uri} · {motor} · {f.describe()}"
+
+
+def _comparar(candidatos: list[s3_queries.S3File], chave: str):
+    """Uma aba com o conteúdo de cada arquivo, para comparar antes de escolher."""
+    if not st.toggle("Comparar o conteúdo", key=chave):
+        return
+    abas = st.tabs([f"{i}. {f.key.rsplit('/', 2)[-2] if f.key.count('/') else f.bucket}/{f.name}"
+                    for i, f in enumerate(candidatos, start=1)])
+    for aba, arquivo in zip(abas, candidatos, strict=True):
+        with aba:
+            st.caption(arquivo.uri)
+            try:
+                st.code(_texto(arquivo), language="json" if arquivo.name.lower().endswith(".json") else "sql")
+            except Exception as e:
+                st.error(_erro_de_conexao(e))
 
 
 # ------------------------------------------------------------------------------------ navegação pelos buckets
@@ -223,7 +243,7 @@ def _buscar_athena(tabela: str, raiz: str, abrir: Abrir):
     if not raiz_normal:
         st.warning("Informe a pasta raiz, como `s3://meu-bucket/queries/`.")
         return
-    ss.s3_raiz = raiz.strip()
+    ss.s3_raiz, ss.s3_ultimo_nome = raiz.strip(), s3_queries.base_name(tabela)
     try:
         indice = _indice(raiz_normal)
     except Exception as e:
@@ -324,7 +344,7 @@ def _buscar_processo(nome: str, raiz: str):
     if not raiz_normal:
         st.warning("Informe a pasta raiz, como `s3://meu-bucket/queries/`.")
         return
-    ss.s3_raiz = raiz.strip()
+    ss.s3_raiz, ss.s3_ultimo_nome = raiz.strip(), base
     try:
         indice = _indice(raiz_normal)
     except Exception as e:
@@ -354,16 +374,7 @@ def _escolha_do_tipo(tipo: str, titulo: str):
     escolha = st.radio(titulo, candidatos, index=candidatos.index(atual) if atual in candidatos else 0,
                        format_func=_rotulo_arquivo, key=f"s3p_r_{tipo}_{ss.s3p_versao}", label_visibility="collapsed")
     ss.s3p_escolhas[tipo] = escolha
-    if st.toggle("Comparar o conteúdo", key=f"s3p_comparar_{tipo}_{ss.s3p_versao}"):
-        abas = st.tabs([f"{i}. {f.key.rsplit('/', 2)[-2] if f.key.count('/') else f.bucket}/{f.name}"
-                        for i, f in enumerate(candidatos, start=1)])
-        for aba, arquivo in zip(abas, candidatos, strict=True):
-            with aba:
-                st.caption(arquivo.uri)
-                try:
-                    st.code(_texto(arquivo), language="json" if arquivo.name.lower().endswith(".json") else "sql")
-                except Exception as e:
-                    st.error(_erro_de_conexao(e))
+    _comparar(candidatos, f"s3p_comparar_{tipo}_{ss.s3p_versao}")
 
 
 def _escolher_na_navegacao(arquivo: s3_queries.S3File):
@@ -424,6 +435,98 @@ def _aplicar(escolhidos: dict[str, s3_queries.S3File]) -> bool:
                             "lido pelo app.")
     ss.s3p_resumo = {"feito": feito, "pendente": pendente}
     return True
+
+
+# ------------------------------------------------------------------------------------ orquestração
+def render_orchestration(abrir: Abrir):
+    """Na janela da orquestração: o JSON de orquestração da base (nome_da_base.json numa pasta /orchestration/),
+    pela busca ou navegando. abrir(texto, origem) põe o JSON no editor da janela."""
+    ss = st.session_state
+    _iniciar("s3o")
+    with st.container(border=True):
+        st.markdown("**☁️ Buscar no S3**")
+        nome, raiz, buscar, navegar = _formulario(
+            "s3o", "Base final", "A orquestração fica salva como nome_da_base.json numa pasta /orchestration/.")
+        if buscar:
+            _buscar_orquestracao(nome, raiz, abrir)
+        if navegar:
+            _abrir_navegacao("s3o", raiz)
+        if ss.s3o_erro:
+            st.error(ss.s3o_erro)
+            ss.s3o_erro = ""
+        _achados_orquestracao(abrir)
+        if ss.s3o_nav is not None:
+            _navegacao("s3o", (".json",), lambda f: _abrir_orquestracao(f, abrir, fechar=True),
+                       "Clique no JSON para abrir no editor.")
+
+
+def _buscar_orquestracao(nome: str, raiz: str, abrir: Abrir):
+    ss = st.session_state
+    ss.s3o_achados = None
+    base = s3_queries.base_name(nome)
+    raiz_normal = s3_queries.normalize_uri(raiz)
+    if not base:
+        st.warning("Digite o nome da base final.")
+        return
+    if not raiz_normal:
+        st.warning("Informe a pasta raiz, como `s3://meu-bucket/queries/`.")
+        return
+    ss.s3_raiz, ss.s3_ultimo_nome = raiz.strip(), base
+    try:
+        indice = _indice(raiz_normal)
+    except Exception as e:
+        st.error(_erro_de_conexao(e))
+        return
+    achados = indice.find_process(base)["orquestracao"]
+    # o mesmo nome fora de uma pasta de orquestração (e que não é o JSON de metadados): pode ser ela, numa pasta
+    # com outro nome
+    alvo = f"{base.lower()}.json"
+    fora = sorted((f for f in indice.files if f.name.lower() == alvo and not f.kind),
+                  key=lambda f: (-(f.modified.timestamp() if f.modified else 0), f.key))
+    ss.s3o_achados = {"nome": base, "raiz": raiz_normal, "arquivos": achados + fora, "indice": indice}
+    if len(achados) == 1 and not fora:      # uma orquestração com esse nome: vai direto para o editor
+        _abrir_orquestracao(achados[0], abrir)
+
+
+def _achados_orquestracao(abrir: Abrir):
+    ss = st.session_state
+    a = ss.s3o_achados
+    if a is None:
+        return
+    arquivos = a["arquivos"]
+    if not arquivos:
+        st.warning(f"Nenhum `{a['nome']}.json` numa pasta `/orchestration/` em `{a['raiz']}` nem nas subpastas.")
+        st.caption(_rodape(a["indice"]) + " Dá para procurar em **📂 Navegar nas pastas**.")
+        return
+    na_pasta = [f for f in arquivos if f.kind == "orquestracao"]
+    if len(arquivos) == 1 and na_pasta:
+        st.caption(_rodape(a["indice"]))
+        return                              # abriu direto: a origem aparece em cima do editor
+    if not na_pasta:
+        st.warning(f"Achei `{a['nome']}.json`, mas fora de uma pasta `/orchestration/`: confira se é mesmo a "
+                   "orquestração.")
+    elif len(na_pasta) > 1:
+        st.info(f"Achei {len(na_pasta)} orquestrações com esse nome (por exemplo, uma da execução no Athena e outra "
+                "no Spark): escolha qual abrir.")
+    chave = f"{a['raiz']}_{a['nome']}"
+    escolha = st.radio("Arquivos encontrados", arquivos, key=f"s3o_escolha_{chave}", format_func=_rotulo_arquivo)
+    _comparar(arquivos, f"s3o_comparar_{chave}")
+    st.button("📄 Abrir este JSON", key="s3o_abrir_escolha", on_click=_abrir_orquestracao, args=(escolha, abrir))
+    st.caption(_rodape(a["indice"]))
+
+
+def _abrir_orquestracao(arquivo: s3_queries.S3File, abrir: Abrir, fechar: bool = False):
+    """Lê o JSON e põe no editor da janela (também é chamada como callback de botão)."""
+    ss = st.session_state
+    try:
+        texto = _texto(arquivo)
+    except Exception as e:
+        ss.s3o_erro = _erro_de_conexao(e)
+        return
+    abrir(texto, arquivo.uri if arquivo.kind == "orquestracao" else
+          f"{arquivo.uri} (fora de uma pasta /orchestration/: confira se é mesmo a orquestração)")
+    if fechar:
+        _fechar_navegacao("s3o")
 
 
 def render_summary():

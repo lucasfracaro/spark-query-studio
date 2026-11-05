@@ -760,6 +760,89 @@ def test_processo_escolhe_cada_arquivo_navegando(janela, monkeypatch):
     assert at.session_state["sql"] == "SELECT * FROM vendas"
 
 
+def _json_da_orquestracao(at) -> str:
+    return next(t for t in at.text_area if t.label == "JSON da orquestração").value
+
+
+def test_orquestracao_busca_no_s3_escolhe_entre_duas_e_aplica(janela, monkeypatch):
+    _s3_falso(monkeypatch)
+    at = janela("orquestracao", orch_draft='{"entradas": []}')
+    _buscar_no_s3(at, "vendas", rotulo="Base final")
+    assert _json_da_orquestracao(at) == '{"entradas": []}'              # duas com esse nome: nada abre sozinho
+    assert any("Achei 2 orquestrações" in i.value for i in at.info)
+    escolha = next(r for r in at.radio if r.label == "Arquivos encontrados")
+    assert "financeiro/orchestration" in escolha.value.key               # a sem motor no caminho vem antes da do Athena
+    next(t for t in at.toggle if t.label == "Comparar o conteúdo").set_value(True).run()
+    assert any('"motor": "athena"' in c.value for c in at.code)
+    _botao(at, "Abrir este JSON").click().run()
+    assert not at.exception, at.exception
+    assert '"source": "db.vendas"' in _json_da_orquestracao(at)
+    assert any("Aberta de: s3://meu-bucket/queries/financeiro/orchestration/vendas.json" in c.value
+               for c in at.caption)
+    _botao(at, "Aplicar").click().run()
+    assert not at.exception, at.exception
+    assert list(at.session_state["inputs_base"]["source"]) == ["db.vendas"]
+
+
+def test_orquestracao_do_saf_no_editor_nao_apaga_as_entradas(janela, monkeypatch):
+    _s3_falso(monkeypatch)
+    at = janela("orquestracao", orch_draft='{"entradas": []}')
+    _buscar_no_s3(at, "vendas", rotulo="Base final")
+    escolha = next(r for r in at.radio if r.label == "Arquivos encontrados")
+    escolha.set_value(next(o for o in escolha.options if "antigo" in o)).run()
+    _botao(at, "Abrir este JSON").click().run()
+    assert _json_da_orquestracao(at) == '{"saf": {"motor": "athena"}}'
+    assert any("não é uma orquestração do app" in e.value for e in at.error) and _botao(at, "Aplicar").disabled
+    # o mesmo para um JSON de outro formato aberto da máquina ou colado
+    next(t for t in at.text_area if t.label == "JSON da orquestração").set_value('{"processo": "x"}').run()
+    assert any("como o do SAF" in e.value for e in at.error) and _botao(at, "Aplicar").disabled
+
+
+def test_orquestracao_unica_abre_direto_e_navegacao(janela, monkeypatch):
+    _s3_falso(monkeypatch)
+    # o nome da última busca (por exemplo, a do processo do Spark) já vem preenchido
+    at = janela("orquestracao", orch_draft='{"entradas": []}', s3_ultimo_nome="vendas")
+    assert next(t for t in at.text_input if t.label == "Base final").value == "vendas"
+    next(t for t in at.text_input if t.label == "Pasta raiz").set_value("s3://meu-bucket/queries/financeiro/")
+    _botao(at, "Buscar").click().run()
+    assert not at.exception, at.exception
+    assert '"source": "db.vendas"' in _json_da_orquestracao(at)        # uma só: abre direto
+    # navegando: só pastas e JSON; o clique abre no editor e fecha a navegação
+    at = janela("orquestracao", orch_draft='{"entradas": []}')
+    next(t for t in at.text_input if t.label == "Pasta raiz").set_value("s3://meu-bucket/queries/")
+    _botao(at, "Navegar nas pastas").click().run()
+    _botao(at, "📁 antigo/").click().run()
+    _botao(at, "📁 athena/").click().run()
+    assert not any(b.label.startswith("📄 clientes.sql") for b in at.button)    # a navegação mostra só JSON
+    _botao(at, "📁 orchestration/").click().run()
+    _botao(at, "📄 vendas.json").click().run()
+    assert not at.exception, at.exception
+    assert _json_da_orquestracao(at) == '{"saf": {"motor": "athena"}}'
+    assert not any("s3://meu-bucket/queries/antigo/athena/orchestration/" in m.value for m in at.markdown)
+
+
+def test_orquestracao_nao_encontrada_e_json_fora_da_pasta(janela, monkeypatch):
+    from fakes import FakeS3
+    conteudo = {(_B, "q/outros/vendas.json"): b'{"entradas": []}', (_B, "q/metadata/vendas.json"): b"{}"}
+    _aws_falsa(monkeypatch, s3=FakeS3(buckets=[_B], contents=conteudo))
+    at = janela("orquestracao", orch_draft='{"entradas": []}')
+    _buscar_no_s3(at, "nao_existe", raiz="s3://meu-bucket/q/", rotulo="Base final")
+    assert any("Nenhum `nao_existe.json` numa pasta `/orchestration/`" in w.value for w in at.warning)
+    _buscar_no_s3(at, "vendas", raiz="s3://meu-bucket/q/", rotulo="Base final")
+    assert any("fora de uma pasta `/orchestration/`" in w.value for w in at.warning)
+    escolha = next(r for r in at.radio if r.label == "Arquivos encontrados")
+    assert [o for o in escolha.options if "metadata" in o] == []            # o de metadados não é orquestração
+
+
+def test_buscas_no_s3_guardam_o_nome_para_as_outras(janela, monkeypatch):
+    _s3_falso(monkeypatch)
+    at = janela("processo")
+    _buscar_no_s3(at, "db.vendas", rotulo="Base final")
+    assert at.session_state["s3_ultimo_nome"] == "vendas"
+    at = janela("athena", engine_kind="local", s3_ultimo_nome="vendas")
+    assert next(t for t in at.text_input if t.label == "Tabela").value == "vendas"
+
+
 def test_passo_2_tem_a_busca_no_s3_e_mostra_o_que_foi_carregado(app):
     app.session_state["s3p_resumo"] = {"feito": ["a query foi para o editor (`s3://b/q.sql`)"], "pendente": []}
     app.run()
