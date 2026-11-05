@@ -359,11 +359,17 @@ class _CteDoErro:
     nome: str = ""                          # a CTE onde está a coluna ("" = fora de CTE)
     usada: bool | None = None               # a query final usa essa CTE (direta ou indiretamente)?
     posicao: tuple[int, int] | None = None  # (linha, posição) da primeira coluna não encontrada, no comando
+    # CTE que a query final não usa: as outras CTEs que dependem dela (também não usadas: saem junto, senão
+    # elas é que quebram) e as tabelas que só esse grupo de CTEs lê (como estão na query)
+    dependentes: list[str] = field(default_factory=list)
+    tabelas_so_delas: list[str] = field(default_factory=list)
 
 
-def _cte_do_erro(statement: str, uc: UnresolvedColumn, nomes: list[str]) -> _CteDoErro:
-    """Para o "unresolved operator" (que não diz linha nem CTE): acha a CTE pelo que o operador cria (os AS x) e
-    pelas colunas não encontradas, se a query final a usa, e a linha da primeira dessas colunas."""
+def _cte_do_erro(statement: str, uc: UnresolvedColumn, nomes: list[str],
+                 ponto: tuple[int, int] | None = None) -> _CteDoErro:
+    """A CTE onde está a coluna não encontrada e se a query final a usa. No "unresolved operator" (que não diz linha
+    nem CTE), a CTE sai do que o operador cria (os AS x) e das colunas não encontradas, e a linha, da primeira
+    dessas colunas. Nas outras mensagens, do ponto que elas dizem (linha, posição no comando)."""
     try:
         import sqlglot
         from sqlglot import exp
@@ -380,14 +386,31 @@ def _cte_do_erro(statement: str, uc: UnresolvedColumn, nomes: list[str]) -> _Cte
 
     with_ = arvore.find(exp.With)
     ctes = list(with_.expressions) if with_ is not None else []
-    escolhida, melhor = None, (0, 0)
-    for cte in ctes:
-        refs = referencias(cte.this)
-        if not refs:
-            continue
-        pontos = (len(criadas & {n.lower() for n in getattr(cte.this, "named_selects", [])}), len(refs))
-        if pontos > melhor:
-            escolhida, melhor = cte, pontos
+    principal = arvore.copy()
+    if principal.find(exp.With) is not None:
+        principal.find(exp.With).pop()
+    escolhida, melhor = None, None
+    if uc.operator:
+        # a CTE que cria os nomes do operador (AS x) e lê as colunas que ele encontrou; empate: a que vem antes
+        # (o Spark mostra o primeiro trecho que falha, e as CTEs que leem dela falham por tabela)
+        resolvidas = {c.lower() for _, c in uc.candidates}
+        for i, cte in enumerate(ctes):
+            if not referencias(cte.this):
+                continue
+            pontos = (len(criadas & {n.lower() for n in getattr(cte.this, "named_selects", [])}),
+                      len(resolvidas & {c.name.lower() for c in cte.this.find_all(exp.Column)}), -i)
+            if melhor is None or pontos > melhor:
+                escolhida, melhor = cte, pontos
+    else:
+        # a mensagem diz o ponto: a CTE é a que tem um nome começando exatamente ali
+        linhas = statement.split("\n")
+        if ponto is None or not ctes or not 1 <= ponto[0] <= len(linhas):
+            return _CteDoErro()
+        inicio = sum(len(linha) + 1 for linha in linhas[:ponto[0] - 1]) + ponto[1]
+        no_ponto = [cte for cte in ctes if any(i.meta.get("start") == inicio for i in cte.this.find_all(exp.Identifier))]
+        if len(no_ponto) != 1:
+            return _CteDoErro()
+        escolhida = no_ponto[0]
     saida = _CteDoErro()
     alvo = escolhida.this if escolhida is not None else arvore
     inicios = [c.this.meta["start"] for c in referencias(alvo)
@@ -403,17 +426,71 @@ def _cte_do_erro(statement: str, uc: UnresolvedColumn, nomes: list[str]) -> _Cte
     def usa(no) -> set[str]:
         return {t.name.lower() for t in no.find_all(exp.Table) if not t.db and t.name.lower() in nomes_ctes}
 
+    def tabelas(no) -> list[str]:
+        """As tabelas (e views das entradas) que um trecho lê, sem as CTEs."""
+        return [".".join(p for p in (t.catalog, t.db, t.name) if p) for t in no.find_all(exp.Table)
+                if t.name and (t.db or t.name.lower() not in nomes_ctes)]
+
     grafo = {c.alias_or_name.lower(): usa(c.this) for c in ctes}
-    principal = arvore.copy()
-    principal.find(exp.With).pop()
     usadas, fila = set(), list(usa(principal))
     while fila:
         nome = fila.pop()
         if nome not in usadas:
             usadas.add(nome)
             fila.extend(grafo.get(nome, ()))
-    saida.usada = saida.nome.lower() in usadas
+    alvo_nome = saida.nome.lower()
+    saida.usada = alvo_nome in usadas
+    if saida.usada:
+        return saida
+    # quem usa uma CTE que a query final não usa também não é usado: para apagá-la, essas saem junto
+    dependem, mudou = set(), True
+    while mudou:
+        mudou = False
+        for nome, deps in grafo.items():
+            if nome != alvo_nome and nome not in dependem and (alvo_nome in deps or deps & dependem):
+                dependem.add(nome)
+                mudou = True
+    saida.dependentes = [c.alias_or_name for c in ctes if c.alias_or_name.lower() in dependem]
+    apagar = dependem | {alvo_nome}
+    lidas_por_elas = [t for c in ctes if c.alias_or_name.lower() in apagar for t in tabelas(c.this)]
+    lidas_fora = {t.lower() for t in tabelas(principal)}
+    lidas_fora |= {t.lower() for c in ctes if c.alias_or_name.lower() not in apagar for t in tabelas(c.this)}
+    saida.tabelas_so_delas = [t for t in dict.fromkeys(lidas_por_elas) if t.lower() not in lidas_fora]
     return saida
+
+
+def _nota_da_cte_nao_usada(cte: _CteDoErro, operador: bool, entradas: list[str], colunas: int = 1) -> str:
+    """O que dizer quando a coluna que falta está numa CTE que a query final não usa. entradas: os aliases das
+    entradas da orquestração (para dizer qual delas fica sem uso depois de apagar as CTEs); colunas: quantas
+    colunas faltam."""
+    sem = "o resto roda sem essa coluna." if colunas == 1 else "o resto roda sem essas colunas."
+    nota = f"\n\n**O erro está na CTE `{cte.nome}`, que a query final não usa.** "
+    if operador:
+        nota += ("O Glue 4.0 (Spark 3.3) confere todas as CTEs mesmo assim e, nesse caso, mostra o trecho inteiro "
+                 "em vez do nome da coluna. ")
+    else:
+        nota += "O Spark confere todas as CTEs, inclusive as que não são usadas. "
+    if cte.dependentes:
+        uma = len(cte.dependentes) == 1
+        nota += (f"Se ela não é necessária, apague-a da query junto com {_e_lista(cte.dependentes)}, que "
+                 f"{'depende' if uma else 'dependem'} dela e também não {'é usada' if uma else 'são usadas'} "
+                 f"(senão, o erro passa para {'ela' if uma else 'elas'}): {sem}")
+    else:
+        nota += f"Se ela não é necessária, apague-a da query: {sem}"
+    por_alias = {a.lower(): a for a in entradas}
+    sobram = [por_alias[t.lower()] for t in cte.tabelas_so_delas if t.lower() in por_alias]
+    if sobram:
+        uma = len(sobram) == 1
+        nota += (f" Sem {'ela' if not cte.dependentes else 'elas'}, {'a entrada' if uma else 'as entradas'} "
+                 f"{_e_lista(sobram)} {'deixa' if uma else 'deixam'} de ser {'usada' if uma else 'usadas'}: "
+                 f"{'tire-a' if uma else 'tire-as'} da orquestração também (uma leitura a menos).")
+    return nota
+
+
+def _e_lista(nomes: list[str]) -> str:
+    """'`a`', '`a` e `b`', '`a`, `b` e `c`'."""
+    marcados = [f"`{n}`" for n in nomes]
+    return marcados[0] if len(marcados) == 1 else ", ".join(marcados[:-1]) + " e " + marcados[-1]
 
 
 def diagnose(error: str, statement: str = "", query: str = "", inputs=None, user_catalog=None, orch_inputs=(),
@@ -427,20 +504,25 @@ def diagnose(error: str, statement: str = "", query: str = "", inputs=None, user
     if uc is None:
         return None
     diag = _diagnostico(uc, statement, query, inputs, user_catalog, orch_inputs, role, glue)
-    if not uc.operator:
+    if uc.operator:                         # "unresolved operator": todas as colunas que faltam vão juntas
+        for outra in uc.others:
+            nome = outra.split(".")[-1]
+            if nome.lower() not in {c.lower() for c in [uc.column] + diag.missing_too}:
+                diag.missing_too.append(nome)
+    if not statement or uc.struct:
         return diag
-    # "unresolved operator": todas as colunas que faltam, a CTE e a linha (o Spark não diz)
-    cte = _cte_do_erro(statement, uc, [uc.column] + [o.split(".")[-1] for o in uc.others])
-    diag.position, diag.cte = cte.posicao, cte.nome
-    for outra in uc.others:
-        nome = outra.split(".")[-1]
-        if nome.lower() not in {c.lower() for c in [uc.column] + diag.missing_too}:
-            diag.missing_too.append(nome)
+    # a CTE do erro (e, no "unresolved operator", a linha, que o Spark não diz)
+    from spark_errors import error_position
+    cte = _cte_do_erro(statement, uc, [uc.column] + [o.split(".")[-1] for o in uc.others], error_position(error))
+    if uc.operator:
+        diag.position = cte.posicao
+    diag.cte = cte.nome
     if cte.nome and cte.usada is False:
-        diag.cause += (f"\n\n**O erro está na CTE `{cte.nome}`, que a query final não usa.** O Glue 4.0 (Spark 3.3) "
-                       "confere todas as CTEs mesmo assim e, nesse caso, mostra o trecho inteiro em vez do nome da "
-                       "coluna. Se ela não é necessária, apague-a da query: o resto roda sem essas colunas.")
-    elif cte.nome:
+        aliases = [i.alias.strip() for i in orch_inputs or [] if getattr(i, "alias", "").strip()]
+        aliases += [str(i.get("alias") or "").strip() for i in inputs or [] if str(i.get("alias") or "").strip()]
+        diag.cause += _nota_da_cte_nao_usada(cte, bool(uc.operator), list(dict.fromkeys(aliases)),
+                                             len({c.lower() for c in [uc.column] + diag.missing_too}))
+    elif cte.nome and uc.operator:
         diag.cause += f"\n\nO erro está na CTE `{cte.nome}`."
     return diag
 
@@ -540,12 +622,19 @@ def _diagnostico(uc: UnresolvedColumn, statement: str, query: str, inputs, user_
         if e.tem(e.role, coluna) and e.columns is not None:
             outras = [c for c in e.faltando(e.role) if c.lower() != coluna.lower() and _usa(texto_query, c)]
             if e.read in ("nativa", "dynamicframe", "glue_context"):
-                como = {"dynamicframe": " (como DynamicFrame)", "nativa": " (pela leitura nativa)"}.get(e.read, "")
+                if e.read == "dynamicframe":
+                    arquivos = ("A leitura pelo GlueContext (como DynamicFrame) monta as colunas a partir dos "
+                                "arquivos lidos, não do catálogo, e nenhum arquivo das partições escolhidas tem "
+                                "essa coluna")
+                else:
+                    arquivos = ("A leitura pelo GlueContext monta as colunas a partir dos arquivos lidos, não do "
+                                "catálogo (na leitura nativa, pelo esquema de um dos arquivos), e os arquivos das "
+                                "partições escolhidas não têm essa coluna (ou só parte deles tem)")
                 causa = (f"`{coluna}` está no catálogo de `{e.source}`, mas a leitura da entrada `{e.alias}` não a "
-                         f"trouxe. A leitura pelo GlueContext{como} monta as colunas a partir dos arquivos lidos, e "
-                         "os arquivos das partições escolhidas não têm essa coluna (é comum quando ela foi criada "
-                         "depois na tabela; no Athena, ela viria vazia nessas partições). Confira as partições do "
-                         "filtro da entrada.")
+                         f"trouxe. {arquivos}. É comum quando a coluna foi criada depois na tabela. No Athena ela "
+                         "existe mesmo assim (vem vazia onde o arquivo não a tem); no Glue, não, e um job que lê "
+                         "essa tabela do mesmo jeito falha igual. Se a query não precisa dela, tire-a; se precisa, "
+                         "confira as partições do filtro da entrada.")
             else:
                 causa = (f"`{coluna}` está no catálogo de `{e.source}`, mas a leitura da entrada `{e.alias}` não "
                          "a trouxe: os arquivos lidos não têm essa coluna. Confira as partições do filtro da entrada.")

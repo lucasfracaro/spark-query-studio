@@ -332,11 +332,13 @@ try:
         _db, _tabela = _src.split(".", 1) if "." in _src else ((_p["db"] or "default"), _src)
         _t, _nativa_falhou, _depois = _time.time(), "", []
         _push = _filtro
+        _ausentes.pop(_chave, None)
+        try:                                   # as colunas do catálogo (o que a role da sessão vê)
+            _no_catalogo = [(_c.name, bool(_c.isPartition)) for _c in spark.catalog.listColumns(_tabela, _db)]
+        except Exception:
+            _no_catalogo = None
         if _filtro and _partes and all(_x["cols"] is not None for _x in _partes):
-            try:
-                _part = {_c.name.lower() for _c in spark.catalog.listColumns(_tabela, _db) if _c.isPartition}
-            except Exception:
-                _part = None
+            _part = None if _no_catalogo is None else {_n.lower() for _n, _e_part in _no_catalogo if _e_part}
             if _part is not None:
                 _usar = [_x["sql"] for _x in _partes if _x["cols"] and set(_x["cols"]) <= _part]
                 _depois = [_x["sql"] for _x in _partes if not (_x["cols"] and set(_x["cols"]) <= _part)]
@@ -376,7 +378,38 @@ try:
                     + str(round(_time.time() - _t, 1)) + "s" + _onde)
         if _nativa_falhou:
             _log.append("a leitura nativa não funcionou para " + _alias + " (" + _nativa_falhou + ")")
+        # O GlueContext monta as colunas a partir dos arquivos, não do catálogo (sem useCatalogSchema; a leitura
+        # nativa, pelo esquema de um dos arquivos): uma coluna do catálogo que não veio não existe aqui, e no
+        # Athena existe (vazia nos arquivos que não a têm). Só avisa: o resultado é o de um job do Glue que lê
+        # do mesmo jeito.
+        if _no_catalogo is not None:
+            try:
+                _lidas = {_f.name.lower() for _f in _d.schema.fields}
+                _faltam = [_n for _n, _e_part in _no_catalogo if not _e_part and _n.lower() not in _lidas]
+                # nenhuma coluna em comum: o esquema do catálogo é outro (ex.: o "col array<string>" de uma
+                # tabela Delta), não uma coluna que faltou
+                if len(_faltam) < len([_n for _n, _e_part in _no_catalogo if not _e_part]):
+                    _ausentes[_chave] = (_faltam, _src, "dynamicframe" if _rdd else "nativa")
+            except Exception:
+                pass
         return _d.where(_filtro) if _filtro else _d
+
+    _ausentes = globals().setdefault("_sqs_ausentes", {})  # colunas do catálogo que a leitura não trouxe
+
+    def _avisar_ausentes(_alias, _chave):
+        _faltam, _src, _como = _ausentes.get(_chave) or ([], "", "")
+        if not _faltam:
+            return
+        _uma = len(_faltam) == 1
+        _nomes = ", ".join(_faltam[:12]) + (" e mais " + str(len(_faltam) - 12) if len(_faltam) > 12 else "")
+        _log.append(
+            "AVISO: a leitura de " + _alias + " não trouxe " + ("a coluna " if _uma else str(len(_faltam)) + " colunas ")
+            + "do catálogo de " + _src + " (" + _nomes + "). Pelo GlueContext, as colunas vêm dos arquivos lidos"
+            + (" e nenhum deles " + ("a" if _uma else "as") + " tem" if _como == "dynamicframe"
+               else " (na leitura nativa, do esquema de um deles), não do catálogo")
+            + ". No Athena " + ("ela existe, vazia," if _uma else "elas existem, vazias,") + " onde o arquivo não "
+            + ("a" if _uma else "as") + " tem; aqui, a query que " + ("a usar" if _uma else "usar alguma delas")
+            + " falha, como num job do Glue que lê do mesmo jeito.")
 
     def _para_esta_sessao(_d, _nome):
         # o GlueContext cria o DataFrame em outra sessão do Spark; uma view global deixa a sessão desta
@@ -396,6 +429,7 @@ try:
                 if _cachear:
                     _base.cache()
                     _cache[_chave] = [_base, _time.strftime("%H:%M:%S"), _alias]
+            _avisar_ausentes(_alias, _chave)
             _df = _para_esta_sessao(_base, "sqs_" + _chave[2:])
         else:
             if _inp["kind"] == "catalog":

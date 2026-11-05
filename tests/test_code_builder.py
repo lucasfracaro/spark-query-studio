@@ -443,6 +443,34 @@ def test_glue_context_filtro_sem_particao_le_tudo_e_filtra_depois(glue_context):
     assert spark.last_session.views["v"].plan[-1] == ("where", "valor > 10 OR dt = '1'")
 
 
+def test_glue_context_avisa_das_colunas_do_catalogo_que_a_leitura_nao_trouxe(glue_context):
+    # as colunas vêm dos arquivos, não do catálogo: no Athena a coluna existe (vazia); aqui, não
+    spark, ns = FakeSpark(), {}
+    spark.catalog_columns["db.v"] = ["id", "NOME", "valor", "regiao_nova"]          # o lido: id, nome, valor
+    entrada = InputSource("v", "catalog", "db.v", cache=True)
+    res = _rodar(spark, ns, "SELECT 1", entrada, reader="glue_context")
+    assert res["ok"], res
+    [aviso] = [linha for linha in res["log"] if linha.startswith("AVISO")]
+    assert aviso.startswith("AVISO: a leitura de v não trouxe a coluna do catálogo de db.v (regiao_nova). "
+                            "Pelo GlueContext, as colunas vêm dos arquivos lidos (na leitura nativa")
+    assert "No Athena ela existe, vazia, onde o arquivo não a tem" in aviso
+    r2 = _rodar(spark, ns, "SELECT 2", entrada, reader="glue_context")               # cache: o aviso continua
+    assert any("cache reaproveitado" in linha for linha in r2["log"]) and aviso in r2["log"]
+    # DynamicFrame (lê os esquemas de todos os arquivos): nenhum deles tem as colunas
+    glue_context[0].nativa_falha = True
+    spark.catalog_columns["db.w"] = ["id", "nome", "valor", "a", "b"]
+    res = _rodar(spark, ns, "SELECT 1", InputSource("w", "catalog", "db.w"), reader="glue_context")
+    assert any(linha.startswith("AVISO: a leitura de w não trouxe 2 colunas do catálogo de db.w (a, b). Pelo "
+                                "GlueContext, as colunas vêm dos arquivos lidos e nenhum deles as tem.")
+               for linha in res["log"])
+    # o catálogo inacessível, com as mesmas colunas ou com um esquema que não tem nada a ver (Delta): sem aviso
+    spark.catalog_columns["db.v2"] = ["id", "nome", "valor"]
+    spark.catalog_columns["db.delta"] = ["col"]
+    for fonte in ("db.sem_catalogo", "db.v2", "db.delta"):
+        res = _rodar(spark, ns, "SELECT 1", InputSource("x", "catalog", fonte), reader="glue_context")
+        assert res["ok"] and not any(linha.startswith("AVISO") for linha in res["log"]), fonte
+
+
 def test_leitor_desconhecido():
     with pytest.raises(ValueError):
         build_spark_code("SELECT 1", Orchestration(), reader="outro")

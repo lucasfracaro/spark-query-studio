@@ -272,6 +272,9 @@ def test_unresolved_operator_numa_cte_que_a_query_final_nao_usa():
     assert d.kind == "role" and d.title == "A role da sessão não enxerga as colunas `CIDADE_ORIGEM` e `CIDADE_DESTINO`"
     assert d.missing_too == ["CIDADE_DESTINO"] and d.cte == "base_rotas"
     assert "CTE `base_rotas`, que a query final não usa" in d.cause and "apague-a" in d.cause
+    # resumo usa base_rotas: apagar só base_rotas faria o erro passar para resumo
+    assert "junto com `resumo`, que depende dela e também não é usada" in d.cause
+    assert "orquestração" not in d.cause                       # rotas continua sendo lida pela query final
     assert d.position == (4, 14)                               # a 1ª CIDADE_ORIGEM, dentro da CTE
     assert d.scope == ("As outras colunas desse trecho (`ESTADO_ORIGEM`, `DATA`) o Spark encontrou na entrada "
                        "`rotas` (`produtor.rotas`).")
@@ -284,6 +287,59 @@ def test_unresolved_operator_numa_cte_usada_sem_conferir_o_catalogo():
     assert d.kind == "nao_existe" and d.title == "A sessão não encontrou as colunas `CIDADE_ORIGEM` e `CIDADE_DESTINO`"
     assert "O erro está na CTE `base_rotas`." in d.cause and "não usa" not in d.cause
     assert d.similar == [] or "CIDADE_ORIGEM" not in d.similar
+
+
+QUERY_CADEIA = """WITH base_historico AS (
+  SELECT id, CASE WHEN CIDADE_ORIGEM IS NULL THEN '000' ELSE CIDADE_ORIGEM END AS CIDADE_ORIGEM FROM historico
+),
+etapa1 AS (SELECT h.id, h.CIDADE_ORIGEM, r.VALOR FROM base_historico h JOIN rotas r ON h.id = r.ID),
+etapa2 AS (SELECT id, sum(VALOR) AS total FROM etapa1 GROUP BY id),
+final AS (SELECT ESTADO_ORIGEM, sum(VALOR) AS total FROM rotas GROUP BY ESTADO_ORIGEM)
+SELECT * FROM final"""
+ERRO_CADEIA = ("unresolved operator 'Project [id#7, CASE WHEN isnull('CIDADE_ORIGEM) THEN 000 ELSE 'CIDADE_ORIGEM "
+               "END AS CIDADE_ORIGEM#9];")
+ENTRADAS_CADEIA = [InputSource("rotas", "catalog", "produtor.rotas"),
+                   InputSource("historico", "catalog", "db.historico")]
+SESSAO_CADEIA = SESSAO_ROTAS + [{"alias": "historico", "kind": "catalog", "source": "db.historico", "read": "nativa",
+                                 "columns": ["id", "DATA"], "catalog": ["id", "DATA", "CIDADE_ORIGEM"]}]
+
+
+def test_cte_nao_usada_sai_com_as_que_dependem_dela_e_a_entrada_que_so_elas_leem():
+    d = ce.diagnose(ERRO_CADEIA, QUERY_CADEIA, QUERY_CADEIA, SESSAO_CADEIA, None, ENTRADAS_CADEIA, glue=True)
+    assert d.kind == "arquivos" and d.cte == "base_historico" and d.position == (2, 23)
+    assert "apague-a da query junto com `etapa1` e `etapa2`, que dependem dela e também não são usadas" in d.cause
+    # historico só é lida pelas CTEs que saem; rotas também é lida pela query final
+    assert "a entrada `historico` deixa de ser usada: tire-a da orquestração também" in d.cause
+    assert "`rotas` deixa" not in d.cause
+    # o motivo da coluna: o catálogo tem, os arquivos não; no Athena ela existe, vazia
+    assert "No Athena ela existe mesmo assim" in d.cause and "pelo esquema de um dos arquivos" in d.cause
+
+
+def test_unresolved_operator_aponta_a_cte_de_origem_e_nao_a_que_le_dela():
+    # resumo cita regiao mais vezes, mas quem não a encontra é base (resumo só falharia por tabela)
+    sql = ("WITH base AS (\n  SELECT id,\n    regiao\n  FROM vendas\n),\nresumo AS (SELECT regiao, count(*) AS n FROM base "
+           "GROUP BY regiao)\nSELECT count(*) AS n FROM vendas")
+    sessao = [{"alias": "vendas", "kind": "s3", "source": "s3://b/v/", "read": "s3", "columns": ["id", "valor"]}]
+    d = ce.diagnose("unresolved operator 'Project [id#16, 'regiao];", sql, sql, sessao)
+    assert d.cte == "base" and d.position == (3, 4) and "junto com `resumo`" in d.cause
+
+
+def _erro_34(linha: int, posicao: int) -> str:
+    return ("[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with name `CIDADE_ORIGEM` cannot be "
+            "resolved. Did you mean one of the following? [`historico`.`id`, `historico`.`DATA`].; "
+            f"line {linha} pos {posicao};")
+
+
+def test_cte_nao_usada_tambem_no_spark_3_4_em_diante():
+    # do Spark 3.4 em diante a mensagem já diz a coluna e a linha: a CTE é a que está nesse ponto
+    d = ce.diagnose(_erro_34(2, 23), QUERY_CADEIA, QUERY_CADEIA, SESSAO_CADEIA, None, ENTRADAS_CADEIA, glue=True)
+    assert d.cte == "base_historico" and d.position is None              # a posição é a da mensagem
+    assert "que a query final não usa" in d.cause and "Glue 4.0" not in d.cause and "junto com `etapa1`" in d.cause
+    # o ponto na query final (ou fora de qualquer nome): sem CTE
+    fora = QUERY_CADEIA.replace("SELECT * FROM final", "SELECT CIDADE_ORIGEM FROM final")
+    for ponto in ((7, 7), (2, 24), (99, 0)):
+        d = ce.diagnose(_erro_34(*ponto), fora, fora, SESSAO_CADEIA, None, ENTRADAS_CADEIA, glue=True)
+        assert d.cte == "" and "não usa" not in d.cause, ponto
 
 
 def test_coluna_formatada_com_o_proprio_nome_nao_e_nome_criado_no_select():
